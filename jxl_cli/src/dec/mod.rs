@@ -223,6 +223,9 @@ fn decode_frames_typed<T: ImageDataType + ConvertToF32, In: JxlBitstreamInput>(
         3
     };
 
+    // Accumulate typed frames during decoding, convert to f32 after timing
+    let mut typed_frames: Vec<(Vec<Image<T>>, f64)> = Vec::new();
+
     loop {
         let decoder_with_frame_info = match decoder_with_image_info.process(input)? {
             ProcessingResult::Complete { result } => result,
@@ -258,24 +261,31 @@ fn decode_frames_typed<T: ImageDataType + ConvertToF32, In: JxlBitstreamInput>(
             ProcessingResult::NeedsMoreInput { .. } => return Err(eyre!("Source file truncated")),
         };
 
-        // Convert typed outputs to f32
-        let f32_outputs: Vec<Image<f32>> = typed_outputs
-            .into_iter()
-            .map(|img| convert_image_to_f32(img))
-            .collect::<Result<_, _>>()?;
-
-        image_data.frames.push(ImageFrame {
-            duration: frame_header.duration.unwrap_or(0.0),
-            channels: f32_outputs,
-            color_type,
-        });
+        typed_frames.push((typed_outputs, frame_header.duration.unwrap_or(0.0)));
 
         if !decoder_with_image_info.has_more_frames() {
             break;
         }
     }
 
-    Ok((image_data, start.elapsed()))
+    // Capture decode duration BEFORE converting to f32, so conversion time is not included
+    let decode_duration = start.elapsed();
+
+    // Convert typed outputs to f32 (outside of timing)
+    for (typed_outputs, duration) in typed_frames {
+        let f32_outputs: Vec<Image<f32>> = typed_outputs
+            .into_iter()
+            .map(|img| convert_image_to_f32(img))
+            .collect::<Result<_, _>>()?;
+
+        image_data.frames.push(ImageFrame {
+            duration,
+            channels: f32_outputs,
+            color_type,
+        });
+    }
+
+    Ok((image_data, decode_duration))
 }
 
 /// Trait for converting a value to f32.
