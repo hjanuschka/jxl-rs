@@ -240,3 +240,106 @@ pub(super) fn read_single_command(
 
     Ok(())
 }
+
+/// POC: Integer Overflow Vulnerability in ICC Tag Parsing
+///
+/// This demonstrates the vulnerability fixed in PR #602:
+/// - `prev_tagstart + prev_tagsize` can overflow u32 (line 53-54)
+/// - `tagstart + tagsize` can overflow u32 (line 84)
+/// - `tagstart + tagsize * 2` can overflow u32 (line 87)
+///
+/// In debug builds: panics with "attempt to add with overflow" (DoS)
+/// In release builds: silently wraps, potentially corrupting data
+#[cfg(test)]
+mod overflow_poc_tests {
+    /// Demonstrates the arithmetic overflow in tagstart calculation (line 53-54)
+    ///
+    /// Vulnerable code:
+    /// ```ignore
+    /// let tagstart = if command & 64 == 0 {
+    ///     prev_tagstart + prev_tagsize  // CAN OVERFLOW!
+    /// }
+    /// ```
+    #[test]
+    fn test_tagstart_overflow() {
+        // prev_tagstart = 0x8C (140 = ICC_HEADER_SIZE + one tag entry)
+        // For overflow: prev_tagstart + prev_tagsize > 0xFFFFFFFF
+        let prev_tagstart: u32 = 128 + 12; // 0x8C
+        let prev_tagsize: u32 = 0xFFFF_FF80; // This will overflow!
+
+        // Using wrapping arithmetic (what happens in release builds)
+        let tagstart_wrapped = prev_tagstart.wrapping_add(prev_tagsize);
+
+        // Using checked arithmetic (the fix from PR #602)
+        let tagstart_checked = prev_tagstart.checked_add(prev_tagsize);
+
+        println!("=== POC: tagstart overflow (line 53-54) ===");
+        println!("prev_tagstart: 0x{:08X}", prev_tagstart);
+        println!("prev_tagsize:  0x{:08X}", prev_tagsize);
+        println!("Expected sum:  0x{:X}", prev_tagstart as u64 + prev_tagsize as u64);
+        println!("Wrapped sum:   0x{:08X} (CORRUPTED!)", tagstart_wrapped);
+        println!("Checked sum:   {:?}", tagstart_checked);
+
+        assert!(tagstart_checked.is_none(), "checked_add should detect overflow");
+        assert!(
+            tagstart_wrapped < 0x100,
+            "wrapping produces low address: 0x{:X}",
+            tagstart_wrapped
+        );
+
+        println!(
+            "✓ OVERFLOW CONFIRMED: Tag points to 0x{:X} instead of 0x{:X}",
+            tagstart_wrapped,
+            prev_tagstart as u64 + prev_tagsize as u64
+        );
+    }
+
+    /// Demonstrates overflow in XYZ triplet offsets (lines 84-87)
+    ///
+    /// Vulnerable code:
+    /// ```ignore
+    /// decoded_profile.write_u32::<BigEndian>(tagstart + tagsize)?;     // gXYZ
+    /// decoded_profile.write_u32::<BigEndian>(tagstart + tagsize * 2)?; // bXYZ
+    /// ```
+    #[test]
+    fn test_xyz_triplet_overflow() {
+        let tagstart: u32 = 0xFFFF_FFF0;
+        let tagsize: u32 = 20; // XYZ tags are always 20 bytes
+
+        // What the vulnerable code calculates:
+        let gxyz_offset = tagstart.wrapping_add(tagsize);
+        let bxyz_offset = tagstart.wrapping_add(tagsize.wrapping_mul(2));
+
+        println!("=== POC: XYZ triplet overflow (lines 84-87) ===");
+        println!("tagstart: 0x{:08X}", tagstart);
+        println!("tagsize:  {} (XYZ tag size)", tagsize);
+        println!();
+        println!("Expected offsets:");
+        println!("  gXYZ: 0x{:X}", tagstart as u64 + tagsize as u64);
+        println!("  bXYZ: 0x{:X}", tagstart as u64 + (tagsize as u64 * 2));
+        println!();
+        println!("Vulnerable (wrapped) offsets:");
+        println!("  gXYZ: 0x{:08X} (WRAPPED!)", gxyz_offset);
+        println!("  bXYZ: 0x{:08X} (WRAPPED!)", bxyz_offset);
+
+        assert!(gxyz_offset < 0x100, "gXYZ wrapped to low address");
+        assert!(bxyz_offset < 0x100, "bXYZ wrapped to low address");
+
+        println!(
+            "✓ bXYZ points to 0x{:X} - could overwrite ICC header!",
+            bxyz_offset
+        );
+    }
+
+    /// Demonstrates that debug builds panic on overflow (DoS)
+    #[test]
+    #[should_panic(expected = "attempt to add with overflow")]
+    fn test_debug_panic_on_overflow() {
+        // Use black_box to prevent compile-time evaluation
+        let prev_tagstart: u32 = std::hint::black_box(0xFFFF_FF00);
+        let prev_tagsize: u32 = std::hint::black_box(0x200);
+
+        // This panics in debug mode - DoS vulnerability!
+        let _tagstart = prev_tagstart + prev_tagsize;
+    }
+}
