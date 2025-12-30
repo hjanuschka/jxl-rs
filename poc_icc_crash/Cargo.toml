@@ -1,0 +1,7 @@
+[package]
+name = "poc_icc_crash"
+version = "0.1.0"
+edition = "2021"
+description = "POC demonstrating ICC integer overflow DoS in jxl-rs (PR #602)"
+
+[dependencies]
