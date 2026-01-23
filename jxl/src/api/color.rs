@@ -937,7 +937,8 @@ impl JxlColorEncoding {
             }
         } else {
             match self {
-                JxlColorEncoding::XYB { .. } => todo!("implement A2B0 and B2A0 tags"),
+                // XYB without HDR tone mapping cannot generate a valid ICC profile
+                JxlColorEncoding::XYB { .. } => return Ok(None),
                 JxlColorEncoding::RgbColorSpace {
                     transfer_function, ..
                 }
@@ -1176,11 +1177,13 @@ impl JxlColorProfile {
     /// # Panics
     /// Panics if the color encoding cannot generate an ICC profile.
     /// Consider using `try_as_icc` for fallible conversion.
+    #[deprecated(
+        since = "0.3.1",
+        note = "Use try_as_icc() instead to handle errors gracefully"
+    )]
     pub fn as_icc(&self) -> Cow<'_, Vec<u8>> {
-        match self {
-            Self::Icc(x) => Cow::Borrowed(x),
-            Self::Simple(encoding) => Cow::Owned(encoding.maybe_create_profile().unwrap().unwrap()),
-        }
+        self.try_as_icc()
+            .expect("Failed to generate ICC profile from color encoding")
     }
 
     /// Attempts to get an ICC profile, returning None if unavailable.
