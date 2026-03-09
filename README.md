@@ -19,7 +19,7 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --h
 # Use predictor=1 (West) to create a simple horizontal ramp-like pattern
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 1 --modular-predictor 1
 
-# Encode raw interleaved RGB8 bytes (width*height*3), currently single-group only (<=256x256)
+# Encode raw interleaved RGB8 bytes (width*height*3)
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --raw-rgb8-input frame.rgb
 ```
 

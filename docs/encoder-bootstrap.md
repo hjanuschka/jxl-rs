@@ -10,7 +10,7 @@ Current local `jxl-encoder` branch includes an early pure-Rust encoder bootstrap
 - Minimal codestream header emission (parses to `WithImageInfo`)
 - Minimal single-frame metadata + TOC emission (parses to `WithFrameInfo`)
 - Minimal decodable modular image stream (black output bootstrap, including multi-group images)
-- Single-group RGB8 modular payload encoding path (`<= 256x256`, raw interleaved RGB8 input)
+- RGB8 modular payload encoding path (raw interleaved RGB8 input, group-aware)
 - `jxle` CLI helper binary for generating bootstrap streams
 - Pure-Rust dependency guard script: `tools/check_encoder_pure_rust.py`
 
@@ -45,6 +45,6 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --h
 # Use predictor=1 (West) to generate a ramp-like stream
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 1 --modular-predictor 1
 
-# Encode raw interleaved RGB8 bytes (width*height*3), currently single-group only
+# Encode raw interleaved RGB8 bytes (width*height*3)
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --raw-rgb8-input frame.rgb
 ```

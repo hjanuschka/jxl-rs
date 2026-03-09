@@ -10,7 +10,8 @@ use crate::{
 };
 
 use super::{
-    BitWriter, HybridUintConfig, write_minimal_modular_global_data_with_params,
+    BitWriter, HybridUintConfig, write_minimal_modular_global_data_with_entropy_params,
+    write_minimal_modular_global_data_with_params,
     write_minimal_modular_lf_global_section_with_entropy_params,
     write_minimal_modular_lf_global_section_with_params, write_split0_fixed_token_signed_stream,
     write_toc, write_u32,
@@ -289,59 +290,113 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
     encode_minimal_modular_image_codestream_with_params(size, 0, 0)
 }
 
-/// Encodes an RGB8 buffer into a single-group modular codestream.
+/// Encodes an interleaved RGB8 buffer into a modular codestream.
 ///
 /// Current constraints:
 /// - input is tightly packed interleaved RGB8 (`[r,g,b, r,g,b, ...]`)
-/// - single-group only (`width <= 256 && height <= 256`)
 /// - uses default file metadata/bootstrap frame header
+/// - residual coding uses fixed split0 token bootstrap coding
 pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
     validate_rgb_u8_buffer(width, height, rgb)?;
 
-    if width > 256 || height > 256 {
-        return Err(Error::InvalidImageSize(width as usize, height as usize));
-    }
-
     const TOKEN: u16 = 10;
     const TREE_OFFSET: i32 = -256;
+    let uint_config = HybridUintConfig::new(0, 0, 0);
 
-    let px_count = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or(Error::ArithmeticOverflow)?;
+    let width_usize = width as usize;
+    let num_groups = default_num_groups(width, height);
+    let num_lf_groups = default_num_lf_groups(width, height);
+    let num_groups_x = width.div_ceil(256);
 
-    let mut section_writer = BitWriter::new();
+    let write_group_samples =
+        |writer: &mut BitWriter, origin: (u32, u32), size: (u32, u32)| -> Result<()> {
+            let (ox, oy) = origin;
+            let (gw, gh) = size;
+            let mut signed_residuals = Vec::with_capacity((gw as usize) * (gh as usize) * 3);
+
+            // Decoder channel order is channel-major, then row-major for each channel.
+            for channel in 0..3 {
+                for y in oy..(oy + gh) {
+                    for x in ox..(ox + gw) {
+                        let pixel_index = y as usize * width_usize + x as usize;
+                        let sample = i32::from(rgb[pixel_index * 3 + channel]);
+                        signed_residuals.push(sample - TREE_OFFSET);
+                    }
+                }
+            }
+
+            write_split0_fixed_token_signed_stream(writer, u32::from(TOKEN), &signed_residuals)
+        };
+
+    let mut lf_global_writer = BitWriter::new();
     write_minimal_modular_lf_global_section_with_entropy_params(
-        &mut section_writer,
+        &mut lf_global_writer,
         TREE_OFFSET,
         0,
         TOKEN,
-        HybridUintConfig::new(0, 0, 0),
+        uint_config,
     )?;
 
-    // Decoder channel order is channel-major, then row-major for each channel.
-    let mut signed_residuals = Vec::with_capacity(px_count * 3);
-    for channel in 0..3 {
-        for i in 0..px_count {
-            let sample = i32::from(rgb[i * 3 + channel]);
-            signed_residuals.push(sample - TREE_OFFSET);
-        }
+    // Single-group path stores all channel samples in section 0.
+    if num_groups == 1 {
+        write_group_samples(&mut lf_global_writer, (0, 0), (width, height))?;
+        let lf_global_section = lf_global_writer.finish();
+
+        let mut writer = BitWriter::new();
+        write_minimal_file_header_fields(&mut writer, width, height)?;
+        writer.byte_align_zero_pad()?;
+        write_default_modular_frame_header(&mut writer)?;
+        write_toc(&mut writer, &[lf_global_section.len() as u32])?;
+        writer.write_aligned_bytes(&lf_global_section)?;
+        return Ok(writer.finish());
     }
-    write_split0_fixed_token_signed_stream(
-        &mut section_writer,
-        u32::from(TOKEN),
-        &signed_residuals,
-    )?;
 
-    let section = section_writer.finish();
+    // Multi-group path:
+    // - section 0: LF global only
+    // - section 1 (LF groups): empty
+    // - section 2 (HF global): empty
+    // - section 3..: one per image group with local tree + residual bits
+    let lf_global_section = lf_global_writer.finish();
+
+    let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
+    for group in 0..num_groups {
+        let gx = group % num_groups_x;
+        let gy = group / num_groups_x;
+        let ox = gx * 256;
+        let oy = gy * 256;
+        let gw = (width - ox).min(256);
+        let gh = (height - oy).min(256);
+
+        let mut group_writer = BitWriter::new();
+        write_minimal_modular_global_data_with_entropy_params(
+            &mut group_writer,
+            TREE_OFFSET,
+            0,
+            TOKEN,
+            uint_config,
+        )?;
+        write_group_samples(&mut group_writer, (ox, oy), (gw, gh))?;
+        hf_group_sections.push(group_writer.finish());
+    }
 
     let mut writer = BitWriter::new();
     write_minimal_file_header_fields(&mut writer, width, height)?;
     writer.byte_align_zero_pad()?;
     write_default_modular_frame_header(&mut writer)?;
-    write_toc(&mut writer, &[section.len() as u32])?;
-    writer.write_aligned_bytes(&section)?;
+
+    let mut toc_entries = Vec::new();
+    toc_entries.push(lf_global_section.len() as u32);
+    toc_entries.extend(std::iter::repeat_n(0u32, num_lf_groups as usize));
+    toc_entries.push(0); // HF global
+    toc_entries.extend(hf_group_sections.iter().map(|s| s.len() as u32));
+
+    write_toc(&mut writer, &toc_entries)?;
+    writer.write_aligned_bytes(&lf_global_section)?;
+    for section in hf_group_sections {
+        writer.write_aligned_bytes(&section)?;
+    }
 
     Ok(writer.finish())
 }
@@ -629,6 +684,30 @@ mod tests {
         // Determinism for fixed input.
         let cs_a2 = encode_modular_u8_rgb_image_codestream(size, &rgb_a).unwrap();
         assert_eq!(cs_a, cs_a2);
+    }
+
+    #[test]
+    fn test_encode_modular_u8_rgb_image_codestream_multigroup_decodes() {
+        let size = (300, 3);
+        let mut rgb = vec![0u8; (size.0 * size.1 * 3) as usize];
+        for y in 0..size.1 as usize {
+            for x in 0..size.0 as usize {
+                let idx = (y * size.0 as usize + x) * 3;
+                rgb[idx] = (x % 256) as u8;
+                rgb[idx + 1] = (y * 40) as u8;
+                rgb[idx + 2] = ((x + y) % 256) as u8;
+            }
+        }
+
+        let cs = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+        let (decoded, frames) =
+            crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
+
+        assert_eq!(decoded, 1);
+        assert_eq!(
+            frames[0][0].size(),
+            ((size.0 * 3) as usize, size.1 as usize)
+        );
     }
 
     #[test]
