@@ -72,8 +72,19 @@ impl JxlEncoder {
         headers::encode_minimal_modular_image_codestream(size)
     }
 
+    /// Encodes a minimal fully decodable modular-image codestream with
+    /// constant modular leaf parameters.
+    pub fn encode_minimal_modular_image_codestream_with_params(
+        &self,
+        size: (u32, u32),
+        offset: i32,
+        predictor: u32,
+    ) -> Result<Vec<u8>> {
+        headers::encode_minimal_modular_image_codestream_with_params(size, offset, predictor)
+    }
+
     /// Encodes a minimal fully decodable modular-image codestream with a
-    /// constant modular leaf offset.
+    /// constant modular leaf offset and predictor `Zero`.
     pub fn encode_minimal_modular_image_codestream_with_offset(
         &self,
         size: (u32, u32),
@@ -100,8 +111,21 @@ impl JxlEncoder {
         container::wrap_codestream(&codestream)
     }
 
-    /// Encodes a minimal decodable modular-image stream with constant offset,
-    /// wrapped in a JXL container.
+    /// Encodes a minimal decodable modular-image stream with constant leaf
+    /// parameters, wrapped in a JXL container.
+    pub fn encode_minimal_modular_image_container_with_params(
+        &self,
+        size: (u32, u32),
+        offset: i32,
+        predictor: u32,
+    ) -> Result<Vec<u8>> {
+        let codestream =
+            headers::encode_minimal_modular_image_codestream_with_params(size, offset, predictor)?;
+        container::wrap_codestream(&codestream)
+    }
+
+    /// Encodes a minimal decodable modular-image stream with constant offset
+    /// and predictor `Zero`, wrapped in a JXL container.
     pub fn encode_minimal_modular_image_container_with_offset(
         &self,
         size: (u32, u32),
@@ -271,6 +295,34 @@ mod tests {
         let enc = JxlEncoder::default();
         let bytes = enc
             .encode_minimal_modular_image_container_with_offset((64, 32), 7)
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Container)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_minimal_modular_image_codestream_with_params_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let bytes = enc
+            .encode_minimal_modular_image_codestream_with_params((64, 32), 7, 1)
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_minimal_modular_image_container_with_params_has_container_signature() {
+        let enc = JxlEncoder::default();
+        let bytes = enc
+            .encode_minimal_modular_image_container_with_params((64, 32), 7, 1)
             .unwrap();
         assert_eq!(
             check_signature(&bytes),

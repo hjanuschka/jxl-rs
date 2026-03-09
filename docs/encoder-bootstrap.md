@@ -40,4 +40,7 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --h
 
 # Same stream shape, but with a constant modular offset
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 12
+
+# Use predictor=1 (West) to generate a ramp-like stream
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 1 --modular-predictor 1
 ```

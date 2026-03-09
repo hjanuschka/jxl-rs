@@ -37,6 +37,10 @@ struct Opt {
     /// Constant modular leaf offset for --modular-image mode
     #[arg(long, default_value_t = 0)]
     modular_offset: i32,
+
+    /// Modular predictor id (0=Zero, 1=West, ... 13=AverageAll)
+    #[arg(long, default_value_t = 0)]
+    modular_predictor: u32,
 }
 
 fn main() -> Result<()> {
@@ -49,22 +53,30 @@ fn main() -> Result<()> {
         ));
     }
 
-    if opt.modular_offset != 0 && !opt.modular_image {
+    if (opt.modular_offset != 0 || opt.modular_predictor != 0) && !opt.modular_image {
         return Err(color_eyre::eyre::eyre!(
-            "--modular-offset requires --modular-image"
+            "--modular-offset/--modular-predictor require --modular-image"
+        ));
+    }
+
+    if opt.modular_predictor > 13 {
+        return Err(color_eyre::eyre::eyre!(
+            "--modular-predictor must be in [0, 13]"
         ));
     }
 
     let bytes = if opt.modular_image {
         if opt.bare {
-            enc.encode_minimal_modular_image_codestream_with_offset(
+            enc.encode_minimal_modular_image_codestream_with_params(
                 (opt.width, opt.height),
                 opt.modular_offset,
+                opt.modular_predictor,
             )?
         } else {
-            enc.encode_minimal_modular_image_container_with_offset(
+            enc.encode_minimal_modular_image_container_with_params(
                 (opt.width, opt.height),
                 opt.modular_offset,
+                opt.modular_predictor,
             )?
         }
     } else if opt.with_frame_info {
@@ -91,10 +103,11 @@ fn main() -> Result<()> {
     };
     if opt.modular_image {
         eprintln!(
-            "Wrote {} bytes to {:?} ({mode}, offset={})",
+            "Wrote {} bytes to {:?} ({mode}, offset={}, predictor={})",
             bytes.len(),
             opt.output,
-            opt.modular_offset
+            opt.modular_offset,
+            opt.modular_predictor
         );
     } else {
         eprintln!("Wrote {} bytes to {:?} ({mode})", bytes.len(), opt.output);

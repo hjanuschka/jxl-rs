@@ -10,8 +10,8 @@ use crate::{
 };
 
 use super::{
-    BitWriter, write_minimal_modular_global_data_with_offset,
-    write_minimal_modular_lf_global_section_with_offset, write_toc, write_u32,
+    BitWriter, write_minimal_modular_global_data_with_params,
+    write_minimal_modular_lf_global_section_with_params, write_toc, write_u32,
 };
 
 fn large_size_coder() -> U32Coder {
@@ -200,11 +200,11 @@ pub fn encode_minimal_single_frame_codestream(size: (u32, u32)) -> Result<Vec<u8
 
 /// Encodes a minimal fully decodable modular single-frame codestream.
 ///
-/// The produced image uses a constant modular leaf offset and defaults to
-/// black for `offset = 0`.
-pub fn encode_minimal_modular_image_codestream_with_offset(
+/// The produced image uses a constant modular leaf offset/predictor pair.
+pub fn encode_minimal_modular_image_codestream_with_params(
     size: (u32, u32),
     offset: i32,
+    predictor: u32,
 ) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
@@ -213,11 +213,11 @@ pub fn encode_minimal_modular_image_codestream_with_offset(
     let num_lf_groups = default_num_lf_groups(width, height);
 
     let mut lf_global_writer = BitWriter::new();
-    write_minimal_modular_lf_global_section_with_offset(&mut lf_global_writer, offset)?;
+    write_minimal_modular_lf_global_section_with_params(&mut lf_global_writer, offset, predictor)?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_writer = BitWriter::new();
-    write_minimal_modular_global_data_with_offset(&mut hf_group_writer, offset)?;
+    write_minimal_modular_global_data_with_params(&mut hf_group_writer, offset, predictor)?;
     let hf_group_section = hf_group_writer.finish();
 
     let mut writer = BitWriter::new();
@@ -259,9 +259,18 @@ pub fn encode_minimal_modular_image_codestream_with_offset(
     Ok(writer.finish())
 }
 
+/// Encodes a minimal fully decodable modular single-frame codestream with
+/// predictor `Zero`.
+pub fn encode_minimal_modular_image_codestream_with_offset(
+    size: (u32, u32),
+    offset: i32,
+) -> Result<Vec<u8>> {
+    encode_minimal_modular_image_codestream_with_params(size, offset, 0)
+}
+
 /// Encodes a minimal fully decodable modular single-frame codestream.
 pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u8>> {
-    encode_minimal_modular_image_codestream_with_offset(size, 0)
+    encode_minimal_modular_image_codestream_with_params(size, 0, 0)
 }
 
 #[cfg(test)]
@@ -486,6 +495,24 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_minimal_modular_image_with_west_predictor_varies_pixels() {
+        let codestream = encode_minimal_modular_image_codestream_with_params((8, 1), 1, 1).unwrap();
+        let (decoded_frames, frames) =
+            crate::api::tests::decode(&codestream, usize::MAX, false, false, None).unwrap();
+
+        assert_eq!(decoded_frames, 1);
+        let row = frames[0][0].row(0);
+        assert!(row.len() >= 6);
+
+        let first_pixel_r = row[0];
+        let second_pixel_r = row[3];
+        assert!(
+            (second_pixel_r - first_pixel_r).abs() > 1e-6,
+            "expected varying pixels with west predictor"
+        );
+    }
+
+    #[test]
     fn test_minimal_header_snapshot_1x1() {
         let codestream = encode_minimal_codestream_header((1, 1)).unwrap();
         assert_eq!(codestream, vec![0xFF, 0x0A, 0x00, 0x00, 0x00, 0x0C]);
@@ -523,6 +550,13 @@ mod tests {
             assert_eq!(
                 a, b,
                 "non-deterministic modular output with offset for size {size:?}"
+            );
+
+            let a = encode_minimal_modular_image_codestream_with_params(size, 7, 1).unwrap();
+            let b = encode_minimal_modular_image_codestream_with_params(size, 7, 1).unwrap();
+            assert_eq!(
+                a, b,
+                "non-deterministic modular output with params for size {size:?}"
             );
         }
     }

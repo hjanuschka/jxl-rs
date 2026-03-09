@@ -41,17 +41,27 @@ pub fn write_minimal_group_header(writer: &mut BitWriter, use_global_tree: bool)
 /// Writes a minimal modular tree payload with a single leaf.
 ///
 /// The resulting leaf uses:
-/// - predictor: `Zero`
+/// - predictor: `predictor`
 /// - offset: `offset`
 /// - multiplier: `1`
-pub fn write_single_leaf_tree_with_offset(writer: &mut BitWriter, offset: i32) -> Result<()> {
+pub fn write_single_leaf_tree_with_params(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+) -> Result<()> {
+    if predictor > 13 {
+        return Err(Error::InvalidPredictor(predictor));
+    }
+
+    let predictor_symbol =
+        u16::try_from(predictor).map_err(|_| Error::InvalidPredictor(predictor))?;
     let offset_symbol = pack_signed(offset) as u32;
     let offset_symbol = u16::try_from(offset_symbol).map_err(|_| Error::InvalidHuffman)?;
 
     // Tree-building histograms across the 6 tree contexts:
     // [split_val, property, predictor, offset, multiplier_log, multiplier_bits]
     let tree_context_map = [0u8, 1, 2, 3, 4, 5];
-    let tree_symbols = [0u16, 0, 0, offset_symbol, 0, 0];
+    let tree_symbols = [0u16, 0, predictor_symbol, offset_symbol, 0, 0];
     write_fixed_symbol_huffman_histograms(writer, &tree_context_map, &tree_symbols)?;
 
     // Entropy histograms for decoded channel residual symbols.
@@ -59,9 +69,14 @@ pub fn write_single_leaf_tree_with_offset(writer: &mut BitWriter, offset: i32) -
     Ok(())
 }
 
-/// Writes a minimal modular tree payload (single leaf, offset 0).
+/// Writes a minimal modular tree payload with predictor `Zero`.
+pub fn write_single_leaf_tree_with_offset(writer: &mut BitWriter, offset: i32) -> Result<()> {
+    write_single_leaf_tree_with_params(writer, offset, 0)
+}
+
+/// Writes a minimal modular tree payload (single leaf, offset 0, predictor `Zero`).
 pub fn write_single_leaf_tree(writer: &mut BitWriter) -> Result<()> {
-    write_single_leaf_tree_with_offset(writer, 0)
+    write_single_leaf_tree_with_params(writer, 0, 0)
 }
 
 /// Writes minimal modular global subbitstream payload.
@@ -70,28 +85,38 @@ pub fn write_single_leaf_tree(writer: &mut BitWriter) -> Result<()> {
 /// - local tree (`use_global_tree = false`)
 /// - default weighted predictor config
 /// - no modular transforms
-/// - single-leaf local tree with constant `offset`
+/// - single-leaf local tree with constant `offset` and `predictor`
+pub fn write_minimal_modular_global_data_with_params(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+) -> Result<()> {
+    write_minimal_group_header(writer, /*use_global_tree=*/ false)?;
+    write_single_leaf_tree_with_params(writer, offset, predictor)?;
+    Ok(())
+}
+
+/// Writes minimal modular global subbitstream payload with predictor `Zero`.
 pub fn write_minimal_modular_global_data_with_offset(
     writer: &mut BitWriter,
     offset: i32,
 ) -> Result<()> {
-    write_minimal_group_header(writer, /*use_global_tree=*/ false)?;
-    write_single_leaf_tree_with_offset(writer, offset)?;
-    Ok(())
+    write_minimal_modular_global_data_with_params(writer, offset, 0)
 }
 
 /// Writes minimal modular global subbitstream payload with offset 0.
 pub fn write_minimal_modular_global_data(writer: &mut BitWriter) -> Result<()> {
-    write_minimal_modular_global_data_with_offset(writer, 0)
+    write_minimal_modular_global_data_with_params(writer, 0, 0)
 }
 
 /// Writes a minimal LF global section prefix for a modular frame:
 /// - default LF quant factors
 /// - no global modular tree
 /// - minimal modular global data payload
-pub fn write_minimal_modular_lf_global_section_with_offset(
+pub fn write_minimal_modular_lf_global_section_with_params(
     writer: &mut BitWriter,
     offset: i32,
+    predictor: u32,
 ) -> Result<()> {
     // LfQuantFactors::new => default path.
     writer.write(1, 1)?;
@@ -99,12 +124,20 @@ pub fn write_minimal_modular_lf_global_section_with_offset(
     // decode_lf_global tree flag: no global tree.
     writer.write(1, 0)?;
 
-    write_minimal_modular_global_data_with_offset(writer, offset)
+    write_minimal_modular_global_data_with_params(writer, offset, predictor)
+}
+
+/// Writes a minimal LF global section prefix with predictor `Zero`.
+pub fn write_minimal_modular_lf_global_section_with_offset(
+    writer: &mut BitWriter,
+    offset: i32,
+) -> Result<()> {
+    write_minimal_modular_lf_global_section_with_params(writer, offset, 0)
 }
 
 /// Writes a minimal LF global section prefix with offset 0.
 pub fn write_minimal_modular_lf_global_section(writer: &mut BitWriter) -> Result<()> {
-    write_minimal_modular_lf_global_section_with_offset(writer, 0)
+    write_minimal_modular_lf_global_section_with_params(writer, 0, 0)
 }
 
 #[cfg(test)]
@@ -160,6 +193,29 @@ mod tests {
         assert!(node_debug.contains("Zero"));
         assert!(node_debug.contains("offset: 7"));
         assert!(node_debug.contains("multiplier: 1"));
+    }
+
+    #[test]
+    fn test_write_single_leaf_tree_with_params_roundtrip() {
+        let mut writer = BitWriter::new();
+        write_single_leaf_tree_with_params(&mut writer, 3, 1).unwrap();
+        let bytes = writer.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
+
+        assert_eq!(tree.nodes.len(), 1);
+        let node_debug = format!("{:?}", tree.nodes[0]);
+        assert!(node_debug.contains("Leaf"));
+        assert!(node_debug.contains("West"));
+        assert!(node_debug.contains("offset: 3"));
+    }
+
+    #[test]
+    fn test_write_single_leaf_tree_with_params_invalid_predictor() {
+        let mut writer = BitWriter::new();
+        let err = write_single_leaf_tree_with_params(&mut writer, 0, 99).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidPredictor(99)));
     }
 
     #[test]
