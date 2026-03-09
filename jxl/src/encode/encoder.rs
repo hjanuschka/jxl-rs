@@ -8,7 +8,7 @@ use crate::{
     error::Result,
 };
 
-use super::{BitWriter, JxlEncoderOptions, container};
+use super::{BitWriter, JxlEncoderOptions, container, headers};
 
 /// Top-level bitstream flavor for encoder output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,17 @@ impl JxlEncoder {
             }
         }
         Ok(writer.finish())
+    }
+
+    /// Encodes a minimal header-only codestream.
+    pub fn encode_minimal_codestream_header(&self, size: (u32, u32)) -> Result<Vec<u8>> {
+        headers::encode_minimal_codestream_header(size)
+    }
+
+    /// Encodes a minimal header-only stream wrapped in a JXL container.
+    pub fn encode_minimal_container_header(&self, size: (u32, u32)) -> Result<Vec<u8>> {
+        let codestream = headers::encode_minimal_codestream_header(size)?;
+        container::wrap_codestream(&codestream)
     }
 
     /// Wraps a pre-encoded codestream in a minimal JXL container.
@@ -117,5 +128,29 @@ mod tests {
         }
 
         assert_eq!(out, codestream);
+    }
+
+    #[test]
+    fn test_encode_minimal_codestream_header_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let bytes = enc.encode_minimal_codestream_header((64, 32)).unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_minimal_container_header_has_container_signature() {
+        let enc = JxlEncoder::default();
+        let bytes = enc.encode_minimal_container_header((64, 32)).unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Container)
+            }
+        );
     }
 }
