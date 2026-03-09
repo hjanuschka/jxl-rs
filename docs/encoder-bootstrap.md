@@ -37,4 +37,7 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 321 --h
 
 # Emit a minimal decodable modular image stream
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image
+
+# Same stream shape, but with a constant modular offset
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 12
 ```

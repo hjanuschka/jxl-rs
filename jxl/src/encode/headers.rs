@@ -10,8 +10,8 @@ use crate::{
 };
 
 use super::{
-    BitWriter, write_minimal_modular_global_data, write_minimal_modular_lf_global_section,
-    write_toc, write_u32,
+    BitWriter, write_minimal_modular_global_data_with_offset,
+    write_minimal_modular_lf_global_section_with_offset, write_toc, write_u32,
 };
 
 fn large_size_coder() -> U32Coder {
@@ -200,12 +200,12 @@ pub fn encode_minimal_single_frame_codestream(size: (u32, u32)) -> Result<Vec<u8
 
 /// Encodes a minimal fully decodable modular single-frame codestream.
 ///
-/// The produced image decodes to black pixels and uses:
-/// - default file header metadata
-/// - modular frame header (regular frame, is_last = true)
-/// - one section (single-group/single-pass path)
-/// - minimal modular LF global payload with a single-leaf tree
-pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u8>> {
+/// The produced image uses a constant modular leaf offset and defaults to
+/// black for `offset = 0`.
+pub fn encode_minimal_modular_image_codestream_with_offset(
+    size: (u32, u32),
+    offset: i32,
+) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
 
@@ -213,11 +213,11 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
     let num_lf_groups = default_num_lf_groups(width, height);
 
     let mut lf_global_writer = BitWriter::new();
-    write_minimal_modular_lf_global_section(&mut lf_global_writer)?;
+    write_minimal_modular_lf_global_section_with_offset(&mut lf_global_writer, offset)?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_writer = BitWriter::new();
-    write_minimal_modular_global_data(&mut hf_group_writer)?;
+    write_minimal_modular_global_data_with_offset(&mut hf_group_writer, offset)?;
     let hf_group_section = hf_group_writer.finish();
 
     let mut writer = BitWriter::new();
@@ -257,6 +257,11 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
     }
 
     Ok(writer.finish())
+}
+
+/// Encodes a minimal fully decodable modular single-frame codestream.
+pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u8>> {
+    encode_minimal_modular_image_codestream_with_offset(size, 0)
 }
 
 #[cfg(test)]
@@ -453,6 +458,34 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_minimal_modular_image_with_offset_decodes_non_black() {
+        let codestream = encode_minimal_modular_image_codestream_with_offset((8, 4), 12).unwrap();
+        let (decoded_frames, frames) =
+            crate::api::tests::decode(&codestream, usize::MAX, false, false, None).unwrap();
+
+        assert_eq!(decoded_frames, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0].size(), (8 * 3, 4));
+
+        let mut any_non_zero = false;
+        for y in 0..4 {
+            for &v in frames[0][0].row(y) {
+                if v.abs() > 1e-6 {
+                    any_non_zero = true;
+                    break;
+                }
+            }
+            if any_non_zero {
+                break;
+            }
+        }
+        assert!(
+            any_non_zero,
+            "expected non-black pixels for non-zero offset"
+        );
+    }
+
+    #[test]
     fn test_minimal_header_snapshot_1x1() {
         let codestream = encode_minimal_codestream_header((1, 1)).unwrap();
         assert_eq!(codestream, vec![0xFF, 0x0A, 0x00, 0x00, 0x00, 0x0C]);
@@ -484,6 +517,13 @@ mod tests {
             let a = encode_minimal_modular_image_codestream(size).unwrap();
             let b = encode_minimal_modular_image_codestream(size).unwrap();
             assert_eq!(a, b, "non-deterministic modular output for size {size:?}");
+
+            let a = encode_minimal_modular_image_codestream_with_offset(size, 7).unwrap();
+            let b = encode_minimal_modular_image_codestream_with_offset(size, 7).unwrap();
+            assert_eq!(
+                a, b,
+                "non-deterministic modular output with offset for size {size:?}"
+            );
         }
     }
 }

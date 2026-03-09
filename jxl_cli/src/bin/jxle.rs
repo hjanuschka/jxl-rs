@@ -33,6 +33,10 @@ struct Opt {
     /// Emit a minimal decodable modular image stream
     #[arg(long)]
     modular_image: bool,
+
+    /// Constant modular leaf offset for --modular-image mode
+    #[arg(long, default_value_t = 0)]
+    modular_offset: i32,
 }
 
 fn main() -> Result<()> {
@@ -45,11 +49,23 @@ fn main() -> Result<()> {
         ));
     }
 
+    if opt.modular_offset != 0 && !opt.modular_image {
+        return Err(color_eyre::eyre::eyre!(
+            "--modular-offset requires --modular-image"
+        ));
+    }
+
     let bytes = if opt.modular_image {
         if opt.bare {
-            enc.encode_minimal_modular_image_codestream((opt.width, opt.height))?
+            enc.encode_minimal_modular_image_codestream_with_offset(
+                (opt.width, opt.height),
+                opt.modular_offset,
+            )?
         } else {
-            enc.encode_minimal_modular_image_container((opt.width, opt.height))?
+            enc.encode_minimal_modular_image_container_with_offset(
+                (opt.width, opt.height),
+                opt.modular_offset,
+            )?
         }
     } else if opt.with_frame_info {
         if opt.bare {
@@ -73,6 +89,15 @@ fn main() -> Result<()> {
     } else {
         "header-only stream"
     };
-    eprintln!("Wrote {} bytes to {:?} ({mode})", bytes.len(), opt.output);
+    if opt.modular_image {
+        eprintln!(
+            "Wrote {} bytes to {:?} ({mode}, offset={})",
+            bytes.len(),
+            opt.output,
+            opt.modular_offset
+        );
+    } else {
+        eprintln!("Wrote {} bytes to {:?} ({mode})", bytes.len(), opt.output);
+    }
     Ok(())
 }
