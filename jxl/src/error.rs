@@ -29,6 +29,8 @@ pub enum Error {
     OutOfBounds(usize),
     #[error("Invalid bit count: {0}")]
     InvalidBitCount(usize),
+    #[error("Value cannot be encoded by the selected U32 coder: {value}")]
+    U32EncodeOutOfRange { value: u32 },
     #[error("Bit writer is not byte-aligned")]
     BitWriterNotByteAligned,
     #[error("Section is too short")]
