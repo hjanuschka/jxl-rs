@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr};
-use jxl::encode::JxlEncoder;
+use jxl::encode::{JxlEncoder, JxlEncoderImageData};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -39,6 +39,10 @@ struct Opt {
     #[arg(long)]
     raw_rgb8_input: Option<PathBuf>,
 
+    /// Encode raw Gray8 bytes from this file (length must be width*height)
+    #[arg(long)]
+    raw_gray8_input: Option<PathBuf>,
+
     /// Constant modular leaf offset for --modular-image mode
     #[arg(long, default_value_t = 0)]
     modular_offset: i32,
@@ -58,22 +62,27 @@ fn main() -> Result<()> {
         ));
     }
 
-    if opt.raw_rgb8_input.is_some() && (opt.modular_image || opt.with_frame_info) {
+    if opt.raw_rgb8_input.is_some() && opt.raw_gray8_input.is_some() {
         return Err(color_eyre::eyre::eyre!(
-            "--raw-rgb8-input is mutually exclusive with --modular-image/--with-frame-info"
+            "--raw-rgb8-input and --raw-gray8-input are mutually exclusive"
         ));
     }
 
-    if opt.raw_rgb8_input.is_some() && (opt.modular_offset != 0 || opt.modular_predictor != 0) {
+    let has_raw_input = opt.raw_rgb8_input.is_some() || opt.raw_gray8_input.is_some();
+
+    if has_raw_input && (opt.modular_image || opt.with_frame_info) {
         return Err(color_eyre::eyre::eyre!(
-            "--raw-rgb8-input does not use --modular-offset/--modular-predictor"
+            "--raw-rgb8-input/--raw-gray8-input are mutually exclusive with --modular-image/--with-frame-info"
         ));
     }
 
-    if (opt.modular_offset != 0 || opt.modular_predictor != 0)
-        && !opt.modular_image
-        && opt.raw_rgb8_input.is_none()
-    {
+    if has_raw_input && (opt.modular_offset != 0 || opt.modular_predictor != 0) {
+        return Err(color_eyre::eyre::eyre!(
+            "raw input modes do not use --modular-offset/--modular-predictor"
+        ));
+    }
+
+    if (opt.modular_offset != 0 || opt.modular_predictor != 0) && !opt.modular_image {
         return Err(color_eyre::eyre::eyre!(
             "--modular-offset/--modular-predictor require --modular-image"
         ));
@@ -88,12 +97,23 @@ fn main() -> Result<()> {
     let (bytes, mode) = if let Some(raw_rgb_path) = &opt.raw_rgb8_input {
         let rgb = std::fs::read(raw_rgb_path)
             .wrap_err_with(|| format!("Failed to read raw RGB8 input {:?}", raw_rgb_path))?;
+        let image = JxlEncoderImageData::Rgb8Interleaved(&rgb);
         let bytes = if opt.bare {
-            enc.encode_modular_u8_rgb_codestream((opt.width, opt.height), &rgb)?
+            enc.encode_image_codestream((opt.width, opt.height), image)?
         } else {
-            enc.encode_modular_u8_rgb_container((opt.width, opt.height), &rgb)?
+            enc.encode_image((opt.width, opt.height), image)?
         };
         (bytes, "raw-rgb8 modular stream")
+    } else if let Some(raw_gray_path) = &opt.raw_gray8_input {
+        let gray = std::fs::read(raw_gray_path)
+            .wrap_err_with(|| format!("Failed to read raw Gray8 input {:?}", raw_gray_path))?;
+        let image = JxlEncoderImageData::Gray8Interleaved(&gray);
+        let bytes = if opt.bare {
+            enc.encode_image_codestream((opt.width, opt.height), image)?
+        } else {
+            enc.encode_image((opt.width, opt.height), image)?
+        };
+        (bytes, "raw-gray8 modular stream")
     } else if opt.modular_image {
         let bytes = if opt.bare {
             enc.encode_minimal_modular_image_codestream_with_params(
