@@ -850,6 +850,19 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_modular_u8_rgb_image_container_decodes() {
+        let size = (16, 8);
+        let rgb = vec![0u8; (size.0 * size.1 * 3) as usize];
+        let cs = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+        let container_stream = container::wrap_codestream(&cs).unwrap();
+
+        let (decoded, frames) =
+            crate::api::tests::decode(&container_stream, usize::MAX, false, false, None).unwrap();
+        assert_eq!(decoded, 1);
+        assert_eq!(frames[0][0].size(), ((size.0 * 3) as usize, size.1 as usize));
+    }
+
+    #[test]
     fn test_minimal_header_snapshot_1x1() {
         let codestream = encode_minimal_codestream_header((1, 1)).unwrap();
         assert_eq!(codestream, vec![0xFF, 0x0A, 0x00, 0x00, 0x00, 0x0C]);
