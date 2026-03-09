@@ -10,7 +10,7 @@ Experimental bootstrap encoder helper:
 # Header-only bootstrap stream
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 320 --height 240
 
-# Minimal decodable modular stream (currently <= 256x256)
+# Minimal decodable modular stream
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image
 ```
 
