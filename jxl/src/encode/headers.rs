@@ -859,7 +859,10 @@ mod tests {
         let (decoded, frames) =
             crate::api::tests::decode(&container_stream, usize::MAX, false, false, None).unwrap();
         assert_eq!(decoded, 1);
-        assert_eq!(frames[0][0].size(), ((size.0 * 3) as usize, size.1 as usize));
+        assert_eq!(
+            frames[0][0].size(),
+            ((size.0 * 3) as usize, size.1 as usize)
+        );
     }
 
     #[test]

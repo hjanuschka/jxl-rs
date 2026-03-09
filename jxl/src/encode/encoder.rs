@@ -5,7 +5,7 @@
 
 use crate::{
     api::{CODESTREAM_SIGNATURE, CONTAINER_SIGNATURE},
-    error::Result,
+    error::{Error, Result},
 };
 
 use super::{BitWriter, JxlEncoderOptions, container, headers};
@@ -22,6 +22,8 @@ pub enum JxlEncoderBitstreamKind {
 pub enum JxlEncoderImageData<'a> {
     /// Interleaved RGB8 samples: `[r,g,b, r,g,b, ...]`.
     Rgb8Interleaved(&'a [u8]),
+    /// RGB8 samples with explicit row stride in bytes.
+    Rgb8Strided { data: &'a [u8], stride: usize },
 }
 
 /// High-level encoder entry point.
@@ -57,6 +59,46 @@ impl JxlEncoder {
         match image {
             JxlEncoderImageData::Rgb8Interleaved(rgb) => {
                 headers::encode_modular_u8_rgb_image_codestream(size, rgb)
+            }
+            JxlEncoderImageData::Rgb8Strided { data, stride } => {
+                let (width, height) = size;
+                let row_bytes = (width as usize)
+                    .checked_mul(3)
+                    .ok_or(Error::ArithmeticOverflow)?;
+
+                if stride < row_bytes {
+                    return Err(Error::InvalidPixelRowStride {
+                        minimum: row_bytes,
+                        actual: stride,
+                    });
+                }
+
+                let required = if height == 0 {
+                    0
+                } else {
+                    (height as usize - 1)
+                        .checked_mul(stride)
+                        .and_then(|x| x.checked_add(row_bytes))
+                        .ok_or(Error::ArithmeticOverflow)?
+                };
+                if data.len() < required {
+                    return Err(Error::InvalidPixelBufferLength {
+                        expected: required,
+                        actual: data.len(),
+                    });
+                }
+
+                let mut packed = Vec::with_capacity(
+                    row_bytes
+                        .checked_mul(height as usize)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                );
+                for y in 0..height as usize {
+                    let row_start = y * stride;
+                    packed.extend_from_slice(&data[row_start..row_start + row_bytes]);
+                }
+
+                headers::encode_modular_u8_rgb_image_codestream(size, &packed)
             }
         }
     }
@@ -261,6 +303,99 @@ mod tests {
                 result: Some(JxlSignatureType::Codestream)
             }
         );
+    }
+
+    #[test]
+    fn test_encode_image_codestream_rgb8_strided_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let width = 8usize;
+        let height = 4usize;
+        let row_bytes = width * 3;
+        let stride = row_bytes + 5;
+        let mut data = vec![0u8; stride * height];
+        for y in 0..height {
+            let row = &mut data[y * stride..y * stride + row_bytes];
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = (x + y) as u8;
+            }
+        }
+
+        let bytes = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Rgb8Strided {
+                    data: &data,
+                    stride,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_image_codestream_rgb8_strided_matches_interleaved() {
+        let enc = JxlEncoder::default();
+        let width = 8usize;
+        let height = 4usize;
+        let row_bytes = width * 3;
+        let stride = row_bytes + 3;
+
+        let mut interleaved = vec![0u8; row_bytes * height];
+        for y in 0..height {
+            for x in 0..row_bytes {
+                interleaved[y * row_bytes + x] = (x * 7 + y * 13) as u8;
+            }
+        }
+
+        let mut strided = vec![0u8; stride * height];
+        for y in 0..height {
+            let src = &interleaved[y * row_bytes..(y + 1) * row_bytes];
+            let dst = &mut strided[y * stride..y * stride + row_bytes];
+            dst.copy_from_slice(src);
+        }
+
+        let a = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Rgb8Interleaved(&interleaved),
+            )
+            .unwrap();
+        let b = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Rgb8Strided {
+                    data: &strided,
+                    stride,
+                },
+            )
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_encode_image_codestream_rgb8_strided_invalid_stride() {
+        let enc = JxlEncoder::default();
+        let err = enc
+            .encode_image_codestream(
+                (8, 4),
+                JxlEncoderImageData::Rgb8Strided {
+                    data: &[0u8; 1],
+                    stride: 8,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidPixelRowStride {
+                minimum: 24,
+                actual: 8
+            }
+        ));
     }
 
     #[test]
