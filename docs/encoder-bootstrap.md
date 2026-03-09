@@ -9,7 +9,7 @@ Current local `jxl-encoder` branch includes an early pure-Rust encoder bootstrap
 - U32/i32 encoding helpers for JPEG XL field coders
 - Minimal codestream header emission (parses to `WithImageInfo`)
 - Minimal single-frame metadata + TOC emission (parses to `WithFrameInfo`)
-- Minimal decodable modular image stream (black output bootstrap)
+- Minimal decodable modular image stream (black output bootstrap, including multi-group images)
 - `jxle` CLI helper binary for generating bootstrap streams
 - Pure-Rust dependency guard script: `tools/check_encoder_pure_rust.py`
 

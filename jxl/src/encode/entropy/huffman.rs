@@ -65,14 +65,20 @@ pub fn write_single_symbol_huffman_table(
     Ok(())
 }
 
-/// Writes one or more single-symbol Huffman tables.
+/// Writes one or more single-symbol Huffman tables with a per-table symbol.
 ///
-/// `alphabet_sizes` length defines table count.
-pub fn write_single_symbol_huffman_codes(
+/// The stream layout matches `HuffmanCodes::decode`:
+/// 1) all alphabet-size varint16 values
+/// 2) all table payloads
+pub fn write_single_symbol_huffman_codes_with_symbols(
     writer: &mut BitWriter,
     alphabet_sizes: &[usize],
-    symbol: u16,
+    symbols: &[u16],
 ) -> Result<()> {
+    if alphabet_sizes.len() != symbols.len() {
+        return Err(Error::InvalidHuffman);
+    }
+
     for &sz in alphabet_sizes {
         if sz == 0 {
             return Err(Error::InvalidHuffman);
@@ -80,9 +86,23 @@ pub fn write_single_symbol_huffman_codes(
 
         // HuffmanCodes::decode expects varint16 = alphabet_size - 1.
         write_varint16(writer, (sz - 1) as u16)?;
+    }
+
+    for (&sz, &symbol) in alphabet_sizes.iter().zip(symbols.iter()) {
         write_single_symbol_huffman_table(writer, sz, symbol)?;
     }
+
     Ok(())
+}
+
+/// Writes one or more single-symbol Huffman tables with the same symbol value.
+pub fn write_single_symbol_huffman_codes(
+    writer: &mut BitWriter,
+    alphabet_sizes: &[usize],
+    symbol: u16,
+) -> Result<()> {
+    let symbols = vec![symbol; alphabet_sizes.len()];
+    write_single_symbol_huffman_codes_with_symbols(writer, alphabet_sizes, &symbols)
 }
 
 #[cfg(test)]
@@ -133,5 +153,19 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let codes = HuffmanCodes::decode(1, &mut br).unwrap();
         assert_eq!(codes.read(&mut br, 0), 0);
+    }
+
+    #[test]
+    fn test_write_single_symbol_huffman_codes_with_symbols_roundtrip() {
+        let mut writer = BitWriter::new();
+        write_single_symbol_huffman_codes_with_symbols(&mut writer, &[1, 8, 1], &[0, 7, 0])
+            .unwrap();
+        let bytes = writer.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let codes = HuffmanCodes::decode(3, &mut br).unwrap();
+        assert_eq!(codes.read(&mut br, 0), 0);
+        assert_eq!(codes.read(&mut br, 1), 7);
+        assert_eq!(codes.read(&mut br, 2), 0);
     }
 }
