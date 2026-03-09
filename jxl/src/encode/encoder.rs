@@ -11,7 +11,7 @@ use crate::{
 use super::{
     BitWriter, JxlEncoderOptions, container, headers,
     input::{
-        expand_gray8_to_rgb8, pack_gray8_strided, pack_rgb8_strided, validate_rgb8_interleaved_len,
+        pack_gray8_strided, pack_rgb8_strided, validate_rgb8_interleaved_len,
     },
 };
 
