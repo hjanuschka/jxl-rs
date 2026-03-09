@@ -43,6 +43,10 @@ struct Opt {
     #[arg(long)]
     raw_gray8_input: Option<PathBuf>,
 
+    /// Row stride in bytes for raw input modes
+    #[arg(long)]
+    raw_stride: Option<usize>,
+
     /// Constant modular leaf offset for --modular-image mode
     #[arg(long, default_value_t = 0)]
     modular_offset: i32,
@@ -82,6 +86,12 @@ fn main() -> Result<()> {
         ));
     }
 
+    if opt.raw_stride.is_some() && !has_raw_input {
+        return Err(color_eyre::eyre::eyre!(
+            "--raw-stride requires --raw-rgb8-input or --raw-gray8-input"
+        ));
+    }
+
     if (opt.modular_offset != 0 || opt.modular_predictor != 0) && !opt.modular_image {
         return Err(color_eyre::eyre::eyre!(
             "--modular-offset/--modular-predictor require --modular-image"
@@ -97,7 +107,11 @@ fn main() -> Result<()> {
     let (bytes, mode) = if let Some(raw_rgb_path) = &opt.raw_rgb8_input {
         let rgb = std::fs::read(raw_rgb_path)
             .wrap_err_with(|| format!("Failed to read raw RGB8 input {:?}", raw_rgb_path))?;
-        let image = JxlEncoderImageData::Rgb8Interleaved(&rgb);
+        let image = if let Some(stride) = opt.raw_stride {
+            JxlEncoderImageData::Rgb8Strided { data: &rgb, stride }
+        } else {
+            JxlEncoderImageData::Rgb8Interleaved(&rgb)
+        };
         let bytes = if opt.bare {
             enc.encode_image_codestream((opt.width, opt.height), image)?
         } else {
@@ -107,7 +121,14 @@ fn main() -> Result<()> {
     } else if let Some(raw_gray_path) = &opt.raw_gray8_input {
         let gray = std::fs::read(raw_gray_path)
             .wrap_err_with(|| format!("Failed to read raw Gray8 input {:?}", raw_gray_path))?;
-        let image = JxlEncoderImageData::Gray8Interleaved(&gray);
+        let image = if let Some(stride) = opt.raw_stride {
+            JxlEncoderImageData::Gray8Strided {
+                data: &gray,
+                stride,
+            }
+        } else {
+            JxlEncoderImageData::Gray8Interleaved(&gray)
+        };
         let bytes = if opt.bare {
             enc.encode_image_codestream((opt.width, opt.height), image)?
         } else {

@@ -51,4 +51,7 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --h
 
 # Encode raw Gray8 bytes (width*height)
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --raw-gray8-input frame.gray
+
+# Raw input with explicit row stride in bytes
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --raw-rgb8-input frame.rgb --raw-stride 512
 ```
