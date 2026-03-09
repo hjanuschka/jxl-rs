@@ -23,4 +23,4 @@ pub use huffman_encode::{
     HuffmanCode, build_huffman_code, count_nonzero, write_huffman_histograms, write_huffman_symbol,
     write_huffman_table,
 };
-pub use hybrid_uint::HybridUintConfig;
+pub use hybrid_uint::{HybridUintConfig, HybridUintEncoded};
