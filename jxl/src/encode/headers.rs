@@ -166,4 +166,13 @@ mod tests {
         let codestream = encode_minimal_codestream_header((1, 1)).unwrap();
         assert_eq!(codestream, vec![0xFF, 0x0A, 0x00, 0x00, 0x00, 0x0C]);
     }
+
+    #[test]
+    fn test_minimal_header_deterministic_output() {
+        for size in [(1, 1), (17, 9), (321, 123), (4096, 2048)] {
+            let a = encode_minimal_codestream_header(size).unwrap();
+            let b = encode_minimal_codestream_header(size).unwrap();
+            assert_eq!(a, b, "non-deterministic output for size {size:?}");
+        }
+    }
 }
