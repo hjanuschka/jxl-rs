@@ -25,7 +25,7 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[~]` Minimal headers/container writing.
 - `[~]` Minimal entropy helpers (HybridUint config, fixed/simple Huffman/context map writer primitives).
 - `[~]` Minimal modular decodable stream generation (constant tree leaf, synthetic output).
-- `[~]` Early real image-to-bitstream path: RGB8 raw input into modular stream (group-aware bootstrap path, interleaved + strided API inputs) plus Gray8 API variants (expanded to RGB bootstrap path).
+- `[~]` Early real image-to-bitstream path: RGB8 raw input into modular stream (group-aware bootstrap path, interleaved + strided API inputs) plus Gray8 API variants (expanded to RGB bootstrap path). Histogram-driven Huffman residual coding now available alongside fixed-token bootstrap.
 - `[ ]` Full entropy modeling and ANS encoding.
 - `[ ]` VarDCT lossy encoding.
 - `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
