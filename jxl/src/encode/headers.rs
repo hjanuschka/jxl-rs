@@ -373,8 +373,6 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     validate_size(width, height)?;
     validate_rgb_u8_buffer(width, height, rgb)?;
 
-    const TOKEN: u16 = 10;
-    const TREE_OFFSET: i32 = -256;
     let uint_config = HybridUintConfig::new(0, 0, 0);
 
     let width_usize = width as usize;
@@ -382,38 +380,81 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     let num_lf_groups = default_num_lf_groups(width, height);
     let num_groups_x = width.div_ceil(256);
 
-    let write_group_samples =
-        |writer: &mut BitWriter, origin: (u32, u32), size: (u32, u32)| -> Result<()> {
-            let (ox, oy) = origin;
-            let (gw, gh) = size;
-            let mut signed_residuals = Vec::with_capacity((gw as usize) * (gh as usize) * 3);
+    let choose_group_entropy_params = |origin: (u32, u32), size: (u32, u32)| -> (i32, u16) {
+        let (ox, oy) = origin;
+        let (gw, gh) = size;
 
-            // Decoder channel order is channel-major, then row-major for each channel.
-            for channel in 0..3 {
-                for y in oy..(oy + gh) {
-                    for x in ox..(ox + gw) {
-                        let pixel_index = y as usize * width_usize + x as usize;
-                        let sample = i32::from(rgb[pixel_index * 3 + channel]);
-                        signed_residuals.push(sample - TREE_OFFSET);
-                    }
+        let mut min_sample = u8::MAX;
+        let mut max_sample = u8::MIN;
+        for y in oy..(oy + gh) {
+            for x in ox..(ox + gw) {
+                let pixel_index = y as usize * width_usize + x as usize;
+                let base = pixel_index * 3;
+                for c in 0..3 {
+                    let sample = rgb[base + c];
+                    min_sample = min_sample.min(sample);
+                    max_sample = max_sample.max(sample);
                 }
             }
+        }
 
-            write_split0_fixed_token_signed_stream(writer, u32::from(TOKEN), &signed_residuals)
-        };
+        if min_sample == max_sample {
+            return (i32::from(min_sample), 0);
+        }
 
-    let mut lf_global_writer = BitWriter::new();
-    write_minimal_modular_lf_global_section_with_entropy_params(
-        &mut lf_global_writer,
-        TREE_OFFSET,
-        0,
-        TOKEN,
-        uint_config,
-    )?;
+        let range = u32::from(max_sample - min_sample);
+        let values = range + 1;
+        let ceil_log2_values = (u32::BITS - (values - 1).leading_zeros()) as u32;
+        let token = (ceil_log2_values + 2) as u16;
+        let low = 1i32 << (u32::from(token) - 2);
+        let offset = i32::from(min_sample) - low;
+
+        (offset, token)
+    };
+
+    let write_group_samples = |writer: &mut BitWriter,
+                               origin: (u32, u32),
+                               size: (u32, u32),
+                               tree_offset: i32,
+                               token: u16|
+     -> Result<()> {
+        let (ox, oy) = origin;
+        let (gw, gh) = size;
+        let mut signed_residuals = Vec::with_capacity((gw as usize) * (gh as usize) * 3);
+
+        // Decoder channel order is channel-major, then row-major for each channel.
+        for channel in 0..3 {
+            for y in oy..(oy + gh) {
+                for x in ox..(ox + gw) {
+                    let pixel_index = y as usize * width_usize + x as usize;
+                    let sample = i32::from(rgb[pixel_index * 3 + channel]);
+                    signed_residuals.push(sample - tree_offset);
+                }
+            }
+        }
+
+        write_split0_fixed_token_signed_stream(writer, u32::from(token), &signed_residuals)
+    };
 
     // Single-group path stores all channel samples in section 0.
     if num_groups == 1 {
-        write_group_samples(&mut lf_global_writer, (0, 0), (width, height))?;
+        let (tree_offset, token) = choose_group_entropy_params((0, 0), (width, height));
+
+        let mut lf_global_writer = BitWriter::new();
+        write_minimal_modular_lf_global_section_with_entropy_params(
+            &mut lf_global_writer,
+            tree_offset,
+            0,
+            token,
+            uint_config,
+        )?;
+        write_group_samples(
+            &mut lf_global_writer,
+            (0, 0),
+            (width, height),
+            tree_offset,
+            token,
+        )?;
         let lf_global_section = lf_global_writer.finish();
 
         let mut writer = BitWriter::new();
@@ -430,6 +471,14 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     // - section 1 (LF groups): empty
     // - section 2 (HF global): empty
     // - section 3..: one per image group with local tree + residual bits
+    let mut lf_global_writer = BitWriter::new();
+    write_minimal_modular_lf_global_section_with_entropy_params(
+        &mut lf_global_writer,
+        0,
+        0,
+        0,
+        uint_config,
+    )?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
@@ -441,15 +490,17 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         let gw = (width - ox).min(256);
         let gh = (height - oy).min(256);
 
+        let (tree_offset, token) = choose_group_entropy_params((ox, oy), (gw, gh));
+
         let mut group_writer = BitWriter::new();
         write_minimal_modular_global_data_with_entropy_params(
             &mut group_writer,
-            TREE_OFFSET,
+            tree_offset,
             0,
-            TOKEN,
+            token,
             uint_config,
         )?;
-        write_group_samples(&mut group_writer, (ox, oy), (gw, gh))?;
+        write_group_samples(&mut group_writer, (ox, oy), (gw, gh), tree_offset, token)?;
         hf_group_sections.push(group_writer.finish());
     }
 
