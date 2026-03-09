@@ -5,10 +5,15 @@
 
 use crate::{
     api::{CODESTREAM_SIGNATURE, CONTAINER_SIGNATURE},
-    error::{Error, Result},
+    error::Result,
 };
 
-use super::{BitWriter, JxlEncoderOptions, container, headers};
+use super::{
+    BitWriter, JxlEncoderOptions, container, headers,
+    input::{
+        expand_gray8_to_rgb8, pack_gray8_strided, pack_rgb8_strided, validate_rgb8_interleaved_len,
+    },
+};
 
 /// Top-level bitstream flavor for encoder output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,108 +65,25 @@ impl JxlEncoder {
         size: (u32, u32),
         image: JxlEncoderImageData<'_>,
     ) -> Result<Vec<u8>> {
-        let (width, height) = size;
-
-        let expand_gray_to_rgb = |gray: &[u8]| -> Result<Vec<u8>> {
-            let px_count = (width as usize)
-                .checked_mul(height as usize)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if gray.len() != px_count {
-                return Err(Error::InvalidPixelBufferLength {
-                    expected: px_count,
-                    actual: gray.len(),
-                });
-            }
-
-            let mut rgb = Vec::with_capacity(px_count * 3);
-            for &y in gray {
-                rgb.extend_from_slice(&[y, y, y]);
-            }
-            Ok(rgb)
-        };
+        let width = size.0 as usize;
+        let height = size.1 as usize;
 
         match image {
             JxlEncoderImageData::Rgb8Interleaved(rgb) => {
+                validate_rgb8_interleaved_len(rgb, width, height)?;
                 headers::encode_modular_u8_rgb_image_codestream(size, rgb)
             }
             JxlEncoderImageData::Rgb8Strided { data, stride } => {
-                let row_bytes = (width as usize)
-                    .checked_mul(3)
-                    .ok_or(Error::ArithmeticOverflow)?;
-
-                if stride < row_bytes {
-                    return Err(Error::InvalidPixelRowStride {
-                        minimum: row_bytes,
-                        actual: stride,
-                    });
-                }
-
-                let required = if height == 0 {
-                    0
-                } else {
-                    (height as usize - 1)
-                        .checked_mul(stride)
-                        .and_then(|x| x.checked_add(row_bytes))
-                        .ok_or(Error::ArithmeticOverflow)?
-                };
-                if data.len() < required {
-                    return Err(Error::InvalidPixelBufferLength {
-                        expected: required,
-                        actual: data.len(),
-                    });
-                }
-
-                let mut packed = Vec::with_capacity(
-                    row_bytes
-                        .checked_mul(height as usize)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                );
-                for y in 0..height as usize {
-                    let row_start = y * stride;
-                    packed.extend_from_slice(&data[row_start..row_start + row_bytes]);
-                }
-
+                let packed = pack_rgb8_strided(data, width, height, stride)?;
                 headers::encode_modular_u8_rgb_image_codestream(size, &packed)
             }
             JxlEncoderImageData::Gray8Interleaved(gray) => {
-                let rgb = expand_gray_to_rgb(gray)?;
+                let rgb = expand_gray8_to_rgb8(gray, width, height)?;
                 headers::encode_modular_u8_rgb_image_codestream(size, &rgb)
             }
             JxlEncoderImageData::Gray8Strided { data, stride } => {
-                let row_bytes = width as usize;
-                if stride < row_bytes {
-                    return Err(Error::InvalidPixelRowStride {
-                        minimum: row_bytes,
-                        actual: stride,
-                    });
-                }
-
-                let required = if height == 0 {
-                    0
-                } else {
-                    (height as usize - 1)
-                        .checked_mul(stride)
-                        .and_then(|x| x.checked_add(row_bytes))
-                        .ok_or(Error::ArithmeticOverflow)?
-                };
-                if data.len() < required {
-                    return Err(Error::InvalidPixelBufferLength {
-                        expected: required,
-                        actual: data.len(),
-                    });
-                }
-
-                let mut gray = Vec::with_capacity(
-                    row_bytes
-                        .checked_mul(height as usize)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                );
-                for y in 0..height as usize {
-                    let row_start = y * stride;
-                    gray.extend_from_slice(&data[row_start..row_start + row_bytes]);
-                }
-
-                let rgb = expand_gray_to_rgb(&gray)?;
+                let gray = pack_gray8_strided(data, width, height, stride)?;
+                let rgb = expand_gray8_to_rgb8(&gray, width, height)?;
                 headers::encode_modular_u8_rgb_image_codestream(size, &rgb)
             }
         }
@@ -455,7 +377,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::InvalidPixelRowStride {
+            crate::error::Error::InvalidPixelRowStride {
                 minimum: 24,
                 actual: 8
             }
