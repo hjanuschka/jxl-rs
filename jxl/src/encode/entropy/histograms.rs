@@ -5,7 +5,7 @@
 
 use crate::error::Result;
 
-use super::{HybridUintConfig, write_simple_zero_context_map};
+use super::{HybridUintConfig, write_simple_zero_context_map, write_single_symbol_huffman_codes};
 use crate::encode::BitWriter;
 
 /// Writes a minimal histogram stream that decodes to:
@@ -32,9 +32,8 @@ pub fn write_single_symbol_huffman_histograms(
     // One HybridUint config for one histogram cluster.
     HybridUintConfig::new(15, 0, 0).write(writer, 15)?;
 
-    // One Huffman table with alphabet size 1:
-    // decode_varint16 = 0 => alphabet_size = 1.
-    writer.write(1, 0)?;
+    // One Huffman table with alphabet size 1.
+    write_single_symbol_huffman_codes(writer, &[1], 0)?;
 
     Ok(())
 }
