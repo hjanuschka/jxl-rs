@@ -9,6 +9,7 @@ pub mod encoder;
 pub mod encodings;
 pub mod entropy;
 pub mod headers;
+pub mod input;
 pub mod modular;
 pub mod options;
 pub mod toc;
