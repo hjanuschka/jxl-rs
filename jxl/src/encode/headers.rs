@@ -386,6 +386,24 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), 1);
         assert_eq!(frames[0][0].size(), (3, 1));
+
+        let row = frames[0][0].row(0);
+        for &v in row {
+            assert!((v - 0.0).abs() < 1e-6, "expected black pixel, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_encode_minimal_modular_image_container_decodes_one_frame() {
+        let codestream = encode_minimal_modular_image_codestream((1, 1)).unwrap();
+        let container_stream = container::wrap_codestream(&codestream).unwrap();
+        let (decoded_frames, frames) =
+            crate::api::tests::decode(&container_stream, usize::MAX, false, false, None)
+                .unwrap();
+
+        assert_eq!(decoded_frames, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0].size(), (3, 1));
     }
 
     #[test]
