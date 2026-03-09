@@ -7,10 +7,14 @@ The current stable focus is decoding. Encoder work has started under the `encode
 Experimental bootstrap encoder helper:
 
 ```bash
+# Header-only bootstrap stream
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 320 --height 240
+
+# Minimal decodable modular stream (currently <= 256x256)
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image
 ```
 
-This currently emits metadata/bootstrap streams and is not yet a full image encoder.
+This is still very early and not yet a full image encoder.
 
 We strive to decode all conformant JPEG XL bitstreams correctly. If you find an image that can be decoded with the reference
 implementation `djxl` (from [`libjxl`](https://github.com/libjxl/libjxl)) but is decoded incorrectly or not at all by `jxl-rs`,
