@@ -12,6 +12,9 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 320 --h
 
 # Minimal decodable modular stream
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image
+
+# Same, but with a constant modular offset (for non-black output experiments)
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 12
 ```
 
 This is still very early and not yet a full image encoder.

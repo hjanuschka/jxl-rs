@@ -64,31 +64,47 @@ pub fn write_single_leaf_tree(writer: &mut BitWriter) -> Result<()> {
     write_single_leaf_tree_with_offset(writer, 0)
 }
 
-/// Writes minimal modular global subbitstream payload for tiny channels.
+/// Writes minimal modular global subbitstream payload.
 ///
 /// The payload uses:
 /// - local tree (`use_global_tree = false`)
 /// - default weighted predictor config
 /// - no modular transforms
-/// - single-leaf local tree with single-symbol histograms
-pub fn write_minimal_modular_global_data(writer: &mut BitWriter) -> Result<()> {
+/// - single-leaf local tree with constant `offset`
+pub fn write_minimal_modular_global_data_with_offset(
+    writer: &mut BitWriter,
+    offset: i32,
+) -> Result<()> {
     write_minimal_group_header(writer, /*use_global_tree=*/ false)?;
-    write_single_leaf_tree(writer)?;
+    write_single_leaf_tree_with_offset(writer, offset)?;
     Ok(())
+}
+
+/// Writes minimal modular global subbitstream payload with offset 0.
+pub fn write_minimal_modular_global_data(writer: &mut BitWriter) -> Result<()> {
+    write_minimal_modular_global_data_with_offset(writer, 0)
 }
 
 /// Writes a minimal LF global section prefix for a modular frame:
 /// - default LF quant factors
 /// - no global modular tree
 /// - minimal modular global data payload
-pub fn write_minimal_modular_lf_global_section(writer: &mut BitWriter) -> Result<()> {
+pub fn write_minimal_modular_lf_global_section_with_offset(
+    writer: &mut BitWriter,
+    offset: i32,
+) -> Result<()> {
     // LfQuantFactors::new => default path.
     writer.write(1, 1)?;
 
     // decode_lf_global tree flag: no global tree.
     writer.write(1, 0)?;
 
-    write_minimal_modular_global_data(writer)
+    write_minimal_modular_global_data_with_offset(writer, offset)
+}
+
+/// Writes a minimal LF global section prefix with offset 0.
+pub fn write_minimal_modular_lf_global_section(writer: &mut BitWriter) -> Result<()> {
+    write_minimal_modular_lf_global_section_with_offset(writer, 0)
 }
 
 #[cfg(test)]
