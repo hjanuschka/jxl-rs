@@ -346,6 +346,52 @@ mod tests {
     }
 
     #[test]
+    fn test_2x1_image_roundtrip() {
+        // 2x1 image: (50,0,0) and (100,0,0). Offset=50, residuals channel-major.
+        // R: [50-50, 100-50] = [0, 50]
+        // G: [0-50, 0-50] = [-50, -50]
+        // B: [0-50, 0-50] = [-50, -50]
+        let residuals: Vec<i32> = vec![0, 50, -50, -50, -50, -50];
+        let uint_config = HybridUintConfig::new(4, 2, 0);
+        let offset = 50;
+
+        let mut writer = BitWriter::new();
+        super::write_lf_global_section_huffman(
+            &mut writer,
+            offset,
+            0,
+            Some(&residuals),
+            uint_config,
+        )
+        .unwrap();
+        let bytes = finish_with_padding(writer);
+
+        // Decode via full modular path.
+        let mut br = BitReader::new(&bytes);
+        // LfQuantFactors
+        assert_eq!(br.read(1).unwrap(), 1); // all_default
+        // Global tree
+        assert_eq!(br.read(1).unwrap(), 0); // no global tree
+        // GroupHeader
+        let _header = GroupHeader::read(&mut br).unwrap();
+        // Tree
+        let tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
+        assert_eq!(tree.nodes.len(), 1);
+        // Tree nodes are not directly accessible (private), so just check via decode.
+
+        let mut reader = SymbolReader::new(&tree.histograms, &mut br, None).unwrap();
+        for (i, &expected) in residuals.iter().enumerate() {
+            let got = reader.read_signed(&tree.histograms, &mut br, 0);
+            assert_eq!(
+                got, expected,
+                "residual mismatch at index {}: got {} expected {}",
+                i, got, expected
+            );
+        }
+        reader.check_final_state(&tree.histograms, &mut br).unwrap();
+    }
+
+    #[test]
     fn test_hf_group_wide_range_roundtrip() {
         // Test with -5..=8 which triggers the failure in the full encoder.
         let residuals: Vec<i32> = (-5..=8).collect();
