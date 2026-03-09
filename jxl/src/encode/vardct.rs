@@ -15,6 +15,9 @@ use crate::encode::headers::write_file_header;
 use crate::encode::toc::write_toc;
 use crate::encode::xyb::srgb_u8_to_xyb;
 use crate::error::Result;
+use crate::frame::block_context_map::{
+    self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT,
+};
 use crate::headers::encodings::{U32, U32Coder};
 use jxl_transforms::dct2d_8_scalar;
 
@@ -83,6 +86,13 @@ pub fn encode_vardct_u8_rgb_codestream(
     // INV_LF_QUANT from the spec/decoder: [4096.0, 512.0, 256.0] for channels [X, Y, B]
     let inv_lf_quant = [4096.0f32, 512.0, 256.0];
 
+    // Get default dequant weights for DCT8x8 (3*64 floats: X=0..64, Y=64..128, B=128..192)
+    let dequant_weights = default_dct8x8_dequant_weights();
+
+    // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
+    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0); // = 0.8
+    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0); // = 1.0
+
     // CfL: with default color correlation, y_to_x_lf=0, y_to_b_lf=1.0
     // For encoding: in_y = dc_y, in_x = dc_x, in_b = dc_b - dc_y
     // The channels in dct arrays are in XYB order.
@@ -94,6 +104,7 @@ pub fn encode_vardct_u8_rgb_codestream(
     let mut qx = vec![0i32; num_blocks * 64];
     let mut qy = vec![0i32; num_blocks * 64];
     let mut qb = vec![0i32; num_blocks * 64];
+    let raw_quant = 1u32; // uniform quant field
 
     for blk in 0..num_blocks {
         // DC: apply CfL decorrelation and proper DC quantization
@@ -111,11 +122,22 @@ pub fn encode_vardct_u8_rgb_codestream(
         dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
         dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
 
-        // AC: uniform quantization for now (TODO: use dequant matrix weights)
+        // AC: apply CfL decorrelation and quantize using dequant matrix weights
+        // Decoder CfL: final_x = x_cc_mul * y + x, final_b = b_cc_mul * y + b
+        // With defaults: x_cc_mul=0, b_cc_mul=1.0
+        // Encoding: enc_x = dct_x, enc_y = dct_y, enc_b = dct_b - dct_y
         for k in 1..64 {
-            qx[blk * 64 + k] = quantize_ac(dct_x[blk * 64 + k], global_scale, 1);
-            qy[blk * 64 + k] = quantize_ac(dct_y[blk * 64 + k], global_scale, 1);
-            qb[blk * 64 + k] = quantize_ac(dct_b[blk * 64 + k], global_scale, 1);
+            let dw_x = dequant_weights[k] * x_dm_multiplier;
+            let dw_y = dequant_weights[64 + k];
+            let dw_b = dequant_weights[128 + k] * b_dm_multiplier;
+
+            let ac_x = dct_x[blk * 64 + k];
+            let ac_y = dct_y[blk * 64 + k];
+            let ac_b = dct_b[blk * 64 + k] - dct_y[blk * 64 + k]; // CfL decorrelation
+
+            qx[blk * 64 + k] = quantize_ac(ac_x, global_scale, raw_quant, dw_x);
+            qy[blk * 64 + k] = quantize_ac(ac_y, global_scale, raw_quant, dw_y);
+            qb[blk * 64 + k] = quantize_ac(ac_b, global_scale, raw_quant, dw_b);
         }
         // DC position in AC array is always 0 (DC is separate)
     }
@@ -167,20 +189,29 @@ fn quantize_dc(dc_float: f32, global_scale: u32, quant_lf: u32, inv_lf_quant: f3
     (dc_float * scale).round() as i32
 }
 
-/// Quantize AC coefficients for a single channel.
+/// Get the default DCT8x8 dequant matrix weights.
 ///
-/// The decoder dequantizes AC as:
-///   ac_float = quantized * dequant_weight[k] * inv_global_scale / raw_quant
+/// Returns 3*64 floats: 64 weights per channel (X, Y, B).
+/// These are the same weights computed by the decoder from the library
+/// encoding with `all_default=true`.
+fn default_dct8x8_dequant_weights() -> &'static [f32] {
+    use crate::frame::quant_weights::DequantMatrices;
+    DequantMatrices::get_library_table(0)
+}
+
+/// Quantize a single AC coefficient using the dequant matrix.
 ///
-/// where inv_global_scale = 2^16 / global_scale
+/// The decoder dequantizes as:
+///   ac_float = adjust_quant_bias(quantized) * dequant_weight[k] * inv_global_scale / raw_quant
 ///
-/// For now, with all_default quant matrices and raw_quant=1, we use uniform weights.
-/// TODO: use actual default dequant matrix weights.
-fn quantize_ac(ac_float: f32, global_scale: u32, _raw_quant: u32) -> i32 {
-    // With raw_quant=1 and assuming dequant_weight=1.0:
-    // ac_float = quantized * 1.0 * (2^16 / global_scale) / 1
-    // quantized = round(ac_float * global_scale / 2^16)
-    let scale = global_scale as f32 / (1u32 << 16) as f32;
+/// For forward quantization (ignoring quant bias):
+///   quantized = round(ac_float * raw_quant / (dequant_weight[k] * inv_global_scale))
+///             = round(ac_float * raw_quant * global_scale / (dequant_weight[k] * 2^16))
+fn quantize_ac(ac_float: f32, global_scale: u32, raw_quant: u32, dequant_weight: f32) -> i32 {
+    if dequant_weight.abs() < 1e-10 {
+        return 0;
+    }
+    let scale = (global_scale as f32 * raw_quant as f32) / ((1u32 << 16) as f32 * dequant_weight);
     (ac_float * scale).round() as i32
 }
 
@@ -323,6 +354,148 @@ fn encode_hf_metadata_modular(
     Ok(())
 }
 
+// ==================== AC coefficient tokenization ====================
+
+/// A token in the AC coefficient stream, with its context.
+struct AcToken {
+    /// Context index for this token.
+    context: usize,
+    /// The unsigned value to encode (via HybridUint).
+    value: u32,
+}
+
+/// Pack a signed integer into an unsigned value for HybridUint encoding.
+/// This is the inverse of the decoder's `unpack_signed`.
+fn pack_signed(x: i32) -> u32 {
+    if x >= 0 {
+        (x as u32) << 1
+    } else {
+        ((-x as u32) << 1) - 1
+    }
+}
+
+/// Natural (zigzag) coefficient order for DCT8x8.
+/// Maps scan position k (0..64) to coefficient index in the 8x8 block.
+fn natural_coeff_order_8x8() -> [usize; 64] {
+    // Standard JPEG/JXL zigzag order
+    let order: [usize; 64] = [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+        12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    ];
+    order
+}
+
+/// Tokenize AC coefficients for a single block (DCT8x8).
+///
+/// Produces tokens matching the decoder's reading order in `decode_vardct_group`.
+fn tokenize_block_8x8(
+    coeffs: &[i32],  // 64 coefficients, DC position is 0 (not used)
+    channel: usize,
+    block_context: usize,
+    num_contexts: usize,
+    context_offset: usize,
+    num_nzeros_left: u32,  // predicted nonzeros from neighbors
+    tokens: &mut Vec<AcToken>,
+) -> usize {
+    let order = natural_coeff_order_8x8();
+
+    // Count actual nonzeros (positions 1..64 in scan order)
+    let mut nonzeros = 0usize;
+    for k in 1..64 {
+        if coeffs[order[k]] != 0 {
+            nonzeros += 1;
+        }
+    }
+
+    // Emit nonzeros count token
+    let predicted = num_nzeros_left;
+    let nz_context = nonzero_context(predicted as usize, block_context, num_contexts)
+        + context_offset;
+    tokens.push(AcToken { context: nz_context, value: nonzeros as u32 });
+
+    // Emit coefficient tokens
+    let histo_offset = zero_density_context_offset(block_context, num_contexts)
+        + context_offset;
+    let mut nz_left = nonzeros;
+    let mut prev: usize = if nonzeros > 64 / 16 { 0 } else { 1 };
+
+    for k in 1..64 {
+        if nz_left == 0 {
+            break;
+        }
+        let ctx = histo_offset + block_context_map::zero_density_context(nz_left, k, 0, prev);
+        let coeff = coeffs[order[k]];
+        let unsigned = pack_signed(coeff);
+        tokens.push(AcToken { context: ctx, value: unsigned });
+        prev = if coeff != 0 { 1 } else { 0 };
+        if coeff != 0 {
+            nz_left -= 1;
+        }
+    }
+
+    nonzeros
+}
+
+/// Compute block context for DCT8x8 using default BlockContextMap.
+/// Simplified version of BlockContextMap::block_context for default map.
+fn default_block_context(channel: usize, quant_lf_idx: usize) -> usize {
+    // Default context map has:
+    //   no lf thresholds (num_lf_contexts=1), no qf thresholds
+    //   context_map indices for (channel, shape, qf, lf) -> block_context
+    //
+    // With all defaults: qf_idx=0, lf_idx=0, shape=0 (DCT8x8)
+    // idx = channel_remap * NUM_ORDERS + shape
+    // idx = idx * (qf_thresholds.len()+1) + qf_idx
+    // idx = idx * num_lf_contexts + lf_idx
+    // channel_remap: 0->1(Y), 1->0(X), 2->2(B)
+    let ch_remap = if channel < 2 { channel ^ 1 } else { 2 };
+    let shape_id = 0; // DCT8x8
+    let num_orders = 13; // NUM_ORDERS
+    let idx = ch_remap * num_orders + shape_id;
+    // Default: no qf thresholds and no lf thresholds -> idx * 1 + 0 = idx
+
+    // Default context_map lookup (from decoder):
+    // [0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
+    //  7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+    //  7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14]
+    const DEFAULT_CTX_MAP: [u8; 39] = [
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
+        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+    ];
+    DEFAULT_CTX_MAP[idx] as usize
+}
+
+/// Compute nonzero context. Matches BlockContextMap::nonzero_context.
+fn nonzero_context(nonzeros: usize, block_context: usize, num_contexts: usize) -> usize {
+    let bucket = if nonzeros < 8 {
+        nonzeros
+    } else if nonzeros < 64 {
+        4 + nonzeros / 2
+    } else {
+        36
+    };
+    bucket * num_contexts + block_context
+}
+
+/// Compute zero_density_context_offset. Matches BlockContextMap::zero_density_context_offset.
+fn zero_density_context_offset(block_context: usize, num_contexts: usize) -> usize {
+    num_contexts * NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT * block_context
+}
+
+/// Predict number of nonzeros for a block based on neighbors.
+/// Matches predict_num_nonzeros from the decoder.
+fn predict_num_nonzeros_simple(left: u32, top: u32) -> u32 {
+    // Simple average of available neighbors
+    if left == 0 && top == 0 {
+        0 // No neighbors yet
+    } else {
+        (left + top + 1) / 2
+    }
+}
+
 fn global_scale_coder() -> U32Coder {
     U32Coder::Select(
         U32::BitsOffset { n: 11, off: 1 },
@@ -401,9 +574,9 @@ fn encode_single_group_section(
     dc_y: &[i32],
     dc_x: &[i32],
     dc_b: &[i32],
-    _ac_x: &[i32],
-    _ac_y: &[i32],
-    _ac_b: &[i32],
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
@@ -482,17 +655,51 @@ fn encode_single_group_section(
     // For simplicity, since all values are 0, a single-symbol stream works.
     encode_hf_metadata_modular(&mut w, cr_w, cr_h, num_blocks, bw, bh, &hf_meta)?;
 
+    // === HfGlobal + HfGroup0: AC coefficients ===
+    // Tokenize all blocks' AC coefficients
+    let num_contexts = 15; // default BlockContextMap has 15 block contexts
+    let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
+    let context_offset = 0; // single histogram set
+
+    let mut tokens: Vec<AcToken> = Vec::new();
+    let mut num_nzeros: Vec<Vec<u32>> = vec![vec![0u32; bw]; bh]; // per block
+
+    // Tokenize in block scan order (matching decoder: by, bx, then channels Y,X,B)
+    let ac_channels = [ac_y, ac_x, ac_b]; // channels in order [1,0,2] = Y,X,B
+    let channel_indices = [1usize, 0, 2]; // actual channel indices for context
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let blk_idx = by * bw + bx;
+            for (ci, &c) in channel_indices.iter().enumerate() {
+                let ac = ac_channels[ci];
+                let blk_coeffs = &ac[blk_idx * 64..(blk_idx + 1) * 64];
+
+                let block_ctx = default_block_context(c, 0);
+
+                // Predict nonzeros from neighbors
+                let left_nz = if bx > 0 { num_nzeros[by][bx - 1] } else { 0 };
+                let top_nz = if by > 0 { num_nzeros[by - 1][bx] } else { 0 };
+                let predicted = predict_num_nonzeros_simple(left_nz, top_nz);
+
+                let nz = tokenize_block_8x8(
+                    blk_coeffs, c, block_ctx, num_contexts,
+                    context_offset, predicted, &mut tokens,
+                );
+                num_nzeros[by][bx] = nz as u32;
+            }
+        }
+    }
+
     // === HfGlobal ===
     // DequantMatrices: all_default = true
     w.write(1, 1)?;
-    // num_histograms: ceil_log2(1) = 0 bits
-    // used_orders: selector 2 = no custom orders
+    // num_histograms: ceil_log2(1) = 0 bits (1 group -> 0 bits)
+    // used_orders: selector 2 = no custom orders (value 0)
     w.write(2, 2)?;
-    // AC histograms: single-symbol Huffman for all 165 contexts
-    write_ac_entropy_header(&mut w, 165)?;
 
-    // === HfGroup0 ===
-    // AC coefficients: with single-symbol histogram (symbol 0), no bits needed
+    // Build and write AC entropy histograms
+    write_ac_histograms_and_tokens(&mut w, num_ac_contexts, &tokens)?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -597,75 +804,85 @@ fn encode_hf_global_section(
     // used_orders: selector 2 = no custom orders (natural order)
     w.write(2, 2)?;
 
-    // AC coefficient histograms
-    // With default BlockContextMap: 15 block contexts
-    // NON_ZERO_BUCKETS = 4, ZERO_DENSITY_CONTEXT_COUNT = 7
-    // num_ac_contexts = 15 * (4 + 7) = 165
-    // Total contexts = 1 histogram * 165 = 165
-    let num_ac_contexts = 165;
-
-    // Write AC entropy header with all-zero single-symbol histograms
-    write_ac_entropy_header(&mut w, num_ac_contexts)?;
+    // AC coefficient histograms: placeholder for multi-group (not yet implemented)
+    let num_ac_contexts = 15 * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
+    let empty_tokens: Vec<AcToken> = Vec::new();
+    write_ac_histograms_and_tokens(&mut w, num_ac_contexts, &empty_tokens)?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
 
 /// Write AC entropy stream header (Huffman histograms for AC contexts).
-/// Write AC entropy header: Histograms with all-zero single-symbol Huffman.
+/// Build and write AC entropy histograms and token data.
 ///
-/// Matches the Histograms::decode format:
-/// 1. LZ77 params (disabled)
-/// 2. Context map (all contexts -> histogram 0)
-/// 3. use_prefix_code = true (Huffman mode)
-/// 4. HybridUint configs (1 config for 1 histogram)
-/// 5. Huffman tables (1 single-symbol table)
-fn write_ac_entropy_header(w: &mut BitWriter, num_contexts: usize) -> Result<()> {
-    // 1. LZ77 enabled = false
-    w.write(1, 0)?;
+/// This encodes the AC coefficients using Huffman coding:
+/// 1. Collect token frequencies per context
+/// 2. Cluster contexts to a single histogram (for simplicity)
+/// 3. Build Huffman codes from frequencies
+/// 4. Write Histograms header (LZ77 + context_map + Huffman tables)
+/// 5. Write token stream (Huffman symbols + HybridUint extra bits)
+fn write_ac_histograms_and_tokens(
+    w: &mut BitWriter,
+    num_ac_contexts: usize,
+    tokens: &[AcToken],
+) -> Result<()> {
+    use crate::encode::entropy::huffman_encode::{build_huffman_code, write_huffman_symbol};
 
-    // 2. Context map: all contexts -> histogram 0
-    crate::encode::entropy::context_map::write_simple_zero_context_map(w, num_contexts)?;
+    // HybridUint config for AC: (4, 1, 2) matches libjxl e3 default
+    let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
 
-    // 3. use_prefix_code = true (Huffman)
-    // For Huffman, log_alpha_size is implicitly HUFFMAN_MAX_BITS (15)
-    w.write(1, 1)?;
+    // Encode all values through HybridUint to get tokens
+    let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
 
-    // 4. HybridUint config for the single histogram
-    // HybridUint::decode reads: split_exponent from log_alpha_size bits
-    // For HUFFMAN_MAX_BITS = 15, that's 4 bits (ceil_log2(15+1) = 4)
-    // split_exponent = 4 (default)
-    // Then reads msb_in_token (max split_exponent, so 3 bits for value 4... wait)
-    // Actually, HybridUint::decode(log_alpha_size=15):
-    //   split_exponent = br.read(ceil_log2(log_alpha_size + 1)) = br.read(4)
-    //   msb_in_token = br.read(ceil_log2(split_exponent + 1))
-    //   lsb_in_token = br.read(ceil_log2(split_exponent - msb_in_token + 1))
-    // For split_exponent=0: msb and lsb are both 0, reads nothing further.
-    // split_exponent=0 means all values are direct tokens (no extra bits).
-    // This is simplest for single-symbol (symbol 0).
-    let log_alpha_size = 15; // HUFFMAN_MAX_BITS
-    let ceil_log2_las_plus1 = 32 - (log_alpha_size as u32).leading_zeros(); // 4
-    w.write(ceil_log2_las_plus1 as usize, 0)?; // split_exponent = 0
-    // With split_exponent=0: no further HybridUint params to read.
+    // Find max token across all encoded values
+    let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
+    let alphabet_size = (max_token as usize + 1).max(1);
 
-    // 5. Single Huffman table: symbol 0, alphabet size determined by log_alpha_size
-    // For Huffman, HuffmanCodes::decode reads num_histograms tables.
-    // Each table is read by Table::decode which reads the alphabet size.
-    // The alphabet size for Huffman is determined by the HybridUint config.
-    //
-    // Actually wait -- looking at HuffmanCodes::decode:
-    // alphabet_size = read_varint16() + 1 per histogram
-    // Then Table::decode(alphabet_size)
-    //
-    // For single symbol 0: alphabet_size = 1 (varint16 = 0)
-    // Table::decode with al_size=1: reads nothing, fills table[0] = 0.
+    // Collect frequencies across all contexts (single histogram)
+    let mut frequencies = vec![0u64; alphabet_size];
+    for enc in &encoded {
+        frequencies[enc.token as usize] += 1;
+    }
 
-    // Write varint16(0) = alphabet_size - 1 = 0
-    // varint16(0): first bit = 0 -> value 0
-    w.write(1, 0)?; // varint16 = 0 -> alphabet_size = 1
+    // Handle empty token stream (all-zero coefficients)
+    if tokens.is_empty() || frequencies.iter().all(|&f| f == 0) {
+        // Write a minimal single-symbol histogram
+        // LZ77 disabled
+        w.write(1, 0)?;
+        // Context map: all -> histogram 0
+        crate::encode::entropy::context_map::write_simple_zero_context_map(w, num_ac_contexts)?;
+        // use_prefix_code = true
+        w.write(1, 1)?;
+        // HybridUint: split_exponent=0
+        let zero_cfg = crate::encode::entropy::HybridUintConfig::new(0, 0, 0);
+        zero_cfg.write(w, 15)?;
+        // varint16(0) = alphabet_size 1
+        w.write(1, 0)?;
+        // Table with al_size=1: no data
+        return Ok(());
+    }
 
-    // Table::decode with alphabet_size=1: no bits read.
-    // Done!
+    // Build Huffman code
+    let code = build_huffman_code(&frequencies)
+        .ok_or(crate::error::Error::InvalidHuffman)?;
+
+    // Write the Histograms header
+    let context_map = vec![0u8; num_ac_contexts]; // all -> histogram 0
+    crate::encode::entropy::huffman_encode::write_huffman_histograms(
+        w,
+        &context_map,
+        &[uint_config],
+        &[code.clone()],
+    )?;
+
+    // Write token data: for each token, write Huffman symbol + extra bits
+    for (token, enc) in tokens.iter().zip(encoded.iter()) {
+        write_huffman_symbol(w, &code, enc.token as usize)?;
+        if enc.nbits > 0 {
+            w.write(enc.nbits as usize, enc.extra_bits as u64)?;
+        }
+    }
 
     Ok(())
 }
@@ -852,8 +1069,14 @@ mod tests {
                 rgb[i + 2] = 128;                   // B: constant
             }
         }
-        let config = VarDctConfig::default();
+        // Use low distance for AC detail
+        let config = VarDctConfig { distance: 0.1 };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
+        eprintln!("Gradient codestream: {} bytes", cs.len());
+
+        // Write to file for djxl testing
+        let file_data = crate::encode::container::wrap_codestream(&cs).unwrap();
+        std::fs::write("/tmp/test_vardct_gradient.jxl", &file_data).unwrap();
 
         // Decode with jxl-rs
         let (_n, frames) = crate::api::tests::decode(
