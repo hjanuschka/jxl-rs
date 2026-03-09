@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.jxl]
 path = ".."
+features = ["encoder"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -29,5 +30,11 @@ doc = false
 [[bin]]
 name = "decode_header"
 path = "fuzz_targets/decode_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_bit_writer_roundtrip"
+path = "fuzz_targets/encode_bit_writer_roundtrip.rs"
 test = false
 doc = false

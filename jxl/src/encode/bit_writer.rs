@@ -4,7 +4,7 @@
 // license that can be found in the LICENSE file.
 
 use crate::{
-    bit_reader::{BitReader, MAX_BITS_PER_CALL},
+    bit_reader::MAX_BITS_PER_CALL,
     error::{Error, Result},
 };
 
@@ -120,6 +120,7 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bit_reader::BitReader;
     use rand::{Rng, SeedableRng};
     use rand_xorshift::XorShiftRng;
 
