@@ -30,7 +30,7 @@ struct Opt {
     #[arg(long)]
     with_frame_info: bool,
 
-    /// Emit a minimal decodable modular image stream (currently <= 256x256)
+    /// Emit a minimal decodable modular image stream
     #[arg(long)]
     modular_image: bool,
 }

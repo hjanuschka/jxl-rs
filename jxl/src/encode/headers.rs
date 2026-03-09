@@ -9,7 +9,10 @@ use crate::{
     headers::encodings::{U32, U32Coder},
 };
 
-use super::{BitWriter, write_minimal_modular_lf_global_section, write_toc, write_u32};
+use super::{
+    BitWriter, write_minimal_modular_global_data, write_minimal_modular_lf_global_section,
+    write_toc, write_u32,
+};
 
 fn large_size_coder() -> U32Coder {
     U32Coder::Select(
@@ -134,23 +137,25 @@ fn write_default_modular_frame_header(writer: &mut BitWriter) -> Result<()> {
     Ok(())
 }
 
+fn default_num_groups(width: u32, height: u32) -> u32 {
+    // FrameHeader defaults for modular path: group_dim = 256.
+    width.div_ceil(256) * height.div_ceil(256)
+}
+
+fn default_num_lf_groups(width: u32, height: u32) -> u32 {
+    // With default frame header parameters, LF groups operate on size_blocks()
+    // where each block is 8x8, then grouped by group_dim=256 blocks.
+    width.div_ceil(2048) * height.div_ceil(2048)
+}
+
 fn default_num_toc_entries(width: u32, height: u32) -> u32 {
-    // These numbers follow FrameHeader defaults:
-    // - group_dim = 256
-    // - lf_group_dim = 2048
-    // - num_passes = 1
-    let num_groups_x = width.div_ceil(256);
-    let num_groups_y = height.div_ceil(256);
-    let num_groups = num_groups_x * num_groups_y;
+    let num_groups = default_num_groups(width, height);
 
     if num_groups == 1 {
         return 1;
     }
 
-    let num_lf_groups_x = width.div_ceil(2048);
-    let num_lf_groups_y = height.div_ceil(2048);
-    let num_lf_groups = num_lf_groups_x * num_lf_groups_y;
-
+    let num_lf_groups = default_num_lf_groups(width, height);
     2 + num_lf_groups + num_groups
 }
 
@@ -193,8 +198,7 @@ pub fn encode_minimal_single_frame_codestream(size: (u32, u32)) -> Result<Vec<u8
     Ok(writer.finish())
 }
 
-/// Encodes a minimal fully decodable modular single-frame codestream for small
-/// images (`<= 256x256`).
+/// Encodes a minimal fully decodable modular single-frame codestream.
 ///
 /// The produced image decodes to black pixels and uses:
 /// - default file header metadata
@@ -205,13 +209,16 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
     let (width, height) = size;
     validate_size(width, height)?;
 
-    if width > 256 || height > 256 {
-        return Err(Error::InvalidImageSize(width as usize, height as usize));
-    }
+    let num_groups = default_num_groups(width, height);
+    let num_lf_groups = default_num_lf_groups(width, height);
 
-    let mut section_writer = BitWriter::new();
-    write_minimal_modular_lf_global_section(&mut section_writer)?;
-    let section = section_writer.finish();
+    let mut lf_global_writer = BitWriter::new();
+    write_minimal_modular_lf_global_section(&mut lf_global_writer)?;
+    let lf_global_section = lf_global_writer.finish();
+
+    let mut hf_group_writer = BitWriter::new();
+    write_minimal_modular_global_data(&mut hf_group_writer)?;
+    let hf_group_section = hf_group_writer.finish();
 
     let mut writer = BitWriter::new();
     write_minimal_file_header_fields(&mut writer, width, height)?;
@@ -221,9 +228,33 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
 
     write_default_modular_frame_header(&mut writer)?;
 
-    // Single-group/single-pass => one TOC entry.
-    write_toc(&mut writer, &[section.len() as u32])?;
-    writer.write_aligned_bytes(&section)?;
+    if num_groups == 1 {
+        // Single-group special case: one combined section.
+        write_toc(&mut writer, &[lf_global_section.len() as u32])?;
+        writer.write_aligned_bytes(&lf_global_section)?;
+        return Ok(writer.finish());
+    }
+
+    // General case layout:
+    // - LF global
+    // - LF groups (all empty for this bootstrap stream)
+    // - HF global (empty)
+    // - HF groups (one minimal modular sub-bitstream per group)
+    let mut toc_entries = Vec::new();
+    toc_entries.push(lf_global_section.len() as u32);
+    toc_entries.extend(std::iter::repeat_n(0u32, num_lf_groups as usize));
+    toc_entries.push(0); // HF global
+    toc_entries.extend(std::iter::repeat_n(
+        hf_group_section.len() as u32,
+        num_groups as usize,
+    ));
+
+    write_toc(&mut writer, &toc_entries)?;
+
+    writer.write_aligned_bytes(&lf_global_section)?;
+    for _ in 0..num_groups {
+        writer.write_aligned_bytes(&hf_group_section)?;
+    }
 
     Ok(writer.finish())
 }
@@ -398,12 +429,27 @@ mod tests {
         let codestream = encode_minimal_modular_image_codestream((1, 1)).unwrap();
         let container_stream = container::wrap_codestream(&codestream).unwrap();
         let (decoded_frames, frames) =
-            crate::api::tests::decode(&container_stream, usize::MAX, false, false, None)
-                .unwrap();
+            crate::api::tests::decode(&container_stream, usize::MAX, false, false, None).unwrap();
 
         assert_eq!(decoded_frames, 1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0][0].size(), (3, 1));
+    }
+
+    #[test]
+    fn test_encode_minimal_modular_image_multigroup_decodes_one_frame() {
+        let codestream = encode_minimal_modular_image_codestream((257, 1)).unwrap();
+        let (decoded_frames, frames) =
+            crate::api::tests::decode(&codestream, usize::MAX, false, false, None).unwrap();
+
+        assert_eq!(decoded_frames, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0].size(), (257 * 3, 1));
+
+        let row = frames[0][0].row(0);
+        for &v in row {
+            assert!((v - 0.0).abs() < 1e-6, "expected black pixel, got {v}");
+        }
     }
 
     #[test]
@@ -427,7 +473,14 @@ mod tests {
             );
         }
 
-        for size in [(1, 1), (17, 9), (128, 128), (256, 256)] {
+        for size in [
+            (1, 1),
+            (17, 9),
+            (128, 128),
+            (256, 256),
+            (257, 1),
+            (257, 257),
+        ] {
             let a = encode_minimal_modular_image_codestream(size).unwrap();
             let b = encode_minimal_modular_image_codestream(size).unwrap();
             assert_eq!(a, b, "non-deterministic modular output for size {size:?}");
