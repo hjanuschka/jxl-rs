@@ -24,6 +24,10 @@ pub enum JxlEncoderImageData<'a> {
     Rgb8Interleaved(&'a [u8]),
     /// RGB8 samples with explicit row stride in bytes.
     Rgb8Strided { data: &'a [u8], stride: usize },
+    /// Interleaved Gray8 samples: `[y, y, y, ...]`.
+    Gray8Interleaved(&'a [u8]),
+    /// Gray8 samples with explicit row stride in bytes.
+    Gray8Strided { data: &'a [u8], stride: usize },
 }
 
 /// High-level encoder entry point.
@@ -56,12 +60,31 @@ impl JxlEncoder {
         size: (u32, u32),
         image: JxlEncoderImageData<'_>,
     ) -> Result<Vec<u8>> {
+        let (width, height) = size;
+
+        let expand_gray_to_rgb = |gray: &[u8]| -> Result<Vec<u8>> {
+            let px_count = (width as usize)
+                .checked_mul(height as usize)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if gray.len() != px_count {
+                return Err(Error::InvalidPixelBufferLength {
+                    expected: px_count,
+                    actual: gray.len(),
+                });
+            }
+
+            let mut rgb = Vec::with_capacity(px_count * 3);
+            for &y in gray {
+                rgb.extend_from_slice(&[y, y, y]);
+            }
+            Ok(rgb)
+        };
+
         match image {
             JxlEncoderImageData::Rgb8Interleaved(rgb) => {
                 headers::encode_modular_u8_rgb_image_codestream(size, rgb)
             }
             JxlEncoderImageData::Rgb8Strided { data, stride } => {
-                let (width, height) = size;
                 let row_bytes = (width as usize)
                     .checked_mul(3)
                     .ok_or(Error::ArithmeticOverflow)?;
@@ -99,6 +122,47 @@ impl JxlEncoder {
                 }
 
                 headers::encode_modular_u8_rgb_image_codestream(size, &packed)
+            }
+            JxlEncoderImageData::Gray8Interleaved(gray) => {
+                let rgb = expand_gray_to_rgb(gray)?;
+                headers::encode_modular_u8_rgb_image_codestream(size, &rgb)
+            }
+            JxlEncoderImageData::Gray8Strided { data, stride } => {
+                let row_bytes = width as usize;
+                if stride < row_bytes {
+                    return Err(Error::InvalidPixelRowStride {
+                        minimum: row_bytes,
+                        actual: stride,
+                    });
+                }
+
+                let required = if height == 0 {
+                    0
+                } else {
+                    (height as usize - 1)
+                        .checked_mul(stride)
+                        .and_then(|x| x.checked_add(row_bytes))
+                        .ok_or(Error::ArithmeticOverflow)?
+                };
+                if data.len() < required {
+                    return Err(Error::InvalidPixelBufferLength {
+                        expected: required,
+                        actual: data.len(),
+                    });
+                }
+
+                let mut gray = Vec::with_capacity(
+                    row_bytes
+                        .checked_mul(height as usize)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                );
+                for y in 0..height as usize {
+                    let row_start = y * stride;
+                    gray.extend_from_slice(&data[row_start..row_start + row_bytes]);
+                }
+
+                let rgb = expand_gray_to_rgb(&gray)?;
+                headers::encode_modular_u8_rgb_image_codestream(size, &rgb)
             }
         }
     }
@@ -396,6 +460,92 @@ mod tests {
                 actual: 8
             }
         ));
+    }
+
+    #[test]
+    fn test_encode_image_codestream_gray8_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let gray = vec![0u8; 8 * 4];
+        let bytes = enc
+            .encode_image_codestream((8, 4), JxlEncoderImageData::Gray8Interleaved(&gray))
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_image_codestream_gray8_matches_expanded_rgb() {
+        let enc = JxlEncoder::default();
+        let width = 8usize;
+        let height = 4usize;
+        let mut gray = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                gray[y * width + x] = (x * 9 + y * 17) as u8;
+            }
+        }
+
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for &y in &gray {
+            rgb.extend_from_slice(&[y, y, y]);
+        }
+
+        let a = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Gray8Interleaved(&gray),
+            )
+            .unwrap();
+        let b = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Rgb8Interleaved(&rgb),
+            )
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_encode_image_codestream_gray8_strided_matches_interleaved() {
+        let enc = JxlEncoder::default();
+        let width = 8usize;
+        let height = 4usize;
+        let stride = width + 7;
+
+        let mut gray = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                gray[y * width + x] = (x * 5 + y * 11) as u8;
+            }
+        }
+
+        let mut gray_strided = vec![0u8; stride * height];
+        for y in 0..height {
+            let src = &gray[y * width..(y + 1) * width];
+            let dst = &mut gray_strided[y * stride..y * stride + width];
+            dst.copy_from_slice(src);
+        }
+
+        let a = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Gray8Interleaved(&gray),
+            )
+            .unwrap();
+        let b = enc
+            .encode_image_codestream(
+                (width as u32, height as u32),
+                JxlEncoderImageData::Gray8Strided {
+                    data: &gray_strided,
+                    stride,
+                },
+            )
+            .unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
