@@ -13,5 +13,5 @@ pub mod options;
 pub use bit_writer::BitWriter;
 pub use encoder::{JxlEncoder, JxlEncoderBitstreamKind};
 pub use encodings::{pack_signed, write_i32, write_u32};
-pub use headers::encode_minimal_codestream_header;
+pub use headers::{encode_minimal_codestream_header, encode_minimal_single_frame_codestream};
 pub use options::JxlEncoderOptions;

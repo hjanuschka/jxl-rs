@@ -62,9 +62,20 @@ impl JxlEncoder {
         headers::encode_minimal_codestream_header(size)
     }
 
+    /// Encodes a minimal single-frame codestream up to frame metadata + TOC.
+    pub fn encode_minimal_single_frame_codestream(&self, size: (u32, u32)) -> Result<Vec<u8>> {
+        headers::encode_minimal_single_frame_codestream(size)
+    }
+
     /// Encodes a minimal header-only stream wrapped in a JXL container.
     pub fn encode_minimal_container_header(&self, size: (u32, u32)) -> Result<Vec<u8>> {
         let codestream = headers::encode_minimal_codestream_header(size)?;
+        container::wrap_codestream(&codestream)
+    }
+
+    /// Encodes a minimal single-frame stream wrapped in a JXL container.
+    pub fn encode_minimal_single_frame_container(&self, size: (u32, u32)) -> Result<Vec<u8>> {
+        let codestream = headers::encode_minimal_single_frame_codestream(size)?;
         container::wrap_codestream(&codestream)
     }
 
@@ -146,6 +157,32 @@ mod tests {
     fn test_encode_minimal_container_header_has_container_signature() {
         let enc = JxlEncoder::default();
         let bytes = enc.encode_minimal_container_header((64, 32)).unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Container)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_minimal_single_frame_codestream_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let bytes = enc
+            .encode_minimal_single_frame_codestream((64, 32))
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_minimal_single_frame_container_has_container_signature() {
+        let enc = JxlEncoder::default();
+        let bytes = enc.encode_minimal_single_frame_container((64, 32)).unwrap();
         assert_eq!(
             check_signature(&bytes),
             ProcessingResult::Complete {
