@@ -18,7 +18,8 @@ pub use encoder::{JxlEncoder, JxlEncoderBitstreamKind};
 pub use encodings::{pack_signed, write_i32, write_u32};
 pub use entropy::{
     HybridUintConfig, write_simple_context_map, write_simple_zero_context_map,
-    write_single_symbol_huffman_histograms,
+    write_single_symbol_huffman_codes, write_single_symbol_huffman_histograms,
+    write_single_symbol_huffman_table, write_varint16,
 };
 pub use headers::{
     encode_minimal_codestream_header, encode_minimal_modular_image_codestream,
