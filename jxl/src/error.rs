@@ -136,6 +136,10 @@ pub enum Error {
     ImageDimensionTooLarge(u64),
     #[error("Invalid image size: {0}x{1}")]
     InvalidImageSize(usize, usize),
+    #[error("Invalid pixel buffer length: expected {expected}, got {actual}")]
+    InvalidPixelBufferLength { expected: usize, actual: usize },
+    #[error("Value {value} cannot be encoded with fixed split0 token {token}")]
+    InvalidFixedTokenValue { token: u32, value: u32 },
     // Generic arithmetic overflow. Prefer using other errors if possible.
     #[error("Arithmetic overflow")]
     ArithmeticOverflow,

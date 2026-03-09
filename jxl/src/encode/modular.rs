@@ -9,8 +9,8 @@ use crate::{
 };
 
 use super::{
-    BitWriter, pack_signed, write_fixed_symbol_huffman_histograms,
-    write_single_symbol_huffman_histograms, write_u32,
+    BitWriter, HybridUintConfig, pack_signed, write_fixed_symbol_huffman_histograms_with_configs,
+    write_u32,
 };
 
 fn transform_count_coder() -> U32Coder {
@@ -44,10 +44,13 @@ pub fn write_minimal_group_header(writer: &mut BitWriter, use_global_tree: bool)
 /// - predictor: `predictor`
 /// - offset: `offset`
 /// - multiplier: `1`
-pub fn write_single_leaf_tree_with_params(
+/// - residual histogram token/config: `symbol_token` + `uint_config`
+pub fn write_single_leaf_tree_with_entropy_params(
     writer: &mut BitWriter,
     offset: i32,
     predictor: u32,
+    symbol_token: u16,
+    uint_config: HybridUintConfig,
 ) -> Result<()> {
     if predictor > 13 {
         return Err(Error::InvalidPredictor(predictor));
@@ -62,11 +65,38 @@ pub fn write_single_leaf_tree_with_params(
     // [split_val, property, predictor, offset, multiplier_log, multiplier_bits]
     let tree_context_map = [0u8, 1, 2, 3, 4, 5];
     let tree_symbols = [0u16, 0, predictor_symbol, offset_symbol, 0, 0];
-    write_fixed_symbol_huffman_histograms(writer, &tree_context_map, &tree_symbols)?;
+    let tree_uint_configs = [HybridUintConfig::new(15, 0, 0); 6];
+    write_fixed_symbol_huffman_histograms_with_configs(
+        writer,
+        &tree_context_map,
+        &tree_symbols,
+        &tree_uint_configs,
+    )?;
 
     // Entropy histograms for decoded channel residual symbols.
-    write_single_symbol_huffman_histograms(writer, 1)?;
+    let residual_context_map = [0u8];
+    write_fixed_symbol_huffman_histograms_with_configs(
+        writer,
+        &residual_context_map,
+        &[symbol_token],
+        &[uint_config],
+    )?;
     Ok(())
+}
+
+/// Writes a minimal modular tree payload with default residual token/config.
+pub fn write_single_leaf_tree_with_params(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+) -> Result<()> {
+    write_single_leaf_tree_with_entropy_params(
+        writer,
+        offset,
+        predictor,
+        0,
+        HybridUintConfig::new(15, 0, 0),
+    )
 }
 
 /// Writes a minimal modular tree payload with predictor `Zero`.
@@ -77,6 +107,63 @@ pub fn write_single_leaf_tree_with_offset(writer: &mut BitWriter, offset: i32) -
 /// Writes a minimal modular tree payload (single leaf, offset 0, predictor `Zero`).
 pub fn write_single_leaf_tree(writer: &mut BitWriter) -> Result<()> {
     write_single_leaf_tree_with_params(writer, 0, 0)
+}
+
+/// Writes modular residual bits for split0/msb0/lsb0 fixed-token streams.
+///
+/// This inverts HybridUint(read) for the specific config used by
+/// `HybridUintConfig::new(0, 0, 0)`.
+pub fn write_split0_fixed_token_signed_stream(
+    writer: &mut BitWriter,
+    token: u32,
+    signed_values: &[i32],
+) -> Result<()> {
+    if token == 0 {
+        return Err(Error::InvalidFixedTokenValue { token, value: 0 });
+    }
+
+    let nbits = token.saturating_sub(1) as usize;
+    if nbits >= 32 {
+        return Err(Error::InvalidFixedTokenValue { token, value: 0 });
+    }
+
+    let base = 1u32 << nbits;
+    let max = base + ((1u32 << nbits) - 1);
+
+    for &signed in signed_values {
+        let value = pack_signed(signed);
+        if value < base || value > max {
+            return Err(Error::InvalidFixedTokenValue { token, value });
+        }
+        writer.write(nbits, u64::from(value - base))?;
+    }
+
+    Ok(())
+}
+
+/// Writes minimal modular global subbitstream payload.
+///
+/// The payload uses:
+/// - local tree (`use_global_tree = false`)
+/// - default weighted predictor config
+/// - no modular transforms
+/// - single-leaf local tree with constant params and residual entropy params
+pub fn write_minimal_modular_global_data_with_entropy_params(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+    symbol_token: u16,
+    uint_config: HybridUintConfig,
+) -> Result<()> {
+    write_minimal_group_header(writer, /*use_global_tree=*/ false)?;
+    write_single_leaf_tree_with_entropy_params(
+        writer,
+        offset,
+        predictor,
+        symbol_token,
+        uint_config,
+    )?;
+    Ok(())
 }
 
 /// Writes minimal modular global subbitstream payload.
@@ -91,9 +178,13 @@ pub fn write_minimal_modular_global_data_with_params(
     offset: i32,
     predictor: u32,
 ) -> Result<()> {
-    write_minimal_group_header(writer, /*use_global_tree=*/ false)?;
-    write_single_leaf_tree_with_params(writer, offset, predictor)?;
-    Ok(())
+    write_minimal_modular_global_data_with_entropy_params(
+        writer,
+        offset,
+        predictor,
+        0,
+        HybridUintConfig::new(15, 0, 0),
+    )
 }
 
 /// Writes minimal modular global subbitstream payload with predictor `Zero`.
@@ -113,10 +204,12 @@ pub fn write_minimal_modular_global_data(writer: &mut BitWriter) -> Result<()> {
 /// - default LF quant factors
 /// - no global modular tree
 /// - minimal modular global data payload
-pub fn write_minimal_modular_lf_global_section_with_params(
+pub fn write_minimal_modular_lf_global_section_with_entropy_params(
     writer: &mut BitWriter,
     offset: i32,
     predictor: u32,
+    symbol_token: u16,
+    uint_config: HybridUintConfig,
 ) -> Result<()> {
     // LfQuantFactors::new => default path.
     writer.write(1, 1)?;
@@ -124,7 +217,31 @@ pub fn write_minimal_modular_lf_global_section_with_params(
     // decode_lf_global tree flag: no global tree.
     writer.write(1, 0)?;
 
-    write_minimal_modular_global_data_with_params(writer, offset, predictor)
+    write_minimal_modular_global_data_with_entropy_params(
+        writer,
+        offset,
+        predictor,
+        symbol_token,
+        uint_config,
+    )
+}
+
+/// Writes a minimal LF global section prefix for a modular frame:
+/// - default LF quant factors
+/// - no global modular tree
+/// - minimal modular global data payload
+pub fn write_minimal_modular_lf_global_section_with_params(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+) -> Result<()> {
+    write_minimal_modular_lf_global_section_with_entropy_params(
+        writer,
+        offset,
+        predictor,
+        0,
+        HybridUintConfig::new(15, 0, 0),
+    )
 }
 
 /// Writes a minimal LF global section prefix with predictor `Zero`.
@@ -145,6 +262,7 @@ mod tests {
     use super::*;
     use crate::{
         bit_reader::BitReader,
+        entropy_coding::decode::{Histograms, SymbolReader},
         frame::quantizer::LfQuantFactors,
         headers::{JxlHeader, modular::GroupHeader},
     };
@@ -216,6 +334,41 @@ mod tests {
         let mut writer = BitWriter::new();
         let err = write_single_leaf_tree_with_params(&mut writer, 0, 99).unwrap_err();
         assert!(matches!(err, crate::error::Error::InvalidPredictor(99)));
+    }
+
+    #[test]
+    fn test_write_split0_fixed_token_signed_stream_roundtrip() {
+        let mut writer = BitWriter::new();
+        write_fixed_symbol_huffman_histograms_with_configs(
+            &mut writer,
+            &[0],
+            &[10],
+            &[HybridUintConfig::new(0, 0, 0)],
+        )
+        .unwrap();
+        write_split0_fixed_token_signed_stream(&mut writer, 10, &[256, 300, 511]).unwrap();
+        let bytes = writer.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let hist = Histograms::decode(1, &mut br, true).unwrap();
+        let mut reader = SymbolReader::new(&hist, &mut br, None).unwrap();
+        assert_eq!(reader.read_signed(&hist, &mut br, 0), 256);
+        assert_eq!(reader.read_signed(&hist, &mut br, 0), 300);
+        assert_eq!(reader.read_signed(&hist, &mut br, 0), 511);
+        reader.check_final_state(&hist, &mut br).unwrap();
+    }
+
+    #[test]
+    fn test_write_split0_fixed_token_signed_stream_invalid_value() {
+        let mut writer = BitWriter::new();
+        let err = write_split0_fixed_token_signed_stream(&mut writer, 10, &[255]).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::InvalidFixedTokenValue {
+                token: 10,
+                value: 510
+            }
+        ));
     }
 
     #[test]

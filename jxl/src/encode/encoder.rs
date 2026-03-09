@@ -93,6 +93,15 @@ impl JxlEncoder {
         headers::encode_minimal_modular_image_codestream_with_offset(size, offset)
     }
 
+    /// Encodes an interleaved RGB8 buffer into a single-group modular codestream.
+    pub fn encode_modular_u8_rgb_codestream(
+        &self,
+        size: (u32, u32),
+        rgb: &[u8],
+    ) -> Result<Vec<u8>> {
+        headers::encode_modular_u8_rgb_image_codestream(size, rgb)
+    }
+
     /// Encodes a minimal header-only stream wrapped in a JXL container.
     pub fn encode_minimal_container_header(&self, size: (u32, u32)) -> Result<Vec<u8>> {
         let codestream = headers::encode_minimal_codestream_header(size)?;
@@ -133,6 +142,13 @@ impl JxlEncoder {
     ) -> Result<Vec<u8>> {
         let codestream =
             headers::encode_minimal_modular_image_codestream_with_offset(size, offset)?;
+        container::wrap_codestream(&codestream)
+    }
+
+    /// Encodes an interleaved RGB8 buffer into a single-group modular stream,
+    /// wrapped in a JXL container.
+    pub fn encode_modular_u8_rgb_container(&self, size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
+        let codestream = headers::encode_modular_u8_rgb_image_codestream(size, rgb)?;
         container::wrap_codestream(&codestream)
     }
 
@@ -324,6 +340,32 @@ mod tests {
         let bytes = enc
             .encode_minimal_modular_image_container_with_params((64, 32), 7, 1)
             .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Container)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_modular_u8_rgb_codestream_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let rgb = vec![0u8; 16 * 8 * 3];
+        let bytes = enc.encode_modular_u8_rgb_codestream((16, 8), &rgb).unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_modular_u8_rgb_container_has_container_signature() {
+        let enc = JxlEncoder::default();
+        let rgb = vec![0u8; 16 * 8 * 3];
+        let bytes = enc.encode_modular_u8_rgb_container((16, 8), &rgb).unwrap();
         assert_eq!(
             check_signature(&bytes),
             ProcessingResult::Complete {

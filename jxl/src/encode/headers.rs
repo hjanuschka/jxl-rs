@@ -10,8 +10,10 @@ use crate::{
 };
 
 use super::{
-    BitWriter, write_minimal_modular_global_data_with_params,
-    write_minimal_modular_lf_global_section_with_params, write_toc, write_u32,
+    BitWriter, HybridUintConfig, write_minimal_modular_global_data_with_params,
+    write_minimal_modular_lf_global_section_with_entropy_params,
+    write_minimal_modular_lf_global_section_with_params, write_split0_fixed_token_signed_stream,
+    write_toc, write_u32,
 };
 
 fn large_size_coder() -> U32Coder {
@@ -31,6 +33,20 @@ fn validate_size(width: u32, height: u32) -> Result<()> {
     let max_large_dim = 1u32 << 30;
     if width > max_large_dim || height > max_large_dim {
         return Err(Error::ImageDimensionTooLarge(width.max(height) as u64));
+    }
+    Ok(())
+}
+
+fn validate_rgb_u8_buffer(width: u32, height: u32, rgb: &[u8]) -> Result<()> {
+    let px_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let expected = px_count.checked_mul(3).ok_or(Error::ArithmeticOverflow)?;
+    if rgb.len() != expected {
+        return Err(Error::InvalidPixelBufferLength {
+            expected,
+            actual: rgb.len(),
+        });
     }
     Ok(())
 }
@@ -273,6 +289,63 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
     encode_minimal_modular_image_codestream_with_params(size, 0, 0)
 }
 
+/// Encodes an RGB8 buffer into a single-group modular codestream.
+///
+/// Current constraints:
+/// - input is tightly packed interleaved RGB8 (`[r,g,b, r,g,b, ...]`)
+/// - single-group only (`width <= 256 && height <= 256`)
+/// - uses default file metadata/bootstrap frame header
+pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
+    let (width, height) = size;
+    validate_size(width, height)?;
+    validate_rgb_u8_buffer(width, height, rgb)?;
+
+    if width > 256 || height > 256 {
+        return Err(Error::InvalidImageSize(width as usize, height as usize));
+    }
+
+    const TOKEN: u16 = 10;
+    const TREE_OFFSET: i32 = -256;
+
+    let px_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(Error::ArithmeticOverflow)?;
+
+    let mut section_writer = BitWriter::new();
+    write_minimal_modular_lf_global_section_with_entropy_params(
+        &mut section_writer,
+        TREE_OFFSET,
+        0,
+        TOKEN,
+        HybridUintConfig::new(0, 0, 0),
+    )?;
+
+    // Decoder channel order is channel-major, then row-major for each channel.
+    let mut signed_residuals = Vec::with_capacity(px_count * 3);
+    for channel in 0..3 {
+        for i in 0..px_count {
+            let sample = i32::from(rgb[i * 3 + channel]);
+            signed_residuals.push(sample - TREE_OFFSET);
+        }
+    }
+    write_split0_fixed_token_signed_stream(
+        &mut section_writer,
+        u32::from(TOKEN),
+        &signed_residuals,
+    )?;
+
+    let section = section_writer.finish();
+
+    let mut writer = BitWriter::new();
+    write_minimal_file_header_fields(&mut writer, width, height)?;
+    writer.byte_align_zero_pad()?;
+    write_default_modular_frame_header(&mut writer)?;
+    write_toc(&mut writer, &[section.len() as u32])?;
+    writer.write_aligned_bytes(&section)?;
+
+    Ok(writer.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +583,52 @@ mod tests {
             (second_pixel_r - first_pixel_r).abs() > 1e-6,
             "expected varying pixels with west predictor"
         );
+    }
+
+    #[test]
+    fn test_encode_modular_u8_rgb_image_codestream_invalid_len() {
+        let err = encode_modular_u8_rgb_image_codestream((4, 4), &[0u8; 3]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidPixelBufferLength {
+                expected: 48,
+                actual: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn test_encode_modular_u8_rgb_image_codestream_decodes_and_changes_with_input() {
+        let size = (8, 4);
+        let rgb_a = vec![0u8; (size.0 * size.1 * 3) as usize];
+        let mut rgb_b = rgb_a.clone();
+        rgb_b[0] = 255;
+
+        let cs_a = encode_modular_u8_rgb_image_codestream(size, &rgb_a).unwrap();
+        let cs_b = encode_modular_u8_rgb_image_codestream(size, &rgb_b).unwrap();
+        assert_ne!(cs_a, cs_b);
+
+        let (decoded_a, frames_a) =
+            crate::api::tests::decode(&cs_a, usize::MAX, false, false, None).unwrap();
+        let (decoded_b, frames_b) =
+            crate::api::tests::decode(&cs_b, usize::MAX, false, false, None).unwrap();
+
+        assert_eq!(decoded_a, 1);
+        assert_eq!(decoded_b, 1);
+        assert_eq!(
+            frames_a[0][0].size(),
+            ((size.0 * 3) as usize, size.1 as usize)
+        );
+        assert_eq!(
+            frames_b[0][0].size(),
+            ((size.0 * 3) as usize, size.1 as usize)
+        );
+
+        assert_ne!(frames_a[0][0].row(0)[0], frames_b[0][0].row(0)[0]);
+
+        // Determinism for fixed input.
+        let cs_a2 = encode_modular_u8_rgb_image_codestream(size, &rgb_a).unwrap();
+        assert_eq!(cs_a, cs_a2);
     }
 
     #[test]

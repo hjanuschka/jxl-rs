@@ -34,6 +34,11 @@ struct Opt {
     #[arg(long)]
     modular_image: bool,
 
+    /// Encode raw interleaved RGB8 bytes from this file
+    /// (length must be width*height*3)
+    #[arg(long)]
+    raw_rgb8_input: Option<PathBuf>,
+
     /// Constant modular leaf offset for --modular-image mode
     #[arg(long, default_value_t = 0)]
     modular_offset: i32,
@@ -53,7 +58,22 @@ fn main() -> Result<()> {
         ));
     }
 
-    if (opt.modular_offset != 0 || opt.modular_predictor != 0) && !opt.modular_image {
+    if opt.raw_rgb8_input.is_some() && (opt.modular_image || opt.with_frame_info) {
+        return Err(color_eyre::eyre::eyre!(
+            "--raw-rgb8-input is mutually exclusive with --modular-image/--with-frame-info"
+        ));
+    }
+
+    if opt.raw_rgb8_input.is_some() && (opt.modular_offset != 0 || opt.modular_predictor != 0) {
+        return Err(color_eyre::eyre::eyre!(
+            "--raw-rgb8-input does not use --modular-offset/--modular-predictor"
+        ));
+    }
+
+    if (opt.modular_offset != 0 || opt.modular_predictor != 0)
+        && !opt.modular_image
+        && opt.raw_rgb8_input.is_none()
+    {
         return Err(color_eyre::eyre::eyre!(
             "--modular-offset/--modular-predictor require --modular-image"
         ));
@@ -65,8 +85,17 @@ fn main() -> Result<()> {
         ));
     }
 
-    let bytes = if opt.modular_image {
-        if opt.bare {
+    let (bytes, mode) = if let Some(raw_rgb_path) = &opt.raw_rgb8_input {
+        let rgb = std::fs::read(raw_rgb_path)
+            .wrap_err_with(|| format!("Failed to read raw RGB8 input {:?}", raw_rgb_path))?;
+        let bytes = if opt.bare {
+            enc.encode_modular_u8_rgb_codestream((opt.width, opt.height), &rgb)?
+        } else {
+            enc.encode_modular_u8_rgb_container((opt.width, opt.height), &rgb)?
+        };
+        (bytes, "raw-rgb8 modular stream")
+    } else if opt.modular_image {
+        let bytes = if opt.bare {
             enc.encode_minimal_modular_image_codestream_with_params(
                 (opt.width, opt.height),
                 opt.modular_offset,
@@ -78,29 +107,27 @@ fn main() -> Result<()> {
                 opt.modular_offset,
                 opt.modular_predictor,
             )?
-        }
+        };
+        (bytes, "minimal modular-image stream")
     } else if opt.with_frame_info {
-        if opt.bare {
+        let bytes = if opt.bare {
             enc.encode_minimal_single_frame_codestream((opt.width, opt.height))?
         } else {
             enc.encode_minimal_single_frame_container((opt.width, opt.height))?
-        }
-    } else if opt.bare {
-        enc.encode_minimal_codestream_header((opt.width, opt.height))?
+        };
+        (bytes, "minimal frame-info stream")
     } else {
-        enc.encode_minimal_container_header((opt.width, opt.height))?
+        let bytes = if opt.bare {
+            enc.encode_minimal_codestream_header((opt.width, opt.height))?
+        } else {
+            enc.encode_minimal_container_header((opt.width, opt.height))?
+        };
+        (bytes, "header-only stream")
     };
 
     std::fs::write(&opt.output, &bytes)
         .wrap_err_with(|| format!("Failed to write {:?}", opt.output))?;
 
-    let mode = if opt.modular_image {
-        "minimal modular-image stream"
-    } else if opt.with_frame_info {
-        "minimal frame-info stream"
-    } else {
-        "header-only stream"
-    };
     if opt.modular_image {
         eprintln!(
             "Wrote {} bytes to {:?} ({mode}, offset={}, predictor={})",

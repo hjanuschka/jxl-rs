@@ -25,7 +25,7 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[~]` Minimal headers/container writing.
 - `[~]` Minimal entropy helpers (HybridUint config, fixed/simple Huffman/context map writer primitives).
 - `[~]` Minimal modular decodable stream generation (constant tree leaf, synthetic output).
-- `[ ]` Real image-to-bitstream encoding (no raw pixel ingestion pipeline yet).
+- `[~]` Early real image-to-bitstream path: RGB8 raw input into single-group modular stream (`<=256x256`).
 - `[ ]` Full entropy modeling and ANS encoding.
 - `[ ]` VarDCT lossy encoding.
 - `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
@@ -40,7 +40,7 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 | P02 | Codestream header field serialization (`enc_fields`, `enc_file`) | [~] | `jxl/src/encode/headers.rs` | split into `headers/file_header.rs`, `headers/frame_header.rs`, `headers/image_metadata.rs` under `encode/` | M2 |
 | P03 | Container writing (`enc_file` container side, boxes) | [~] | `jxl/src/encode/container.rs` | add `encode/container_boxes.rs` for Exif/XMP/JUMBF/jxlp policy | M2, M8 |
 | P04 | Public encoder API surface (`JxlEncoder`, frame settings) | [~] | `jxl/src/encode/encoder.rs`, `jxl/src/encode/options.rs`, `jxl/src/api/mod.rs` | add `jxl/src/encode/api.rs`, per-frame settings types | M4, M9 |
-| P05 | Input pixel ingestion and normalization | [ ] | none (bootstrap only) | `jxl/src/encode/input.rs`, `jxl/src/encode/color_pipeline.rs` | M4 |
+| P05 | Input pixel ingestion and normalization | [~] | `jxl/src/encode/headers.rs` (RGB8 single-group bootstrap path), `jxl/src/encode/encoder.rs` | `jxl/src/encode/input.rs`, `jxl/src/encode/color_pipeline.rs` | M4 |
 | P06 | Context map writer and optimization (`enc_entropy_coder`) | [~] | `jxl/src/encode/entropy/context_map.rs` | add non-simple context map and optimization pass | M3, M5 |
 | P07 | Huffman table build from symbol stats | [~] | `jxl/src/encode/entropy/huffman.rs` (fixed-symbol only) | add histogram-driven table builder | M3 |
 | P08 | HybridUint full usage in entropy paths | [~] | `jxl/src/encode/entropy/hybrid_uint.rs` | wire into real modular/vardct token paths | M3, M4, M6 |
@@ -68,7 +68,8 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 
 ### A. Public API and integration
 
-- [ ] A01 Add `JxlEncoder::encode_image(...)` for raw in-memory buffers (RGB/Gray/RGBA, u8/u16/f32).
+- [~] A01 Add `JxlEncoder::encode_image(...)` for raw in-memory buffers (RGB/Gray/RGBA, u8/u16/f32).
+  - Current: `encode_modular_u8_rgb_codestream/container` for interleaved RGB8, single-group bootstrap path.
   - Files: `jxl/src/encode/encoder.rs`, new `jxl/src/encode/input.rs`.
   - Milestone: M4.
 - [ ] A02 Add per-frame settings type mirroring libjxl style controls (lossless, distance, effort, modular vs vardct).
