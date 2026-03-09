@@ -2,6 +2,10 @@
 
 This turns the roadmap in `jxl-encoder.md` into a trackable issue plan.
 
+Detailed parity gaps vs libjxl are tracked in:
+
+- `docs/encoder-libjxl-parity-checklist.md`
+
 ## Quick setup
 
 - Create 1 tracking epic issue + 10 milestone issues (M0..M9).

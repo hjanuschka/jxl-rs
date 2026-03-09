@@ -4,6 +4,12 @@
 
 Build a **100% pure Rust** JPEG XL encoder inside jxl-rs, with a staged path from "valid files" to "competitive with cjxl".
 
+## libjxl parity tracker
+
+Detailed subsystem parity checklist is tracked in:
+
+- `docs/encoder-libjxl-parity-checklist.md`
+
 ## Non-negotiable constraints
 
 - [ ] No C or C++ FFI in the encoder path.
