@@ -79,26 +79,45 @@ pub fn encode_vardct_u8_rgb_codestream(
 
     // Quantize
     let (global_scale, quant_lf) = distance_to_quant_params(config.distance);
-    let inv_global_scale = (1u32 << 16) as f32 / global_scale as f32;
 
-    let mut qx = vec![0i32; num_blocks * 64];
-    let mut qy = vec![0i32; num_blocks * 64];
-    let mut qb = vec![0i32; num_blocks * 64];
-    quantize_channel(&dct_x, inv_global_scale, &mut qx);
-    quantize_channel(&dct_y, inv_global_scale, &mut qy);
-    quantize_channel(&dct_b, inv_global_scale, &mut qb);
+    // INV_LF_QUANT from the spec/decoder: [4096.0, 512.0, 256.0] for channels [X, Y, B]
+    let inv_lf_quant = [4096.0f32, 512.0, 256.0];
 
-    // Separate DC and AC
+    // CfL: with default color correlation, y_to_x_lf=0, y_to_b_lf=1.0
+    // For encoding: in_y = dc_y, in_x = dc_x, in_b = dc_b - dc_y
+    // The channels in dct arrays are in XYB order.
+
+    // Separate DC and AC, quantize differently
     let mut dc_x = vec![0i32; num_blocks];
     let mut dc_y = vec![0i32; num_blocks];
     let mut dc_b = vec![0i32; num_blocks];
+    let mut qx = vec![0i32; num_blocks * 64];
+    let mut qy = vec![0i32; num_blocks * 64];
+    let mut qb = vec![0i32; num_blocks * 64];
+
     for blk in 0..num_blocks {
-        dc_x[blk] = qx[blk * 64];
-        dc_y[blk] = qy[blk * 64];
-        dc_b[blk] = qb[blk * 64];
-        qx[blk * 64] = 0;
-        qy[blk * 64] = 0;
-        qb[blk * 64] = 0;
+        // DC: apply CfL decorrelation and proper DC quantization
+        let raw_dc_x = dct_x[blk * 64];
+        let raw_dc_y = dct_y[blk * 64];
+        let raw_dc_b = dct_b[blk * 64];
+
+        // Forward CfL: decoder does dec_b = in_y * 1.0 + in_b
+        // So in_b = dec_b - in_y, in_x = dec_x, in_y = dec_y
+        let cfl_dc_x = raw_dc_x;         // in_x = dc_x (y_to_x_lf=0)
+        let cfl_dc_y = raw_dc_y;         // in_y = dc_y
+        let cfl_dc_b = raw_dc_b - raw_dc_y; // in_b = dc_b - dc_y (y_to_b_lf=1.0)
+
+        dc_x[blk] = quantize_dc(cfl_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
+        dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
+        dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
+
+        // AC: uniform quantization for now (TODO: use dequant matrix weights)
+        for k in 1..64 {
+            qx[blk * 64 + k] = quantize_ac(dct_x[blk * 64 + k], global_scale, 1);
+            qy[blk * 64 + k] = quantize_ac(dct_y[blk * 64 + k], global_scale, 1);
+            qb[blk * 64 + k] = quantize_ac(dct_b[blk * 64 + k], global_scale, 1);
+        }
+        // DC position in AC array is always 0 (DC is separate)
     }
 
     // Build the frame
@@ -135,11 +154,34 @@ fn forward_dct_channel(
     }
 }
 
-/// Quantize DCT coefficients (flat weight for now).
-fn quantize_channel(dct: &[f32], inv_global_scale: f32, out: &mut [i32]) {
-    for (i, &c) in dct.iter().enumerate() {
-        out[i] = (c / inv_global_scale).round() as i32;
-    }
+/// Quantize DC coefficients for a single channel.
+///
+/// The decoder dequantizes DC as:
+///   dc_float = quantized * LF_QUANT[c] * 2^16 / (global_scale * quant_lf)
+///
+/// So forward quantization is:
+///   quantized = round(dc_float * global_scale * quant_lf / (2^16 * LF_QUANT[c]))
+///             = round(dc_float * global_scale * quant_lf * INV_LF_QUANT[c] / 2^16)
+fn quantize_dc(dc_float: f32, global_scale: u32, quant_lf: u32, inv_lf_quant: f32) -> i32 {
+    let scale = (global_scale as f32) * (quant_lf as f32) * inv_lf_quant / (1u32 << 16) as f32;
+    (dc_float * scale).round() as i32
+}
+
+/// Quantize AC coefficients for a single channel.
+///
+/// The decoder dequantizes AC as:
+///   ac_float = quantized * dequant_weight[k] * inv_global_scale / raw_quant
+///
+/// where inv_global_scale = 2^16 / global_scale
+///
+/// For now, with all_default quant matrices and raw_quant=1, we use uniform weights.
+/// TODO: use actual default dequant matrix weights.
+fn quantize_ac(ac_float: f32, global_scale: u32, _raw_quant: u32) -> i32 {
+    // With raw_quant=1 and assuming dequant_weight=1.0:
+    // ac_float = quantized * 1.0 * (2^16 / global_scale) / 1
+    // quantized = round(ac_float * global_scale / 2^16)
+    let scale = global_scale as f32 / (1u32 << 16) as f32;
+    (ac_float * scale).round() as i32
 }
 
 /// Build the complete VarDCT frame bitstream.
@@ -383,13 +425,13 @@ fn encode_single_group_section(
     // === LfGroup0: VarDCT DC ===
     // extra_precision = 0 (2 bits)
     w.write(2, 0)?;
-    // DC coefficients as modular (3 channels: X, Y, B order as per decode_vardct_lf)
+    // DC coefficients as modular (3 channels: Y, X, B order as per decode_vardct_lf)
     // The decoder creates channels in order: [shrink_rect(1), shrink_rect(0), shrink_rect(2)]
-    // which for non-subsampled is [X_chan, Y_chan, B_chan]
+    // which for non-subsampled is [Y_chan, X_chan, B_chan]
     let mut dc_data = vec![0i32; num_blocks * 3];
     for i in 0..num_blocks {
-        dc_data[i] = dc_x[i];              // Channel 0: X
-        dc_data[num_blocks + i] = dc_y[i]; // Channel 1: Y
+        dc_data[i] = dc_y[i];              // Channel 0: Y
+        dc_data[num_blocks + i] = dc_x[i]; // Channel 1: X
         dc_data[2 * num_blocks + i] = dc_b[i]; // Channel 2: B
     }
     crate::encode::modular_encode::encode_modular_signed_stream(
@@ -425,7 +467,7 @@ fn encode_single_group_section(
     let ch3_size = bw * bh; // epf
     let total = ch0_size + ch1_size + ch2_size + ch3_size;
 
-    let mut hf_meta = vec![0i32; total];
+    let hf_meta = vec![0i32; total];
     // ch0 (ytox): all 0
     // ch1 (ytob): all 0
     // ch2 (transform_image):
@@ -570,54 +612,60 @@ fn encode_hf_global_section(
 }
 
 /// Write AC entropy stream header (Huffman histograms for AC contexts).
+/// Write AC entropy header: Histograms with all-zero single-symbol Huffman.
+///
+/// Matches the Histograms::decode format:
+/// 1. LZ77 params (disabled)
+/// 2. Context map (all contexts -> histogram 0)
+/// 3. use_prefix_code = true (Huffman mode)
+/// 4. HybridUint configs (1 config for 1 histogram)
+/// 5. Huffman tables (1 single-symbol table)
 fn write_ac_entropy_header(w: &mut BitWriter, num_contexts: usize) -> Result<()> {
-    // Histograms::decode reads:
-    // lz77_enabled = false
+    // 1. LZ77 enabled = false
     w.write(1, 0)?;
-    // use_prefix_code = true (Huffman)
-    w.write(1, 1)?;
-    // log_alphabet_size (5 bits) -- max symbol size
-    w.write(5, 8)?; // 2^8 = 256 max symbols
 
-    // Context map: all contexts map to the same histogram (histogram 0)
-    // context_map encoding:
-    // num_histograms = 1 (so trivially all map to 0)
-    // The context map encoding: if num_contexts > 1, read context map.
-    // Actually, the Histograms::decode reads context_map differently.
-    //
-    // Let me look at the decoder more carefully...
-    // For now, encode a trivial "all zero coefficients" scenario.
-    // We'll need to flesh this out with proper AC tokenization.
-
-    // Actually this is getting complex. Let me write a simpler version:
-    // Write the context map as "all contexts use histogram 0"
-    // Then write 1 Huffman table that encodes symbol 0 with 0 bits.
-
-    // For Huffman mode:
-    // 1. Read context map (maps num_contexts entries to histogram indices)
-    // 2. Read num_histograms Huffman tables
-
-    // Context map: all zeros (all contexts -> histogram 0)
-    // Encoding: use_simple = 1, nbits = 0, first_symbol = 0
-    // This means: context map has only 1 unique value = 0
-    // Actually context_map_decode reads:
-    //   simple = read(1)
-    //   if simple: nsym = read(2), then nsym symbols
-    //   else: complex
-    //
-    // For all-same context map: simple=1, nsym=1, symbol=0
-    // This gives us num_histograms=1 (just symbol 0).
-    // But then each context is symbol 0, meaning all use histogram 0.
-
-    // Looking at entropy_coding/context_map.rs decoder:
-    // Actually our encoder already has context map writers!
-    // Let me use write_simple_zero_context_map.
-
+    // 2. Context map: all contexts -> histogram 0
     crate::encode::entropy::context_map::write_simple_zero_context_map(w, num_contexts)?;
 
-    // Now write 1 Huffman table for the single histogram.
-    // For "all zeros" AC, a single-symbol table with symbol 0.
-    crate::encode::entropy::huffman::write_single_symbol_huffman_table(w, 256, 0)?;
+    // 3. use_prefix_code = true (Huffman)
+    // For Huffman, log_alpha_size is implicitly HUFFMAN_MAX_BITS (15)
+    w.write(1, 1)?;
+
+    // 4. HybridUint config for the single histogram
+    // HybridUint::decode reads: split_exponent from log_alpha_size bits
+    // For HUFFMAN_MAX_BITS = 15, that's 4 bits (ceil_log2(15+1) = 4)
+    // split_exponent = 4 (default)
+    // Then reads msb_in_token (max split_exponent, so 3 bits for value 4... wait)
+    // Actually, HybridUint::decode(log_alpha_size=15):
+    //   split_exponent = br.read(ceil_log2(log_alpha_size + 1)) = br.read(4)
+    //   msb_in_token = br.read(ceil_log2(split_exponent + 1))
+    //   lsb_in_token = br.read(ceil_log2(split_exponent - msb_in_token + 1))
+    // For split_exponent=0: msb and lsb are both 0, reads nothing further.
+    // split_exponent=0 means all values are direct tokens (no extra bits).
+    // This is simplest for single-symbol (symbol 0).
+    let log_alpha_size = 15; // HUFFMAN_MAX_BITS
+    let ceil_log2_las_plus1 = 32 - (log_alpha_size as u32).leading_zeros(); // 4
+    w.write(ceil_log2_las_plus1 as usize, 0)?; // split_exponent = 0
+    // With split_exponent=0: no further HybridUint params to read.
+
+    // 5. Single Huffman table: symbol 0, alphabet size determined by log_alpha_size
+    // For Huffman, HuffmanCodes::decode reads num_histograms tables.
+    // Each table is read by Table::decode which reads the alphabet size.
+    // The alphabet size for Huffman is determined by the HybridUint config.
+    //
+    // Actually wait -- looking at HuffmanCodes::decode:
+    // alphabet_size = read_varint16() + 1 per histogram
+    // Then Table::decode(alphabet_size)
+    //
+    // For single symbol 0: alphabet_size = 1 (varint16 = 0)
+    // Table::decode with al_size=1: reads nothing, fills table[0] = 0.
+
+    // Write varint16(0) = alphabet_size - 1 = 0
+    // varint16(0): first bit = 0 -> value 0
+    w.write(1, 0)?; // varint16 = 0 -> alphabet_size = 1
+
+    // Table::decode with alphabet_size=1: no bits read.
+    // Done!
 
     Ok(())
 }
@@ -717,25 +765,112 @@ mod tests {
         let config = VarDctConfig::default();
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
 
-        // Try decoding with jxl-rs
-        let result = std::panic::catch_unwind(|| {
-            crate::api::tests::decode(&cs, usize::MAX, true, false, None)
-        });
-        match result {
-            Ok(Ok((_size, frames))) => {
-                eprintln!("jxl-rs decoded OK! frames: {}", frames.len());
-                // Check output dimensions
-                if let Some(frame) = frames.first() {
-                    if let Some(img) = frame.first() {
-                        eprintln!("  Output: {}x{}", img.size().0, img.size().1);
-                    }
+        // Decode with the jxl-rs test helper (includes NaN check)
+        let (num_frames, frames) = crate::api::tests::decode(
+            &cs, usize::MAX, true, false, None,
+        ).expect("jxl-rs decode should succeed");
+        assert_eq!(num_frames, 1, "should have 1 frame");
+
+        // Check output pixels: f32 interleaved RGB, 3 channels
+        let frame = &frames[0];
+        let buf = &frame[0]; // interleaved color channels
+        let (bw, bh) = buf.size();
+        eprintln!("Decoded buffer: {}x{}", bw, bh);
+        assert_eq!(bw, width * 3, "buffer width = width * 3 channels");
+        assert_eq!(bh, height);
+
+        // Print first few decoded pixels
+        for y in 0..2 {
+            let row = buf.row(y);
+            for x in 0..2 {
+                let r = row[x * 3];
+                let g = row[x * 3 + 1];
+                let b = row[x * 3 + 2];
+                eprintln!("  pixel({},{}) = ({:.4}, {:.4}, {:.4})", x, y, r, g, b);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vardct_16x16_roundtrip() {
+        // 16x16 = 4 blocks, still single-group
+        let width = 16;
+        let height = 16;
+        let mut rgb = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                // Each quadrant a different color
+                let qx = if x < 8 { 0 } else { 1 };
+                let qy = if y < 8 { 0 } else { 1 };
+                match (qx, qy) {
+                    (0, 0) => { rgb[i] = 255; rgb[i+1] = 0; rgb[i+2] = 0; }     // Red
+                    (1, 0) => { rgb[i] = 0; rgb[i+1] = 255; rgb[i+2] = 0; }     // Green
+                    (0, 1) => { rgb[i] = 0; rgb[i+1] = 0; rgb[i+2] = 255; }     // Blue
+                    _ => { rgb[i] = 255; rgb[i+1] = 255; rgb[i+2] = 0; }         // Yellow
                 }
             }
-            Ok(Err(e)) => {
-                eprintln!("jxl-rs decode error: {e:?}");
+        }
+        let config = VarDctConfig::default();
+        let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
+
+        // Decode with jxl-rs
+        let (_n, frames) = crate::api::tests::decode(
+            &cs, usize::MAX, true, false, None,
+        ).expect("decode should succeed");
+
+        let buf = &frames[0][0];
+        eprintln!("16x16 quad-color test: decoded OK");
+        // Check corners - should roughly match input colors (DC-only = block average)
+        for (qx, qy, label) in [(0,0,"TL-Red"), (1,0,"TR-Green"), (0,1,"BL-Blue"), (1,1,"BR-Yellow")] {
+            let x = qx * 8 + 4;
+            let y = qy * 8 + 4;
+            let row = buf.row(y);
+            let r = (row[x * 3].clamp(0.0, 1.0) * 255.0).round() as u8;
+            let g = (row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
+            let b = (row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
+            eprintln!("  {} center: ({},{},{})", label, r, g, b);
+        }
+
+        // Also write to file for djxl verification
+        let file_data = crate::encode::container::wrap_codestream(&cs).unwrap();
+        std::fs::write("/tmp/test_vardct_16x16.jxl", &file_data).unwrap();
+        eprintln!("Written {} bytes to /tmp/test_vardct_16x16.jxl", file_data.len());
+    }
+
+    #[test]
+    fn test_vardct_gradient_roundtrip() {
+        // Test with gradient image - more interesting than constant
+        let width = 8;
+        let height = 8;
+        let mut rgb = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                rgb[i] = (x * 255 / 7) as u8;     // R: gradient left-right
+                rgb[i + 1] = (y * 255 / 7) as u8; // G: gradient top-bottom
+                rgb[i + 2] = 128;                   // B: constant
             }
-            Err(e) => {
-                eprintln!("jxl-rs panicked: {e:?}");
+        }
+        let config = VarDctConfig::default();
+        let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
+
+        // Decode with jxl-rs
+        let (_n, frames) = crate::api::tests::decode(
+            &cs, usize::MAX, true, false, None,
+        ).expect("decode should succeed");
+
+        let buf = &frames[0][0];
+        eprintln!("Gradient test decoded OK");
+        for y in 0..2 {
+            let row = buf.row(y);
+            for x in 0..2 {
+                let r = (row[x * 3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let g = (row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let b = (row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                eprintln!("  pixel({},{}) input=({},{},{}) decoded=({},{},{})",
+                    x, y, rgb[(y*width+x)*3], rgb[(y*width+x)*3+1], rgb[(y*width+x)*3+2],
+                    r, g, b);
             }
         }
     }
