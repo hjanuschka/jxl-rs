@@ -9,13 +9,24 @@ pub mod encoder;
 pub mod encodings;
 pub mod entropy;
 pub mod headers;
+pub mod modular;
 pub mod options;
 pub mod toc;
 
 pub use bit_writer::BitWriter;
 pub use encoder::{JxlEncoder, JxlEncoderBitstreamKind};
 pub use encodings::{pack_signed, write_i32, write_u32};
-pub use entropy::{HybridUintConfig, write_simple_context_map, write_simple_zero_context_map};
-pub use headers::{encode_minimal_codestream_header, encode_minimal_single_frame_codestream};
+pub use entropy::{
+    HybridUintConfig, write_simple_context_map, write_simple_zero_context_map,
+    write_single_symbol_huffman_histograms,
+};
+pub use headers::{
+    encode_minimal_codestream_header, encode_minimal_modular_image_codestream,
+    encode_minimal_single_frame_codestream,
+};
+pub use modular::{
+    write_minimal_group_header, write_minimal_modular_global_data,
+    write_minimal_modular_lf_global_section, write_single_leaf_tree,
+};
 pub use options::JxlEncoderOptions;
 pub use toc::write_toc;

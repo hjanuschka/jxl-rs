@@ -9,6 +9,7 @@ Current local `jxl-encoder` branch includes an early pure-Rust encoder bootstrap
 - U32/i32 encoding helpers for JPEG XL field coders
 - Minimal codestream header emission (parses to `WithImageInfo`)
 - Minimal single-frame metadata + TOC emission (parses to `WithFrameInfo`)
+- Minimal decodable modular image stream for small images (`<= 256x256`)
 - `jxle` CLI helper binary for generating bootstrap streams
 - Pure-Rust dependency guard script: `tools/check_encoder_pure_rust.py`
 
@@ -33,4 +34,7 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 321 --h
 
 # Emit a minimal stream that also includes frame metadata + TOC
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 321 --height 123 --with-frame-info
+
+# Emit a minimal decodable modular image stream
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image
 ```

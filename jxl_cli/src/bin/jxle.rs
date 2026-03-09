@@ -29,13 +29,29 @@ struct Opt {
     /// Include minimal frame header + TOC (still no pixel section payload)
     #[arg(long)]
     with_frame_info: bool,
+
+    /// Emit a minimal decodable modular image stream (currently <= 256x256)
+    #[arg(long)]
+    modular_image: bool,
 }
 
 fn main() -> Result<()> {
     let opt = Opt::parse();
     let enc = JxlEncoder::default();
 
-    let bytes = if opt.with_frame_info {
+    if opt.modular_image && opt.with_frame_info {
+        return Err(color_eyre::eyre::eyre!(
+            "--modular-image and --with-frame-info are mutually exclusive"
+        ));
+    }
+
+    let bytes = if opt.modular_image {
+        if opt.bare {
+            enc.encode_minimal_modular_image_codestream((opt.width, opt.height))?
+        } else {
+            enc.encode_minimal_modular_image_container((opt.width, opt.height))?
+        }
+    } else if opt.with_frame_info {
         if opt.bare {
             enc.encode_minimal_single_frame_codestream((opt.width, opt.height))?
         } else {
@@ -50,7 +66,9 @@ fn main() -> Result<()> {
     std::fs::write(&opt.output, &bytes)
         .wrap_err_with(|| format!("Failed to write {:?}", opt.output))?;
 
-    let mode = if opt.with_frame_info {
+    let mode = if opt.modular_image {
+        "minimal modular-image stream"
+    } else if opt.with_frame_info {
         "minimal frame-info stream"
     } else {
         "header-only stream"
