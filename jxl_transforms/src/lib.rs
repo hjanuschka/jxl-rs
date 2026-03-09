@@ -8,6 +8,11 @@ mod reinterpreting_dct2d;
 pub mod transform;
 pub mod transform_map;
 
+#[cfg(feature = "encoder")]
+mod dct8;
+#[cfg(feature = "encoder")]
+pub use dct8::*;
+
 mod idct16;
 mod idct2;
 mod idct32;
