@@ -40,5 +40,10 @@ avx = ["jxl_simd/avx"]
 avx512 = ["jxl_simd/avx512"]
 neon = ["jxl_simd/neon"]
 
+# Encoder feature rollout (pure Rust implementation).
+encoder = []
+encoder-vardct = ["encoder"]
+encoder-advanced = ["encoder-vardct"]
+
 [lints]
 workspace = true

@@ -27,6 +27,10 @@ pub enum Error {
     InvalidQuantizationTableWeight(f32),
     #[error("Read out of bounds; size hint: {0}")]
     OutOfBounds(usize),
+    #[error("Invalid bit count: {0}")]
+    InvalidBitCount(usize),
+    #[error("Bit writer is not byte-aligned")]
+    BitWriterNotByteAligned,
     #[error("Section is too short")]
     SectionTooShort,
     #[error("Non-zero padding bits")]
