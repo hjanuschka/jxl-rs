@@ -374,22 +374,31 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
 /// Encodes an interleaved RGB8 buffer into a modular codestream.
 ///
 /// Uses histogram-driven Huffman encoding for proper compression.
-/// The encoding uses predictor Zero with per-group offset optimization.
+/// The encoding uses the West (left) predictor with offset 0 for good
+/// compression of smooth images; channel-major, row-major order.
 pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
     validate_rgb_u8_buffer(width, height, rgb)?;
 
     let uint_config = HybridUintConfig::new(4, 2, 0);
+    let predictor = 1u32; // West (left neighbor)
 
     let width_usize = width as usize;
     let num_groups = default_num_groups(width, height);
     let num_lf_groups = default_num_lf_groups(width, height);
     let num_groups_x = width.div_ceil(256);
 
-    /// Collect signed residuals for a group region.
-    /// Uses predictor Zero with the given offset: residual = sample - offset.
-    fn collect_group_residuals(
+    /// Collect signed residuals for a group region using the West predictor.
+    ///
+    /// Matches the decoder's `PredictionData::get_rows` behavior for `Predictor::West`:
+    /// - x=0, y=0: prediction = 0 (no neighbors)
+    /// - x=0, y>0: prediction = sample[0, y-1] (top pixel at x=0)
+    /// - x>0: prediction = sample[x-1, y] (left neighbor)
+    ///
+    /// The tree leaf `offset` is added to the prediction by the decoder, so
+    /// residual = sample - (prediction + offset).
+    fn collect_group_residuals_west(
         rgb: &[u8],
         width_usize: usize,
         origin: (u32, u32),
@@ -398,59 +407,46 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     ) -> Vec<i32> {
         let (ox, oy) = origin;
         let (gw, gh) = group_size;
-        let mut residuals = Vec::with_capacity((gw as usize) * (gh as usize) * 3);
+        let gw_usize = gw as usize;
+        let mut residuals = Vec::with_capacity(gw_usize * (gh as usize) * 3);
 
         // Channel-major, row-major within each channel.
         for channel in 0..3 {
+            // Track the first column of the previous row for the West predictor fallback.
+            let mut prev_row_first = 0i32;
+
             for y in oy..(oy + gh) {
-                for x in ox..(ox + gw) {
+                let local_y = (y - oy) as usize;
+                // First pixel in row: West prediction = top pixel at x=0 (y>0) or 0 (y=0).
+                let first_pred = if local_y > 0 { prev_row_first } else { 0 };
+                let first_pixel_index = y as usize * width_usize + ox as usize;
+                let first_sample = i32::from(rgb[first_pixel_index * 3 + channel]);
+                residuals.push(first_sample - (first_pred + offset));
+                prev_row_first = first_sample;
+
+                let mut prev = first_sample;
+                for x in (ox + 1)..(ox + gw) {
                     let pixel_index = y as usize * width_usize + x as usize;
                     let sample = i32::from(rgb[pixel_index * 3 + channel]);
-                    residuals.push(sample - offset);
+                    residuals.push(sample - (prev + offset));
+                    prev = sample;
                 }
             }
         }
         residuals
     }
 
-    /// Choose the optimal constant offset for a group.
-    fn choose_group_offset(
-        rgb: &[u8],
-        width_usize: usize,
-        origin: (u32, u32),
-        group_size: (u32, u32),
-    ) -> i32 {
-        let (ox, oy) = origin;
-        let (gw, gh) = group_size;
-        let mut min_sample = u8::MAX;
-        let mut max_sample = u8::MIN;
-
-        for y in oy..(oy + gh) {
-            for x in ox..(ox + gw) {
-                let pixel_index = y as usize * width_usize + x as usize;
-                let base = pixel_index * 3;
-                for c in 0..3 {
-                    let sample = rgb[base + c];
-                    min_sample = min_sample.min(sample);
-                    max_sample = max_sample.max(sample);
-                }
-            }
-        }
-
-        // Use the midpoint of the range as offset for balanced residuals.
-        i32::from((min_sample / 2) + (max_sample / 2))
-    }
-
     // Single-group path: LF global section contains tree + residuals.
     if num_groups == 1 {
-        let offset = choose_group_offset(rgb, width_usize, (0, 0), (width, height));
-        let residuals = collect_group_residuals(rgb, width_usize, (0, 0), (width, height), offset);
+        let offset = 0i32; // West predictor doesn't need a nonzero offset
+        let residuals =
+            collect_group_residuals_west(rgb, width_usize, (0, 0), (width, height), offset);
 
         let mut lf_global_writer = BitWriter::new();
         write_lf_global_section_huffman(
             &mut lf_global_writer,
             offset,
-            0,
+            predictor,
             Some(&residuals),
             uint_config,
         )?;
@@ -472,7 +468,7 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     // - section N+1: HF global (empty)
     // - section N+2..: HF groups (local tree + residual data)
     let mut lf_global_writer = BitWriter::new();
-    write_lf_global_section_huffman(&mut lf_global_writer, 0, 0, None, uint_config)?;
+    write_lf_global_section_huffman(&mut lf_global_writer, 0, predictor, None, uint_config)?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
@@ -484,11 +480,18 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         let gw = (width - ox).min(256);
         let gh = (height - oy).min(256);
 
-        let offset = choose_group_offset(rgb, width_usize, (ox, oy), (gw, gh));
-        let residuals = collect_group_residuals(rgb, width_usize, (ox, oy), (gw, gh), offset);
+        let offset = 0i32;
+        let residuals =
+            collect_group_residuals_west(rgb, width_usize, (ox, oy), (gw, gh), offset);
 
         let mut group_writer = BitWriter::new();
-        write_hf_group_section_huffman(&mut group_writer, offset, 0, &residuals, uint_config)?;
+        write_hf_group_section_huffman(
+            &mut group_writer,
+            offset,
+            predictor,
+            &residuals,
+            uint_config,
+        )?;
         hf_group_sections.push(group_writer.finish());
     }
 
