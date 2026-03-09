@@ -23,13 +23,13 @@ use super::{
 };
 
 /// Precomputed token stream for a group of residual values.
-struct TokenStream {
+pub struct TokenStream {
     /// HybridUint-encoded tokens (symbol + extra bits).
-    tokens: Vec<HybridUintEncoded>,
+    pub(crate) tokens: Vec<HybridUintEncoded>,
     /// The Huffman code built from frequencies.
-    code: HuffmanCode,
+    pub(crate) code: HuffmanCode,
     /// The HybridUint config used.
-    uint_config: HybridUintConfig,
+    pub(crate) uint_config: HybridUintConfig,
 }
 
 /// Encode residual values into a token stream with histogram.
@@ -226,6 +226,18 @@ pub fn write_hf_group_section_huffman(
         uint_config,
         false,
     )
+}
+
+/// Build tree token stream for a zero-predictor, zero-offset tree.
+/// Exposed for VarDCT HF metadata encoding.
+pub fn build_tree_tokens_zero() -> Result<TokenStream> {
+    build_tree_token_stream(0, 0) // predictor=0 (Zero), offset=0
+}
+
+/// Write tree token stream to a BitWriter.
+/// Exposed for VarDCT HF metadata encoding.
+pub fn write_tree_token_stream(writer: &mut BitWriter, stream: &TokenStream) -> Result<()> {
+    write_token_stream(writer, stream)
 }
 
 /// Encode a multi-channel signed integer modular stream.

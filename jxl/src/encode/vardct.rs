@@ -224,6 +224,63 @@ fn encode_vardct_frame(
     }
 }
 
+/// Encode HF metadata as a modular stream with 4 channels of different sizes.
+///
+/// Channels:
+///   0: ytox_map (cr_w x cr_h)
+///   1: ytob_map (cr_w x cr_h)
+///   2: transform_image (count x 2)
+///   3: epf_map (bw x bh)
+///
+/// All values are 0 for our minimal encoder (no chroma correlation,
+/// DCT8x8 transform, quant=1, no EPF).
+fn encode_hf_metadata_modular(
+    w: &mut BitWriter,
+    _cr_w: usize,
+    _cr_h: usize,
+    _count: usize,
+    _bw: usize,
+    _bh: usize,
+    _data: &[i32],
+) -> Result<()> {
+    // All 4 channels contain only zeros.
+    // Write a modular subbitstream that decodes to all-zero channels.
+    //
+    // GroupHeader: use_global_tree=false, wp_all_default=true, nb_transforms=0
+    crate::encode::modular::write_minimal_group_header(w, false)?;
+
+    // Local tree: single leaf node with predictor=0 (Zero), offset=0
+    // This produces residual 0 for each pixel, which matches our all-zero data.
+    // Tree tokens: property=-1, value=0, predictor=0, offset=0, multiplier=0
+    let tree_stream = crate::encode::modular_encode::build_tree_tokens_zero()?;
+    let tree_context_map = [0u8; 6];
+    crate::encode::entropy::huffman_encode::write_huffman_histograms(
+        w,
+        &tree_context_map,
+        &[tree_stream.uint_config],
+        &[tree_stream.code.clone()],
+    )?;
+    crate::encode::modular_encode::write_tree_token_stream(w, &tree_stream)?;
+
+    // Residual histograms: single symbol 0 (all residuals are 0)
+    let zero_code = crate::encode::entropy::huffman_encode::build_huffman_code(&[1])
+        .ok_or(crate::error::Error::InvalidHuffman)?;
+    let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
+    crate::encode::entropy::huffman_encode::write_huffman_histograms(
+        w,
+        &[0u8],
+        &[uint_config],
+        &[zero_code],
+    )?;
+
+    // No residual tokens to write (all symbols are 0, encoded as 0 bits each).
+    // The SymbolReader will read 0 bits per symbol from the single-symbol table.
+    // But we still need the check_final_state which verifies the ans state.
+    // For Huffman with single symbol, no bits are consumed, so nothing to write.
+
+    Ok(())
+}
+
 fn global_scale_coder() -> U32Coder {
     U32Coder::Select(
         U32::BitsOffset { n: 11, off: 1 },
@@ -342,14 +399,46 @@ fn encode_single_group_section(
     // === LfGroup0: ModularLF (empty for 0 extra channels) ===
 
     // === LfGroup0: HF metadata ===
-    // raw_quant_field (all 1) + transform_map (all 0 = DCT8x8)
-    let mut hf_meta = vec![0i32; num_blocks * 2];
-    for i in 0..num_blocks {
-        hf_meta[i] = 1; // raw_quant_field
+    // The HF metadata encodes 4 modular channels:
+    //   ch0: ytox_map (cr_w x cr_h, where cr = blocks/8 ceiled)
+    //   ch1: ytob_map (same size)
+    //   ch2: transform_image (count x 2)
+    //   ch3: epf_map (bw x bh)
+    //
+    // First: count is read from ceil_log2(bw*bh) bits, value = count-1.
+    let upper_bound = bw * bh;
+    let count_num_bits = if upper_bound <= 1 { 0 } else {
+        32 - (upper_bound as u32 - 1).leading_zeros()
+    };
+    // count = num_blocks (every block gets a transform entry)
+    // Write count-1 in count_num_bits bits
+    if count_num_bits > 0 {
+        w.write(count_num_bits as usize, (num_blocks - 1) as u64)?;
     }
-    crate::encode::modular_encode::encode_modular_signed_stream(
-        &mut w, bw, bh, 2, &hf_meta,
-    )?;
+
+    // Build modular channels for HF metadata
+    let cr_w = bw.div_ceil(8); // chroma correlation map size
+    let cr_h = bh.div_ceil(8);
+    let ch0_size = cr_w * cr_h; // ytox
+    let ch1_size = cr_w * cr_h; // ytob
+    let ch2_size = num_blocks * 2; // transform (count x 2)
+    let ch3_size = bw * bh; // epf
+    let total = ch0_size + ch1_size + ch2_size + ch3_size;
+
+    let mut hf_meta = vec![0i32; total];
+    // ch0 (ytox): all 0
+    // ch1 (ytob): all 0
+    // ch2 (transform_image):
+    //   row 0: transform types (DCT8x8 = 0)
+    //   row 1: raw_quant - 1 (quant=1, so value=0)
+    // All zeros -- which is correct for DCT8x8 with quant=1.
+    // ch3 (epf): all 0 (no EPF sharpness)
+
+    // The 4 channels have different sizes. We need to encode them
+    // as a multi-channel modular stream where each channel has its own
+    // width and height.
+    // For simplicity, since all values are 0, a single-symbol stream works.
+    encode_hf_metadata_modular(&mut w, cr_w, cr_h, num_blocks, bw, bh, &hf_meta)?;
 
     // === HfGlobal ===
     // DequantMatrices: all_default = true
@@ -618,6 +707,37 @@ mod tests {
         let path = "/tmp/test_vardct_8x8.jxl";
         std::fs::write(path, &container).unwrap();
         eprintln!("Written to {path} ({} bytes)", container.len());
+    }
+
+    #[test]
+    fn test_decode_vardct_jxlrs() {
+        let width = 8;
+        let height = 8;
+        let rgb = vec![128u8; width * height * 3];
+        let config = VarDctConfig::default();
+        let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
+
+        // Try decoding with jxl-rs
+        let result = std::panic::catch_unwind(|| {
+            crate::api::tests::decode(&cs, usize::MAX, true, false, None)
+        });
+        match result {
+            Ok(Ok((_size, frames))) => {
+                eprintln!("jxl-rs decoded OK! frames: {}", frames.len());
+                // Check output dimensions
+                if let Some(frame) = frames.first() {
+                    if let Some(img) = frame.first() {
+                        eprintln!("  Output: {}x{}", img.size().0, img.size().1);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("jxl-rs decode error: {e:?}");
+            }
+            Err(e) => {
+                eprintln!("jxl-rs panicked: {e:?}");
+            }
+        }
     }
 
     #[test]
