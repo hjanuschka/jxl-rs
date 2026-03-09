@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::{
     HybridUintConfig, write_simple_context_map, write_single_symbol_huffman_codes_with_symbols,
@@ -11,15 +11,21 @@ use super::{
 use crate::encode::BitWriter;
 
 /// Writes prefix/Huffman histograms where each histogram table decodes to a
-/// single fixed symbol.
+/// single fixed symbol with caller-provided HybridUint configs.
 ///
 /// - `context_map`: one histogram-id per context
 /// - `histogram_symbols`: one fixed decoded symbol per histogram-id
-pub fn write_fixed_symbol_huffman_histograms(
+/// - `uint_configs`: one HybridUint config per histogram-id
+pub fn write_fixed_symbol_huffman_histograms_with_configs(
     writer: &mut BitWriter,
     context_map: &[u8],
     histogram_symbols: &[u16],
+    uint_configs: &[HybridUintConfig],
 ) -> Result<()> {
+    if histogram_symbols.len() != uint_configs.len() {
+        return Err(Error::InvalidHuffman);
+    }
+
     // LZ77 disabled.
     writer.write(1, 0)?;
 
@@ -30,8 +36,8 @@ pub fn write_fixed_symbol_huffman_histograms(
     // use_prefix_code = true => Huffman path, log_alpha_size = 15.
     writer.write(1, 1)?;
 
-    for _ in histogram_symbols {
-        HybridUintConfig::new(15, 0, 0).write(writer, 15)?;
+    for cfg in uint_configs {
+        cfg.write(writer, 15)?;
     }
 
     let alphabet_sizes: Vec<usize> = histogram_symbols
@@ -42,6 +48,24 @@ pub fn write_fixed_symbol_huffman_histograms(
     write_single_symbol_huffman_codes_with_symbols(writer, &alphabet_sizes, histogram_symbols)?;
 
     Ok(())
+}
+
+/// Writes prefix/Huffman histograms where each histogram table decodes to a
+/// single fixed symbol.
+///
+/// Uses default HybridUint config (`split_exponent = log_alpha_size`).
+pub fn write_fixed_symbol_huffman_histograms(
+    writer: &mut BitWriter,
+    context_map: &[u8],
+    histogram_symbols: &[u16],
+) -> Result<()> {
+    let default_cfgs = vec![HybridUintConfig::new(15, 0, 0); histogram_symbols.len()];
+    write_fixed_symbol_huffman_histograms_with_configs(
+        writer,
+        context_map,
+        histogram_symbols,
+        &default_cfgs,
+    )
 }
 
 /// Writes a minimal histogram stream that decodes to:
@@ -115,6 +139,31 @@ mod tests {
             assert_eq!(reader.read_unsigned(&hist, &mut br, 1), 0);
         }
 
+        reader.check_final_state(&hist, &mut br).unwrap();
+    }
+
+    #[test]
+    fn test_fixed_symbol_huffman_histograms_with_configs_roundtrip() {
+        let mut writer = BitWriter::new();
+        let context_map = [0u8];
+        let histogram_symbols = [10u16];
+        let uint_configs = [HybridUintConfig::new(0, 0, 0)];
+        write_fixed_symbol_huffman_histograms_with_configs(
+            &mut writer,
+            &context_map,
+            &histogram_symbols,
+            &uint_configs,
+        )
+        .unwrap();
+
+        // token=10 with split0 -> 9 extra bits, choose bits=0 => decoded signed 256.
+        writer.write(9, 0).unwrap();
+        let bytes = writer.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let hist = Histograms::decode(1, &mut br, true).unwrap();
+        let mut reader = SymbolReader::new(&hist, &mut br, None).unwrap();
+        assert_eq!(reader.read_signed(&hist, &mut br, 0), 256);
         reader.check_final_state(&hist, &mut br).unwrap();
     }
 }
