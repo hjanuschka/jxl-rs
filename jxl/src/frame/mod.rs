@@ -31,14 +31,14 @@ use crate::features::epf::SigmaSource;
 use crate::util::AtomicRefCell;
 
 mod adaptive_lf_smoothing;
-mod block_context_map;
+pub(crate) mod block_context_map;
 mod coeff_order;
 pub mod color_correlation_map;
 pub mod decode;
 mod group;
 pub mod lf_preview;
 pub mod modular;
-mod quant_weights;
+pub(crate) mod quant_weights;
 pub mod quantizer;
 pub mod render;
 

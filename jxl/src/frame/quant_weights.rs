@@ -909,7 +909,7 @@ impl DequantMatrices {
 
     /// Get cached computed library table for a QuantTable type index.
     /// Computes the table lazily on first access.
-    fn get_library_table(idx: usize) -> &'static [f32] {
+    pub fn get_library_table(idx: usize) -> &'static [f32] {
         LIBRARY_TABLES[idx].get_or_init(|| {
             let encoding = Self::get_library_encoding(idx);
             Self::compute_table(&encoding, idx).expect("library table computation should not fail")
