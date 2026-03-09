@@ -14,7 +14,7 @@ pub mod options;
 pub mod toc;
 
 pub use bit_writer::BitWriter;
-pub use encoder::{JxlEncoder, JxlEncoderBitstreamKind};
+pub use encoder::{JxlEncoder, JxlEncoderBitstreamKind, JxlEncoderImageData};
 pub use encodings::{pack_signed, write_i32, write_u32};
 pub use entropy::{
     HybridUintConfig, write_fixed_symbol_huffman_histograms,
