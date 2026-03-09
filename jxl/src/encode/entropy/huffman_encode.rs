@@ -259,7 +259,18 @@ pub fn count_nonzero(frequencies: &[u64]) -> usize {
 }
 
 /// Write a Huffman table for a single histogram.
+///
+/// When `alphabet_size == 1`, writes nothing (decoder handles this
+/// as a special case without reading any table bits).
 pub fn write_huffman_table(writer: &mut BitWriter, code: &HuffmanCode) -> Result<()> {
+    let al_size = code.alphabet_size;
+
+    // Decoder special case: al_size==1 means the only possible symbol is 0,
+    // no table data is read from the bitstream.
+    if al_size == 1 {
+        return Ok(());
+    }
+
     let nonzero: Vec<(usize, u8)> = code
         .code_lengths
         .iter()
@@ -268,10 +279,9 @@ pub fn write_huffman_table(writer: &mut BitWriter, code: &HuffmanCode) -> Result
         .map(|(i, l)| (i, *l))
         .collect();
 
-    let al_size = code.alphabet_size;
     let num_nonzero = nonzero.len();
 
-    if al_size == 1 || num_nonzero <= 1 {
+    if num_nonzero <= 1 {
         write_simple_table_1(
             writer,
             al_size,
@@ -544,6 +554,9 @@ fn write_static_huffman_symbol(writer: &mut BitWriter, value: u8) -> Result<()> 
 }
 
 /// Write a symbol using an already-built Huffman code.
+///
+/// When `alphabet_size == 1`, writes 0 bits (the decoder knows the only
+/// possible symbol and doesn't read any bits).
 pub fn write_huffman_symbol(
     writer: &mut BitWriter,
     code: &HuffmanCode,
@@ -552,9 +565,12 @@ pub fn write_huffman_symbol(
     if symbol >= code.alphabet_size {
         return Err(Error::InvalidHuffman);
     }
+    // Single-symbol alphabet: decoder returns symbol 0 without reading bits.
+    if code.alphabet_size == 1 {
+        return Ok(());
+    }
     let len = code.code_lengths[symbol] as usize;
     if len == 0 {
-        // Single-symbol code: write 0 bits.
         return Ok(());
     }
     writer.write(len, u64::from(code.codes[symbol]))?;

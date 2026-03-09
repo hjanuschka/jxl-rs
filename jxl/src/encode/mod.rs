@@ -11,6 +11,7 @@ pub mod entropy;
 pub mod headers;
 pub mod input;
 pub mod modular;
+pub mod modular_encode;
 pub mod options;
 pub mod toc;
 
