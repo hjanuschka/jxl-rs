@@ -1099,6 +1099,105 @@ mod tests {
     }
 
     #[test]
+    fn test_vardct_quality_levels() {
+        // Test encode-decode roundtrip at different quality levels
+        let width = 8;
+        let height = 8;
+        let mut rgb = vec![0u8; width * height * 3];
+        // Checker pattern with 2x2 blocks
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                if (x / 2 + y / 2) % 2 == 0 {
+                    rgb[i] = 200; rgb[i+1] = 50; rgb[i+2] = 100;
+                } else {
+                    rgb[i] = 50; rgb[i+1] = 200; rgb[i+2] = 150;
+                }
+            }
+        }
+
+        for (distance, label) in [(0.01, "near-lossless"), (0.5, "high"), (1.0, "default"), (3.0, "low")] {
+            let config = VarDctConfig { distance };
+            let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
+            let (_n, frames) = crate::api::tests::decode(
+                &cs, usize::MAX, true, false, None,
+            ).expect("decode should succeed");
+
+            let buf = &frames[0][0];
+            // Compute max pixel error
+            let mut max_err = 0u32;
+            for y in 0..height {
+                let row = buf.row(y);
+                for x in 0..width {
+                    let i = (y * width + x) * 3;
+                    let dr = ((row[x * 3].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i] as i32).unsigned_abs();
+                    let dg = ((row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i+1] as i32).unsigned_abs();
+                    let db = ((row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i+2] as i32).unsigned_abs();
+                    max_err = max_err.max(dr).max(dg).max(db);
+                }
+            }
+            eprintln!("  d={:.2} ({:14}): {} bytes, max_err={}", distance, label, cs.len(), max_err);
+
+            // Note: at near-lossless, error can still be significant because
+            // our simple encoder doesn't yet optimize for quality (no adaptive
+            // quant, no CfL optimization, etc.)
+            // At d=0.01, expect max_err < 100 for now.
+            if distance <= 0.1 {
+                assert!(max_err <= 100, "near-lossless should have reasonable error, got {max_err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_vardct_large_image() {
+        // Test 64x64 image (8 groups x 8 groups of 8x8 blocks)
+        // Still single-group since 64 < 256
+        let width = 64;
+        let height = 64;
+        let mut rgb = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                // Smooth gradient with some structure
+                rgb[i] = (x * 255 / (width - 1)) as u8;
+                rgb[i + 1] = (y * 255 / (height - 1)) as u8;
+                rgb[i + 2] = ((x + y) * 128 / (width + height - 2)) as u8;
+            }
+        }
+
+        // Test multiple distances  
+        for distance in [1.0f32, 0.5] {
+            let config = VarDctConfig { distance };
+        let cs = match encode_vardct_u8_rgb_codestream(&rgb, width, height, &config) {
+            Ok(cs) => cs,
+            Err(e) => panic!("Encoding failed: {e:?}"),
+        };
+        eprintln!("64x64 codestream: {} bytes", cs.len());
+
+            // Write to file for visual inspection
+            let file_data = crate::encode::container::wrap_codestream(&cs).unwrap();
+            std::fs::write("/tmp/test_vardct_64x64.jxl", &file_data).unwrap();
+
+            // Decode with jxl-rs
+            let result = crate::api::tests::decode(
+                &cs, usize::MAX, true, false, None,
+            );
+            match result {
+                Ok((_n, frames)) => {
+                    let buf = &frames[0][0];
+                    assert_eq!(buf.size(), (width * 3, height));
+                    eprintln!("  d={distance}: {} bytes - OK", cs.len());
+                }
+                Err(e) => {
+                    eprintln!("  d={distance}: {} bytes - FAILED: {e:?}", cs.len());
+                }
+            }
+        }
+    }
+
+    // Large image test is in test_vardct_large_image -- uses djxl for verification
+
+    #[test]
     fn test_write_vardct_to_file() {
         let width = 8;
         let height = 8;

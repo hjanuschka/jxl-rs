@@ -35,6 +35,46 @@ impl HuffmanCode {
     }
 }
 
+/// Build a canonical Huffman code from symbol frequencies with a custom max length.
+pub fn build_huffman_code_limited(frequencies: &[u64], max_bits: usize) -> Option<HuffmanCode> {
+    let alphabet_size = frequencies.len();
+    if alphabet_size == 0 {
+        return None;
+    }
+
+    let nonzero: Vec<(usize, u64)> = frequencies
+        .iter()
+        .enumerate()
+        .filter(|&(_, f)| *f > 0)
+        .map(|(i, f)| (i, *f))
+        .collect();
+
+    if nonzero.is_empty() {
+        return None;
+    }
+
+    if nonzero.len() == 1 {
+        let mut code_lengths = vec![0u8; alphabet_size];
+        code_lengths[nonzero[0].0] = 1;
+        let mut codes = vec![0u32; alphabet_size];
+        codes[nonzero[0].0] = 0;
+        return Some(HuffmanCode {
+            alphabet_size,
+            code_lengths,
+            codes,
+        });
+    }
+
+    let code_lengths = build_code_lengths(frequencies, max_bits);
+    let codes = canonical_codes(&code_lengths);
+
+    Some(HuffmanCode {
+        alphabet_size,
+        code_lengths,
+        codes,
+    })
+}
+
 /// Build a canonical Huffman code from symbol frequencies.
 pub fn build_huffman_code(frequencies: &[u64]) -> Option<HuffmanCode> {
     let alphabet_size = frequencies.len();
@@ -186,7 +226,7 @@ fn cap_code_lengths(lengths: &mut [u8], max_bits: usize) {
 
     nz.sort_by(|a, b| b.1.cmp(&a.1));
 
-    loop {
+    for _ in 0..10000 {
         let kraft_sum: u64 = nz
             .iter()
             .map(|&(_, l)| 1u64 << (max_bits - l as usize))
@@ -198,19 +238,21 @@ fn cap_code_lengths(lengths: &mut [u8], max_bits: usize) {
         }
 
         if kraft_sum > target {
+            // Too much space used -- make shortest code longer to reduce Kraft sum
+            // Pick the symbol with shortest code (largest contribution)
+            if let Some(item) = nz.iter_mut().rev().find(|item| (item.1 as usize) < max_bits) {
+                item.1 += 1;
+            } else {
+                break;
+            }
+        } else {
+            // Not enough space used -- make longest code shorter to increase Kraft sum
+            // Pick the symbol with longest code (smallest contribution)
             if let Some(item) = nz.iter_mut().find(|item| item.1 > 1) {
                 item.1 -= 1;
             } else {
                 break;
             }
-        } else if let Some(item) = nz
-            .iter_mut()
-            .rev()
-            .find(|item| (item.1 as usize) < max_bits)
-        {
-            item.1 += 1;
-        } else {
-            break;
         }
 
         nz.sort_by(|a, b| b.1.cmp(&a.1));
@@ -494,7 +536,8 @@ fn write_complex_table(writer: &mut BitWriter, code: &HuffmanCode) -> Result<()>
         cl_freqs[sym.symbol as usize] += 1;
     }
 
-    let cl_code = build_huffman_code(&cl_freqs).ok_or(Error::InvalidHuffman)?;
+    // Build code-length code with max length 5 (static table only supports 0-5)
+    let cl_code = build_huffman_code_limited(&cl_freqs, 5).ok_or(Error::InvalidHuffman)?;
 
     let mut cl_code_lengths = [0u8; 18];
     for (i, &len) in cl_code.code_lengths.iter().enumerate() {
@@ -875,5 +918,46 @@ mod tests {
             assert_eq!(got, expected);
         }
         reader.check_final_state(&hist, &mut br).unwrap();
+    }
+
+    #[test]
+    fn test_write_complex_table_many_symbols_roundtrip() {
+        // Test with increasing alphabet sizes to find the breaking point
+        // Test with specific code lengths that reproduce the failure
+        for al_size in [6, 20, 50, 58, 60, 87] {
+            let mut freqs = vec![0u64; al_size];
+            for (i, f) in freqs.iter_mut().enumerate() {
+                *f = ((al_size - i) * 3) as u64 + 1;
+            }
+            let code = build_huffman_code(&freqs).unwrap();
+            let nonzero = code.code_lengths.iter().filter(|&&l| l > 0).count();
+
+            let mut writer = BitWriter::new();
+            write_varint16(&mut writer, (code.alphabet_size - 1) as u16).unwrap();
+            write_huffman_table(&mut writer, &code).unwrap();
+            // Write each symbol once
+            for s in 0..al_size {
+                write_huffman_symbol(&mut writer, &code, s).unwrap();
+            }
+            writer.write(32, 0).unwrap(); // padding
+            writer.write(32, 0).unwrap();
+            let bytes = writer.finish();
+
+            let mut br = BitReader::new(&bytes);
+            match HuffmanCodes::decode(1, &mut br) {
+                Ok(codes) => {
+                    for s in 0..al_size as u32 {
+                        let got = codes.read(&mut br, 0);
+                        assert_eq!(got, s, "al_size={al_size} symbol {s} mismatch: got {got}");
+                    }
+                    println!("  al_size={al_size} nonzero={nonzero}: OK");
+                }
+                Err(e) => {
+                    println!("  al_size={al_size} nonzero={nonzero} max_len={}: FAILED: {e:?}",
+                        code.code_lengths.iter().max().unwrap_or(&0));
+                    panic!("Decode failed at al_size={al_size}");
+                }
+            }
+        }
     }
 }
