@@ -393,6 +393,18 @@ struct CodeLengthSymbol {
 }
 
 /// Encode code lengths into a sequence of code-length symbols.
+/// Encode code lengths into a sequence of code-length symbols.
+///
+/// Uses the decoder's accumulative repeat semantics:
+/// - Symbol 16 (repeat previous): extra_bits = code_len - 14 = 2 bits.
+///   First use: repeat = extra_value + 3 (3..6).
+///   Subsequent: repeat = (repeat - 2) << 2 + extra_value + 3.
+/// - Symbol 17 (zero fill): extra_bits = 3 bits.
+///   First use: repeat = extra_value + 3 (3..10).
+///   Subsequent: repeat = (repeat - 2) << 3 + extra_value + 3.
+///
+/// For simplicity and correctness, we emit at most one repeat code per run
+/// (for runs of 3+), falling back to individual literals for shorter runs.
 fn encode_code_lengths(code_lengths: &[u8]) -> Vec<CodeLengthSymbol> {
     let mut symbols = Vec::new();
     let mut i = 0;
@@ -401,56 +413,59 @@ fn encode_code_lengths(code_lengths: &[u8]) -> Vec<CodeLengthSymbol> {
         let len = code_lengths[i];
 
         if len == 0 {
+            // Count zero run.
             let mut run = 1;
             while i + run < code_lengths.len() && code_lengths[i + run] == 0 {
                 run += 1;
             }
 
-            while run >= 3 {
-                let count = run.min(10);
+            if run >= 3 && run <= 10 {
+                // Single zero-fill code (symbol 17, 3 extra bits, encodes 3..10).
                 symbols.push(CodeLengthSymbol {
                     symbol: 17,
-                    extra: (count - 3) as u8,
+                    extra: (run - 3) as u8,
                 });
-                run -= count;
-                i += count;
-            }
-
-            for _ in 0..run {
-                symbols.push(CodeLengthSymbol {
-                    symbol: 0,
-                    extra: 0,
-                });
-                i += 1;
+                i += run;
+            } else {
+                // Individual zeros.
+                for _ in 0..run {
+                    symbols.push(CodeLengthSymbol {
+                        symbol: 0,
+                        extra: 0,
+                    });
+                    i += 1;
+                }
             }
         } else {
+            // Emit first literal.
             symbols.push(CodeLengthSymbol {
                 symbol: len,
                 extra: 0,
             });
             i += 1;
 
+            // Count subsequent identical values.
             let mut run = 0;
             while i + run < code_lengths.len() && code_lengths[i + run] == len {
                 run += 1;
             }
 
-            while run >= 3 {
-                let count = run.min(6);
+            if run >= 3 && run <= 6 {
+                // Single repeat code (symbol 16, 2 extra bits, encodes 3..6).
                 symbols.push(CodeLengthSymbol {
                     symbol: 16,
-                    extra: (count - 3) as u8,
+                    extra: (run - 3) as u8,
                 });
-                run -= count;
-                i += count;
-            }
-
-            for _ in 0..run {
-                symbols.push(CodeLengthSymbol {
-                    symbol: len,
-                    extra: 0,
-                });
-                i += 1;
+                i += run;
+            } else {
+                // Individual literals.
+                for _ in 0..run {
+                    symbols.push(CodeLengthSymbol {
+                        symbol: len,
+                        extra: 0,
+                    });
+                    i += 1;
+                }
             }
         }
     }
@@ -460,7 +475,7 @@ fn encode_code_lengths(code_lengths: &[u8]) -> Vec<CodeLengthSymbol> {
 
 /// Write a complex Huffman table using code-length encoding.
 fn write_complex_table(writer: &mut BitWriter, code: &HuffmanCode) -> Result<()> {
-    let cl_symbols = encode_code_lengths(&code.code_lengths);
+    let cl_symbols = encode_code_lengths(&code.code_lengths[..code.alphabet_size]);
 
     let mut cl_freqs = [0u64; 18];
     for sym in &cl_symbols {
@@ -522,8 +537,13 @@ fn write_complex_table(writer: &mut BitWriter, code: &HuffmanCode) -> Result<()>
     for sym in &cl_symbols {
         let s = sym.symbol as usize;
         let len = cl_code.code_lengths[s] as usize;
-        let bits = cl_code.codes[s];
-        writer.write(len, u64::from(bits))?;
+        if len == 0 && cl_code.alphabet_size == 1 {
+            // Single-symbol CL code: don't write any bits.
+            // (The decoder knows the only symbol.)
+        } else {
+            let bits = cl_code.codes[s];
+            writer.write(len, u64::from(bits))?;
+        }
 
         if sym.symbol == 16 {
             writer.write(2, u64::from(sym.extra))?;
@@ -764,6 +784,34 @@ mod tests {
         assert_eq!(codes.read(&mut br, 0), 8);
         assert_eq!(codes.read(&mut br, 0), 14);
         assert_eq!(codes.read(&mut br, 0), 20);
+    }
+
+    #[test]
+    fn test_write_complex_table_sparse_17_roundtrip() {
+        // 17-symbol alphabet with gaps (symbols 11, 13, 15 have freq 0).
+        // Exercises complex table writing with zero-frequency gaps.
+        let mut freqs = vec![0u64; 17];
+        for &s in &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16] {
+            freqs[s] = 1;
+        }
+        let code = build_huffman_code(&freqs).unwrap();
+
+        let mut writer = BitWriter::new();
+        write_varint16(&mut writer, (code.alphabet_size - 1) as u16).unwrap();
+        write_huffman_table(&mut writer, &code).unwrap();
+        // Write all non-zero symbols.
+        for &s in &[0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16] {
+            write_huffman_symbol(&mut writer, &code, s).unwrap();
+        }
+        writer.write(32, 0).unwrap();
+        let bytes = writer.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let codes = HuffmanCodes::decode(1, &mut br).unwrap();
+        for &s in &[0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16] {
+            let got = codes.read(&mut br, 0);
+            assert_eq!(got, s, "expected symbol {} got {}", s, got);
+        }
     }
 
     #[test]

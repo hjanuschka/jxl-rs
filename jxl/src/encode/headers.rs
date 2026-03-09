@@ -10,11 +10,10 @@ use crate::{
 };
 
 use super::{
-    BitWriter, HybridUintConfig, write_minimal_modular_global_data_with_entropy_params,
+    BitWriter, HybridUintConfig,
+    modular_encode::{write_hf_group_section_huffman, write_lf_global_section_huffman},
     write_minimal_modular_global_data_with_params,
-    write_minimal_modular_lf_global_section_with_entropy_params,
-    write_minimal_modular_lf_global_section_with_params, write_split0_fixed_token_signed_stream,
-    write_toc, write_u32,
+    write_minimal_modular_lf_global_section_with_params, write_toc, write_u32,
 };
 
 fn large_size_coder() -> U32Coder {
@@ -364,28 +363,58 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
 
 /// Encodes an interleaved RGB8 buffer into a modular codestream.
 ///
-/// Current constraints:
-/// - input is tightly packed interleaved RGB8 (`[r,g,b, r,g,b, ...]`)
-/// - uses default file metadata/bootstrap frame header
-/// - residual coding uses fixed split0 token bootstrap coding
+/// Uses histogram-driven Huffman encoding for proper compression.
+/// The encoding uses predictor Zero with per-group offset optimization.
 pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
     validate_rgb_u8_buffer(width, height, rgb)?;
 
-    let uint_config = HybridUintConfig::new(0, 0, 0);
+    let uint_config = HybridUintConfig::new(4, 2, 0);
 
     let width_usize = width as usize;
     let num_groups = default_num_groups(width, height);
     let num_lf_groups = default_num_lf_groups(width, height);
     let num_groups_x = width.div_ceil(256);
 
-    let choose_group_entropy_params = |origin: (u32, u32), size: (u32, u32)| -> (i32, u16) {
+    /// Collect signed residuals for a group region.
+    /// Uses predictor Zero with the given offset: residual = sample - offset.
+    fn collect_group_residuals(
+        rgb: &[u8],
+        width_usize: usize,
+        origin: (u32, u32),
+        group_size: (u32, u32),
+        offset: i32,
+    ) -> Vec<i32> {
         let (ox, oy) = origin;
-        let (gw, gh) = size;
+        let (gw, gh) = group_size;
+        let mut residuals = Vec::with_capacity((gw as usize) * (gh as usize) * 3);
 
+        // Channel-major, row-major within each channel.
+        for channel in 0..3 {
+            for y in oy..(oy + gh) {
+                for x in ox..(ox + gw) {
+                    let pixel_index = y as usize * width_usize + x as usize;
+                    let sample = i32::from(rgb[pixel_index * 3 + channel]);
+                    residuals.push(sample - offset);
+                }
+            }
+        }
+        residuals
+    }
+
+    /// Choose the optimal constant offset for a group.
+    fn choose_group_offset(
+        rgb: &[u8],
+        width_usize: usize,
+        origin: (u32, u32),
+        group_size: (u32, u32),
+    ) -> i32 {
+        let (ox, oy) = origin;
+        let (gw, gh) = group_size;
         let mut min_sample = u8::MAX;
         let mut max_sample = u8::MIN;
+
         for y in oy..(oy + gh) {
             for x in ox..(ox + gw) {
                 let pixel_index = y as usize * width_usize + x as usize;
@@ -398,62 +427,22 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
             }
         }
 
-        if min_sample == max_sample {
-            return (i32::from(min_sample), 0);
-        }
+        // Use the midpoint of the range as offset for balanced residuals.
+        i32::from((min_sample / 2) + (max_sample / 2))
+    }
 
-        let range = u32::from(max_sample - min_sample);
-        let values = range + 1;
-        let ceil_log2_values = (u32::BITS - (values - 1).leading_zeros()) as u32;
-        let token = (ceil_log2_values + 2) as u16;
-        let low = 1i32 << (u32::from(token) - 2);
-        let offset = i32::from(min_sample) - low;
-
-        (offset, token)
-    };
-
-    let write_group_samples = |writer: &mut BitWriter,
-                               origin: (u32, u32),
-                               size: (u32, u32),
-                               tree_offset: i32,
-                               token: u16|
-     -> Result<()> {
-        let (ox, oy) = origin;
-        let (gw, gh) = size;
-        let mut signed_residuals = Vec::with_capacity((gw as usize) * (gh as usize) * 3);
-
-        // Decoder channel order is channel-major, then row-major for each channel.
-        for channel in 0..3 {
-            for y in oy..(oy + gh) {
-                for x in ox..(ox + gw) {
-                    let pixel_index = y as usize * width_usize + x as usize;
-                    let sample = i32::from(rgb[pixel_index * 3 + channel]);
-                    signed_residuals.push(sample - tree_offset);
-                }
-            }
-        }
-
-        write_split0_fixed_token_signed_stream(writer, u32::from(token), &signed_residuals)
-    };
-
-    // Single-group path stores all channel samples in section 0.
+    // Single-group path: LF global section contains tree + residuals.
     if num_groups == 1 {
-        let (tree_offset, token) = choose_group_entropy_params((0, 0), (width, height));
+        let offset = choose_group_offset(rgb, width_usize, (0, 0), (width, height));
+        let residuals = collect_group_residuals(rgb, width_usize, (0, 0), (width, height), offset);
 
         let mut lf_global_writer = BitWriter::new();
-        write_minimal_modular_lf_global_section_with_entropy_params(
+        write_lf_global_section_huffman(
             &mut lf_global_writer,
-            tree_offset,
+            offset,
             0,
-            token,
+            Some(&residuals),
             uint_config,
-        )?;
-        write_group_samples(
-            &mut lf_global_writer,
-            (0, 0),
-            (width, height),
-            tree_offset,
-            token,
         )?;
         let lf_global_section = lf_global_writer.finish();
 
@@ -467,18 +456,12 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     }
 
     // Multi-group path:
-    // - section 0: LF global only
-    // - section 1 (LF groups): empty
-    // - section 2 (HF global): empty
-    // - section 3..: one per image group with local tree + residual bits
+    // - section 0: LF global (tree + empty residual histograms)
+    // - section 1..N: LF groups (empty)
+    // - section N+1: HF global (empty)
+    // - section N+2..: HF groups (local tree + residual data)
     let mut lf_global_writer = BitWriter::new();
-    write_minimal_modular_lf_global_section_with_entropy_params(
-        &mut lf_global_writer,
-        0,
-        0,
-        0,
-        uint_config,
-    )?;
+    write_lf_global_section_huffman(&mut lf_global_writer, 0, 0, None, uint_config)?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
@@ -490,17 +473,11 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         let gw = (width - ox).min(256);
         let gh = (height - oy).min(256);
 
-        let (tree_offset, token) = choose_group_entropy_params((ox, oy), (gw, gh));
+        let offset = choose_group_offset(rgb, width_usize, (ox, oy), (gw, gh));
+        let residuals = collect_group_residuals(rgb, width_usize, (ox, oy), (gw, gh), offset);
 
         let mut group_writer = BitWriter::new();
-        write_minimal_modular_global_data_with_entropy_params(
-            &mut group_writer,
-            tree_offset,
-            0,
-            token,
-            uint_config,
-        )?;
-        write_group_samples(&mut group_writer, (ox, oy), (gw, gh), tree_offset, token)?;
+        write_hf_group_section_huffman(&mut group_writer, offset, 0, &residuals, uint_config)?;
         hf_group_sections.push(group_writer.finish());
     }
 
@@ -530,7 +507,7 @@ mod tests {
     use crate::{
         api::{JxlBitDepth, JxlDecoder, JxlDecoderOptions, ProcessingResult, states},
         bit_reader::BitReader,
-        encode::container,
+        encode::{container, modular_encode},
         headers::{
             FileHeader, JxlHeader,
             encodings::{Empty, UnconditionalCoder},
@@ -826,7 +803,92 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_multigroup_lf_global_section_parses() {
+        // Test that the LF global section for multi-group encodes parses correctly.
+        let uint_config = HybridUintConfig::new(4, 2, 0);
+        let mut lf_writer = BitWriter::new();
+        modular_encode::write_lf_global_section_huffman(&mut lf_writer, 0, 0, None, uint_config)
+            .unwrap();
+        let lf_bytes = lf_writer.finish();
+
+        use crate::bit_reader::BitReader;
+        let mut br = BitReader::new(&lf_bytes);
+
+        // LfQuantFactors: all_default
+        let all_default = br.read(1).unwrap();
+        assert_eq!(all_default, 1);
+
+        // No global tree
+        let global_tree = br.read(1).unwrap();
+        assert_eq!(global_tree, 0);
+
+        // Parse group header
+        let header = crate::headers::modular::GroupHeader::read(&mut br).unwrap();
+        assert!(!header.use_global_tree);
+
+        // Parse tree (should read tree histograms + data + residual histograms)
+        let tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
+        eprintln!(
+            "LF global tree: {} nodes, bit_pos={}",
+            tree.nodes.len(),
+            br.total_bits_read()
+        );
+        assert_eq!(tree.nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_encode_multigroup_hf_group_section_parses() {
+        // Test that an HF group section decodes correctly.
+        let uint_config = HybridUintConfig::new(4, 2, 0);
+        let residuals: Vec<i32> = vec![1, 2, 3, 4, 5];
+
+        let mut group_writer = BitWriter::new();
+        modular_encode::write_hf_group_section_huffman(
+            &mut group_writer,
+            5,
+            0,
+            &residuals,
+            uint_config,
+        )
+        .unwrap();
+        let group_bytes = group_writer.finish();
+
+        use crate::bit_reader::BitReader;
+        let mut br = BitReader::new(&group_bytes);
+
+        // Parse group header
+        let header = crate::headers::modular::GroupHeader::read(&mut br).unwrap();
+        assert!(!header.use_global_tree);
+
+        // Parse tree
+        let tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
+        assert_eq!(tree.nodes.len(), 1);
+
+        // Read residuals
+        use crate::entropy_coding::decode::SymbolReader;
+        let mut reader = SymbolReader::new(&tree.histograms, &mut br, None).unwrap();
+        for &expected in &residuals {
+            let got = reader.read_signed(&tree.histograms, &mut br, 0);
+            assert_eq!(got, expected);
+        }
+        reader.check_final_state(&tree.histograms, &mut br).unwrap();
+    }
+
+    #[test]
+    fn test_encode_modular_u8_rgb_image_codestream_multigroup_all_zeros() {
+        // Simple all-zeros image, 300x3 = 2 groups.
+        let size = (300, 3);
+        let rgb = vec![0u8; (size.0 * size.1 * 3) as usize];
+
+        let cs = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+        let (decoded, _frames) =
+            crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
+        assert_eq!(decoded, 1);
+    }
+
+    #[test]
     fn test_encode_modular_u8_rgb_image_codestream_multigroup_decodes() {
+        // 300x3 = 2 groups: [0..256) and [256..300).
         let size = (300, 3);
         let mut rgb = vec![0u8; (size.0 * size.1 * 3) as usize];
         for y in 0..size.1 as usize {

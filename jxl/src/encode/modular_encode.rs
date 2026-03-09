@@ -296,78 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_then_residual_bit_position() {
-        // Debug test: check bit positions during decode.
-        let residuals: Vec<i32> = vec![1, 2, 3];
-        let uint_config = HybridUintConfig::new(4, 2, 0);
-
-        let mut writer = BitWriter::new();
-        write_minimal_group_header(&mut writer, false).unwrap();
-        let after_header = writer.total_bits_written();
-
-        let tree_stream = super::build_tree_token_stream(0, 0).unwrap();
-        super::write_huffman_histograms(
-            &mut writer,
-            &[0u8; 6],
-            &[tree_stream.uint_config],
-            &[tree_stream.code.clone()],
-        )
-        .unwrap();
-        let after_tree_hist = writer.total_bits_written();
-
-        super::write_token_stream(&mut writer, &tree_stream).unwrap();
-        let after_tree_data = writer.total_bits_written();
-
-        let residual_stream = super::build_token_stream(&residuals, uint_config).unwrap();
-        super::write_huffman_histograms(
-            &mut writer,
-            &[0u8],
-            &[residual_stream.uint_config],
-            &[residual_stream.code.clone()],
-        )
-        .unwrap();
-        let after_res_hist = writer.total_bits_written();
-
-        super::write_token_stream(&mut writer, &residual_stream).unwrap();
-        let after_res_data = writer.total_bits_written();
-
-        eprintln!(
-            "Encoder bits: header={} tree_hist={} tree_data={} res_hist={} res_data={}",
-            after_header,
-            after_tree_hist - after_header,
-            after_tree_data - after_tree_hist,
-            after_res_hist - after_tree_data,
-            after_res_data - after_res_hist
-        );
-
-        let bytes = finish_with_padding(writer);
-
-        let mut br = BitReader::new(&bytes);
-        let _header = GroupHeader::read(&mut br).unwrap();
-        let after_header_dec = br.total_bits_read();
-
-        let _tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
-        let after_tree_dec = br.total_bits_read();
-
-        eprintln!(
-            "Decoder bits: header={} tree+res_hist={}",
-            after_header_dec,
-            after_tree_dec - after_header_dec
-        );
-        eprintln!(
-            "Expected residual start at bit {}, decoder at bit {}",
-            after_res_hist, after_tree_dec
-        );
-
-        // This is the key check: does Tree::read land at the same bit
-        // position as our residual data starts?
-        assert_eq!(
-            after_tree_dec, after_res_hist as usize,
-            "bit position mismatch after tree parse"
-        );
-    }
-
-    #[test]
     fn test_tree_then_residual_roundtrip() {
         // Mimic write_modular_section_huffman but decode step-by-step.
         let residuals: Vec<i32> = vec![1, 2, 3];
@@ -415,6 +343,32 @@ mod tests {
         res_reader
             .check_final_state(&tree.histograms, &mut br)
             .unwrap();
+    }
+
+    #[test]
+    fn test_hf_group_wide_range_roundtrip() {
+        // Test with -5..=8 which triggers the failure in the full encoder.
+        let residuals: Vec<i32> = (-5..=8).collect();
+        let uint_config = HybridUintConfig::new(4, 2, 0);
+
+        let mut writer = BitWriter::new();
+        super::write_hf_group_section_huffman(&mut writer, 0, 0, &residuals, uint_config).unwrap();
+        let bytes = finish_with_padding(writer);
+
+        let mut br = BitReader::new(&bytes);
+        let _header = GroupHeader::read(&mut br).unwrap();
+        let tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
+
+        let mut reader = SymbolReader::new(&tree.histograms, &mut br, None).unwrap();
+        for (i, &expected) in residuals.iter().enumerate() {
+            let got = reader.read_signed(&tree.histograms, &mut br, 0);
+            assert_eq!(
+                got, expected,
+                "mismatch at index {}: got {} expected {}",
+                i, got, expected
+            );
+        }
+        reader.check_final_state(&tree.histograms, &mut br).unwrap();
     }
 
     #[test]
