@@ -48,4 +48,7 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --h
 
 # Encode raw interleaved RGB8 bytes (width*height*3)
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --raw-rgb8-input frame.rgb
+
+# Encode raw Gray8 bytes (width*height)
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --raw-gray8-input frame.gray
 ```
