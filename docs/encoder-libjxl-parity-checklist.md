@@ -25,7 +25,7 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[~]` Minimal headers/container writing.
 - `[~]` Minimal entropy helpers (HybridUint config, fixed/simple Huffman/context map writer primitives).
 - `[~]` Minimal modular decodable stream generation (constant tree leaf, synthetic output).
-- `[~]` Early real image-to-bitstream path: RGB8 raw input into single-group modular stream (`<=256x256`).
+- `[~]` Early real image-to-bitstream path: RGB8 raw input into modular stream (group-aware bootstrap path).
 - `[ ]` Full entropy modeling and ANS encoding.
 - `[ ]` VarDCT lossy encoding.
 - `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
@@ -69,7 +69,7 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 ### A. Public API and integration
 
 - [~] A01 Add `JxlEncoder::encode_image(...)` for raw in-memory buffers (RGB/Gray/RGBA, u8/u16/f32).
-  - Current: `encode_modular_u8_rgb_codestream/container` for interleaved RGB8, single-group bootstrap path.
+  - Current: `encode_modular_u8_rgb_codestream/container` for interleaved RGB8, group-aware bootstrap path.
   - Files: `jxl/src/encode/encoder.rs`, new `jxl/src/encode/input.rs`.
   - Milestone: M4.
 - [ ] A02 Add per-frame settings type mirroring libjxl style controls (lossless, distance, effort, modular vs vardct).
