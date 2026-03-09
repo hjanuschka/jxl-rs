@@ -119,7 +119,15 @@ pub fn write_split0_fixed_token_signed_stream(
     signed_values: &[i32],
 ) -> Result<()> {
     if token == 0 {
-        return Err(Error::InvalidFixedTokenValue { token, value: 0 });
+        for &signed in signed_values {
+            if signed != 0 {
+                return Err(Error::InvalidFixedTokenValue {
+                    token,
+                    value: pack_signed(signed),
+                });
+            }
+        }
+        return Ok(());
     }
 
     let nbits = token.saturating_sub(1) as usize;
@@ -356,6 +364,20 @@ mod tests {
         assert_eq!(reader.read_signed(&hist, &mut br, 0), 300);
         assert_eq!(reader.read_signed(&hist, &mut br, 0), 511);
         reader.check_final_state(&hist, &mut br).unwrap();
+    }
+
+    #[test]
+    fn test_write_split0_fixed_token_signed_stream_token0_only_zero() {
+        let mut writer = BitWriter::new();
+        write_split0_fixed_token_signed_stream(&mut writer, 0, &[0, 0, 0]).unwrap();
+        assert!(writer.finish().is_empty());
+
+        let mut writer = BitWriter::new();
+        let err = write_split0_fixed_token_signed_stream(&mut writer, 0, &[1]).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::InvalidFixedTokenValue { token: 0, value: 2 }
+        ));
     }
 
     #[test]
