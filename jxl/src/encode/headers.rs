@@ -9,7 +9,7 @@ use crate::{
     headers::encodings::{U32, U32Coder},
 };
 
-use super::{BitWriter, write_u32};
+use super::{BitWriter, write_toc, write_u32};
 
 fn large_size_coder() -> U32Coder {
     U32Coder::Select(
@@ -17,18 +17,6 @@ fn large_size_coder() -> U32Coder {
         U32::BitsOffset { n: 13, off: 1 },
         U32::BitsOffset { n: 18, off: 1 },
         U32::BitsOffset { n: 30, off: 1 },
-    )
-}
-
-fn toc_entry_coder() -> U32Coder {
-    U32Coder::Select(
-        U32::Bits(10),
-        U32::BitsOffset { n: 14, off: 1024 },
-        U32::BitsOffset { n: 22, off: 17408 },
-        U32::BitsOffset {
-            n: 30,
-            off: 4211712,
-        },
     )
 }
 
@@ -125,17 +113,8 @@ pub fn encode_minimal_single_frame_codestream(size: (u32, u32)) -> Result<Vec<u8
     writer.write(1, 1)?;
 
     // TOC (num_entries based on default frame geometry).
-    // Toc::permuted = false, then permutation reader aligns to next byte.
-    writer.write(1, 0)?;
-    writer.byte_align_zero_pad()?;
-
-    let entry_coder = toc_entry_coder();
-    for _ in 0..default_num_toc_entries(width, height) {
-        write_u32(&mut writer, &entry_coder, 0)?;
-    }
-
-    // TOC reader aligns to byte boundary after entries.
-    writer.byte_align_zero_pad()?;
+    let entries = vec![0u32; default_num_toc_entries(width, height) as usize];
+    write_toc(&mut writer, &entries)?;
 
     Ok(writer.finish())
 }
