@@ -15,6 +15,9 @@ cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --h
 
 # Same, but with a constant modular offset (for non-black output experiments)
 cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 12
+
+# Use predictor=1 (West) to create a simple horizontal ramp-like pattern
+cargo run -p jxl_cli --no-default-features --bin jxle -- out.jxl --width 128 --height 64 --modular-image --modular-offset 1 --modular-predictor 1
 ```
 
 This is still very early and not yet a full image encoder.
