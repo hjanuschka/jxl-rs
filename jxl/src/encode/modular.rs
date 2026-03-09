@@ -4,11 +4,14 @@
 // license that can be found in the LICENSE file.
 
 use crate::{
-    error::Result,
+    error::{Error, Result},
     headers::encodings::{U32, U32Coder},
 };
 
-use super::{BitWriter, write_single_symbol_huffman_histograms, write_u32};
+use super::{
+    BitWriter, pack_signed, write_fixed_symbol_huffman_histograms,
+    write_single_symbol_huffman_histograms, write_u32,
+};
 
 fn transform_count_coder() -> U32Coder {
     U32Coder::Select(
@@ -35,16 +38,30 @@ pub fn write_minimal_group_header(writer: &mut BitWriter, use_global_tree: bool)
     Ok(())
 }
 
-/// Writes a minimal modular tree payload (single leaf, single histogram cluster).
+/// Writes a minimal modular tree payload with a single leaf.
 ///
-/// Layout matches `Tree::read`:
-/// - tree-building histograms (6 contexts), all symbols => 0
-/// - one leaf node implied by stream of zeros
-/// - entropy histograms for decoded symbols (1 context), all symbols => 0
-pub fn write_single_leaf_tree(writer: &mut BitWriter) -> Result<()> {
-    write_single_symbol_huffman_histograms(writer, 6)?;
+/// The resulting leaf uses:
+/// - predictor: `Zero`
+/// - offset: `offset`
+/// - multiplier: `1`
+pub fn write_single_leaf_tree_with_offset(writer: &mut BitWriter, offset: i32) -> Result<()> {
+    let offset_symbol = pack_signed(offset) as u32;
+    let offset_symbol = u16::try_from(offset_symbol).map_err(|_| Error::InvalidHuffman)?;
+
+    // Tree-building histograms across the 6 tree contexts:
+    // [split_val, property, predictor, offset, multiplier_log, multiplier_bits]
+    let tree_context_map = [0u8, 1, 2, 3, 4, 5];
+    let tree_symbols = [0u16, 0, 0, offset_symbol, 0, 0];
+    write_fixed_symbol_huffman_histograms(writer, &tree_context_map, &tree_symbols)?;
+
+    // Entropy histograms for decoded channel residual symbols.
     write_single_symbol_huffman_histograms(writer, 1)?;
     Ok(())
+}
+
+/// Writes a minimal modular tree payload (single leaf, offset 0).
+pub fn write_single_leaf_tree(writer: &mut BitWriter) -> Result<()> {
+    write_single_leaf_tree_with_offset(writer, 0)
 }
 
 /// Writes minimal modular global subbitstream payload for tiny channels.
@@ -109,6 +126,23 @@ mod tests {
         assert!(node_debug.contains("Leaf"));
         assert!(node_debug.contains("Zero"));
         assert!(node_debug.contains("offset: 0"));
+        assert!(node_debug.contains("multiplier: 1"));
+    }
+
+    #[test]
+    fn test_write_single_leaf_tree_with_offset_roundtrip() {
+        let mut writer = BitWriter::new();
+        write_single_leaf_tree_with_offset(&mut writer, 7).unwrap();
+        let bytes = writer.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let tree = crate::frame::modular::Tree::read(&mut br, 1024).unwrap();
+
+        assert_eq!(tree.nodes.len(), 1);
+        let node_debug = format!("{:?}", tree.nodes[0]);
+        assert!(node_debug.contains("Leaf"));
+        assert!(node_debug.contains("Zero"));
+        assert!(node_debug.contains("offset: 7"));
         assert!(node_debug.contains("multiplier: 1"));
     }
 
