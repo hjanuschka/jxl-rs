@@ -67,12 +67,68 @@ fn write_size(writer: &mut BitWriter, width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
-fn write_minimal_file_header_fields(writer: &mut BitWriter, width: u32, height: u32) -> Result<()> {
+fn bit_depth_int_coder() -> U32Coder {
+    U32Coder::Select(
+        U32::Val(8),
+        U32::Val(10),
+        U32::Val(12),
+        U32::BitsOffset { n: 6, off: 1 },
+    )
+}
+
+fn extra_channel_count_coder() -> U32Coder {
+    U32Coder::Select(
+        U32::Val(0),
+        U32::Val(1),
+        U32::BitsOffset { n: 4, off: 2 },
+        U32::BitsOffset { n: 12, off: 1 },
+    )
+}
+
+fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool) -> Result<()> {
+    if xyb_encoded {
+        // ImageMetadata::all_default = true.
+        writer.write(1, 1)?;
+        return Ok(());
+    }
+
+    // ImageMetadata::all_default = false.
+    writer.write(1, 0)?;
+
+    // extra_fields = false.
+    writer.write(1, 0)?;
+
+    // bit_depth: 8-bit integer default.
+    writer.write(1, 0)?; // floating_point_sample = false
+    write_u32(writer, &bit_depth_int_coder(), 8)?;
+
+    // modular_16bit_sufficient = true
+    writer.write(1, 1)?;
+
+    // extra_channel_info len = 0
+    write_u32(writer, &extra_channel_count_coder(), 0)?;
+
+    // xyb_encoded = false
+    writer.write(1, 0)?;
+
+    // color_encoding.all_default = true (defaults to RGB/sRGB)
+    writer.write(1, 1)?;
+
+    // extensions selector = 0 (u64 coding)
+    writer.write(2, 0)?;
+
+    Ok(())
+}
+
+fn write_minimal_file_header_fields_with_metadata(
+    writer: &mut BitWriter,
+    width: u32,
+    height: u32,
+    xyb_encoded: bool,
+) -> Result<()> {
     writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
     write_size(writer, width, height)?;
-
-    // ImageMetadata::all_default = true.
-    writer.write(1, 1)?;
+    write_minimal_image_metadata_fields(writer, xyb_encoded)?;
 
     // CustomTransformData::all_default = true.
     writer.write(1, 1)?;
@@ -80,7 +136,14 @@ fn write_minimal_file_header_fields(writer: &mut BitWriter, width: u32, height: 
     Ok(())
 }
 
-fn write_default_modular_frame_header(writer: &mut BitWriter) -> Result<()> {
+fn write_minimal_file_header_fields(writer: &mut BitWriter, width: u32, height: u32) -> Result<()> {
+    write_minimal_file_header_fields_with_metadata(writer, width, height, true)
+}
+
+fn write_default_modular_frame_header_with_xyb(
+    writer: &mut BitWriter,
+    xyb_encoded: bool,
+) -> Result<()> {
     // FrameHeader::all_default = false so we can set encoding = Modular.
     writer.write(1, 0)?;
 
@@ -92,6 +155,11 @@ fn write_default_modular_frame_header(writer: &mut BitWriter) -> Result<()> {
 
     // flags = 0 (u64 coding)
     writer.write(2, 0)?;
+
+    if !xyb_encoded {
+        // do_ycbcr = false (present only for non-XYB metadata).
+        writer.write(1, 0)?;
+    }
 
     // upsampling = 1, via u2S(1,2,4,8)
     write_u32(
@@ -152,6 +220,10 @@ fn write_default_modular_frame_header(writer: &mut BitWriter) -> Result<()> {
     writer.write(2, 0)?;
 
     Ok(())
+}
+
+fn write_default_modular_frame_header(writer: &mut BitWriter) -> Result<()> {
+    write_default_modular_frame_header_with_xyb(writer, true)
 }
 
 fn default_num_groups(width: u32, height: u32) -> u32 {
@@ -345,9 +417,9 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         let lf_global_section = lf_global_writer.finish();
 
         let mut writer = BitWriter::new();
-        write_minimal_file_header_fields(&mut writer, width, height)?;
+        write_minimal_file_header_fields_with_metadata(&mut writer, width, height, false)?;
         writer.byte_align_zero_pad()?;
-        write_default_modular_frame_header(&mut writer)?;
+        write_default_modular_frame_header_with_xyb(&mut writer, false)?;
         write_toc(&mut writer, &[lf_global_section.len() as u32])?;
         writer.write_aligned_bytes(&lf_global_section)?;
         return Ok(writer.finish());
@@ -382,9 +454,9 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     }
 
     let mut writer = BitWriter::new();
-    write_minimal_file_header_fields(&mut writer, width, height)?;
+    write_minimal_file_header_fields_with_metadata(&mut writer, width, height, false)?;
     writer.byte_align_zero_pad()?;
-    write_default_modular_frame_header(&mut writer)?;
+    write_default_modular_frame_header_with_xyb(&mut writer, false)?;
 
     let mut toc_entries = Vec::new();
     toc_entries.push(lf_global_section.len() as u32);
@@ -653,6 +725,17 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_modular_u8_rgb_image_codestream_has_non_xyb_metadata() {
+        let size = (8, 4);
+        let rgb = vec![0u8; (size.0 * size.1 * 3) as usize];
+        let codestream = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+
+        let mut br = BitReader::new(&codestream);
+        let header = FileHeader::read(&mut br).unwrap();
+        assert!(!header.image_metadata.xyb_encoded);
+    }
+
+    #[test]
     fn test_encode_modular_u8_rgb_image_codestream_decodes_and_changes_with_input() {
         let size = (8, 4);
         let rgb_a = vec![0u8; (size.0 * size.1 * 3) as usize];
@@ -678,6 +761,11 @@ mod tests {
             frames_b[0][0].size(),
             ((size.0 * 3) as usize, size.1 as usize)
         );
+
+        let row_a0 = frames_a[0][0].row(0);
+        for &v in row_a0 {
+            assert!((v - 0.0).abs() < 1e-6, "expected zero sample, got {v}");
+        }
 
         assert_ne!(frames_a[0][0].row(0)[0], frames_b[0][0].row(0)[0]);
 
