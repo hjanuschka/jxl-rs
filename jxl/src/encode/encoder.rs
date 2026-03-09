@@ -78,13 +78,11 @@ impl JxlEncoder {
                 headers::encode_modular_u8_rgb_image_codestream(size, &packed)
             }
             JxlEncoderImageData::Gray8Interleaved(gray) => {
-                let rgb = expand_gray8_to_rgb8(gray, width, height)?;
-                headers::encode_modular_u8_rgb_image_codestream(size, &rgb)
+                headers::encode_modular_u8_gray_image_codestream(size, gray)
             }
             JxlEncoderImageData::Gray8Strided { data, stride } => {
                 let gray = pack_gray8_strided(data, width, height, stride)?;
-                let rgb = expand_gray8_to_rgb8(&gray, width, height)?;
-                headers::encode_modular_u8_rgb_image_codestream(size, &rgb)
+                headers::encode_modular_u8_gray_image_codestream(size, &gray)
             }
         }
     }
@@ -400,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_image_codestream_gray8_matches_expanded_rgb() {
+    fn test_encode_image_codestream_gray8_native() {
         let enc = JxlEncoder::default();
         let width = 8usize;
         let height = 4usize;
@@ -411,24 +409,48 @@ mod tests {
             }
         }
 
-        let mut rgb = Vec::with_capacity(width * height * 3);
-        for &y in &gray {
-            rgb.extend_from_slice(&[y, y, y]);
-        }
-
-        let a = enc
+        let gray_cs = enc
             .encode_image_codestream(
                 (width as u32, height as u32),
                 JxlEncoderImageData::Gray8Interleaved(&gray),
             )
             .unwrap();
-        let b = enc
+
+        // Native gray should be smaller than expanded RGB.
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for &y in &gray {
+            rgb.extend_from_slice(&[y, y, y]);
+        }
+        let rgb_cs = enc
             .encode_image_codestream(
                 (width as u32, height as u32),
                 JxlEncoderImageData::Rgb8Interleaved(&rgb),
             )
             .unwrap();
-        assert_eq!(a, b);
+        assert!(
+            gray_cs.len() < rgb_cs.len(),
+            "native gray ({} bytes) should be smaller than RGB ({} bytes)",
+            gray_cs.len(),
+            rgb_cs.len()
+        );
+
+        // Verify it's decodable by jxl-rs.
+        let (_decoded, frames) =
+            crate::api::tests::decode(&gray_cs, usize::MAX, false, false, None).unwrap();
+        assert_eq!(frames.len(), 1);
+        let img = &frames[0][0];
+        // Grayscale: 1 sample per pixel.
+        assert_eq!(img.size(), (width, height));
+        for y in 0..height {
+            let row = img.row(y);
+            for x in 0..width {
+                let decoded = (row[x] * 255.0 + 0.5) as u8;
+                assert_eq!(
+                    decoded, gray[y * width + x],
+                    "pixel mismatch at ({x},{y})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -84,7 +84,13 @@ fn extra_channel_count_coder() -> U32Coder {
     )
 }
 
-fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool) -> Result<()> {
+/// Writes image metadata for non-XYB encoding.
+/// `grayscale`: if true, writes color_space=Gray instead of RGB.
+fn write_image_metadata(
+    writer: &mut BitWriter,
+    xyb_encoded: bool,
+    grayscale: bool,
+) -> Result<()> {
     if xyb_encoded {
         // ImageMetadata::all_default = true.
         writer.write(1, 1)?;
@@ -110,11 +116,63 @@ fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool
     // xyb_encoded = false
     writer.write(1, 0)?;
 
-    // color_encoding.all_default = true (defaults to sRGB).
-    writer.write(1, 1)?;
+    if grayscale {
+        // color_encoding.all_default = false (default is RGB)
+        writer.write(1, 0)?;
+
+        // want_icc = false
+        writer.write(1, 0)?;
+
+        // color_space = Gray (enum value 1, u2S selector 1 = bits 01)
+        writer.write(2, 1)?;
+
+        // white_point = D65 (value=1)
+        // u2S(Val(0), Val(1), Bits(4)+2, Bits(6)+18): D65=1 → selector 01
+        writer.write(2, 1)?;
+
+        // primaries: NOT present for Gray (condition excludes it)
+
+        // CustomTransferFunction (nested struct, no all_default annotation):
+        // have_gamma = false (condition: color_space != XYB, which is true for Gray)
+        writer.write(1, 0)?;
+        // transfer_function = SRGB (value=13)
+        // u2S(Val(0), Val(1), Bits(4)+2, Bits(6)+18): 13-2=11 → selector 10 + Bits(4)=11
+        writer.write(2, 2)?;
+        writer.write(4, 11)?;
+
+        // rendering_intent = Relative (value=1)
+        // u2S(Val(0), Val(1), ...): Relative=1 → selector 01
+        writer.write(2, 1)?;
+    } else {
+        // color_encoding.all_default = true (defaults to sRGB).
+        writer.write(1, 1)?;
+    }
 
     // extensions selector = 0 (u64 coding)
     writer.write(2, 0)?;
+
+    Ok(())
+}
+
+fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool) -> Result<()> {
+    write_image_metadata(writer, xyb_encoded, false)
+}
+
+fn write_file_header(
+    writer: &mut BitWriter,
+    width: u32,
+    height: u32,
+    xyb_encoded: bool,
+    grayscale: bool,
+) -> Result<()> {
+    writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
+
+    write_size(writer, width, height)?;
+
+    write_image_metadata(writer, xyb_encoded, grayscale)?;
+
+    // CustomTransformData::all_default = true.
+    writer.write(1, 1)?;
 
     Ok(())
 }
@@ -125,16 +183,7 @@ fn write_minimal_file_header_fields_with_metadata(
     height: u32,
     xyb_encoded: bool,
 ) -> Result<()> {
-    writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
-
-    write_size(writer, width, height)?;
-
-    write_minimal_image_metadata_fields(writer, xyb_encoded)?;
-
-    // CustomTransformData::all_default = true.
-    writer.write(1, 1)?;
-
-    Ok(())
+    write_file_header(writer, width, height, xyb_encoded, false)
 }
 
 fn write_minimal_file_header_fields(writer: &mut BitWriter, width: u32, height: u32) -> Result<()> {
@@ -497,6 +546,131 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
 
     let mut writer = BitWriter::new();
     write_minimal_file_header_fields_with_metadata(&mut writer, width, height, false)?;
+    writer.byte_align_zero_pad()?;
+    write_default_modular_frame_header_with_xyb(&mut writer, false)?;
+
+    let mut toc_entries = Vec::new();
+    toc_entries.push(lf_global_section.len() as u32);
+    toc_entries.extend(std::iter::repeat_n(0u32, num_lf_groups as usize));
+    toc_entries.push(0); // HF global
+    toc_entries.extend(hf_group_sections.iter().map(|s| s.len() as u32));
+
+    write_toc(&mut writer, &toc_entries)?;
+    writer.write_aligned_bytes(&lf_global_section)?;
+    for section in hf_group_sections {
+        writer.write_aligned_bytes(&section)?;
+    }
+
+    Ok(writer.finish())
+}
+
+/// Encodes an interleaved Gray8 buffer into a native grayscale modular codestream.
+///
+/// Unlike `encode_modular_u8_rgb_image_codestream`, this produces a single-channel
+/// modular image with `color_space=Gray`, avoiding the 3x data expansion of
+/// converting gray to RGB.
+pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) -> Result<Vec<u8>> {
+    let (width, height) = size;
+    validate_size(width, height)?;
+    let expected_len = (width as usize) * (height as usize);
+    if gray.len() != expected_len {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: expected_len,
+            actual: gray.len(),
+        });
+    }
+
+    let uint_config = HybridUintConfig::new(4, 2, 0);
+    let predictor = 1u32; // West
+
+    let width_usize = width as usize;
+    let num_groups = default_num_groups(width, height);
+    let num_lf_groups = default_num_lf_groups(width, height);
+    let num_groups_x = width.div_ceil(256);
+
+    /// Collect signed residuals for a gray group region using the West predictor.
+    fn collect_gray_residuals_west(
+        gray: &[u8],
+        width_usize: usize,
+        origin: (u32, u32),
+        group_size: (u32, u32),
+    ) -> Vec<i32> {
+        let (ox, oy) = origin;
+        let (gw, gh) = group_size;
+        let mut residuals = Vec::with_capacity((gw as usize) * (gh as usize));
+
+        // Single channel, row-major.
+        let mut prev_row_first = 0i32;
+        for y in oy..(oy + gh) {
+            let local_y = (y - oy) as usize;
+            let first_pred = if local_y > 0 { prev_row_first } else { 0 };
+            let first_idx = y as usize * width_usize + ox as usize;
+            let first_sample = i32::from(gray[first_idx]);
+            residuals.push(first_sample - first_pred);
+            prev_row_first = first_sample;
+
+            let mut prev = first_sample;
+            for x in (ox + 1)..(ox + gw) {
+                let idx = y as usize * width_usize + x as usize;
+                let sample = i32::from(gray[idx]);
+                residuals.push(sample - prev);
+                prev = sample;
+            }
+        }
+        residuals
+    }
+
+    // Single-group path
+    if num_groups == 1 {
+        let residuals = collect_gray_residuals_west(gray, width_usize, (0, 0), (width, height));
+
+        let mut lf_global_writer = BitWriter::new();
+        write_lf_global_section_huffman(
+            &mut lf_global_writer,
+            0,
+            predictor,
+            Some(&residuals),
+            uint_config,
+        )?;
+        let lf_global_section = lf_global_writer.finish();
+
+        let mut writer = BitWriter::new();
+        write_file_header(&mut writer, width, height, false, true)?;
+        writer.byte_align_zero_pad()?;
+        write_default_modular_frame_header_with_xyb(&mut writer, false)?;
+        write_toc(&mut writer, &[lf_global_section.len() as u32])?;
+        writer.write_aligned_bytes(&lf_global_section)?;
+        return Ok(writer.finish());
+    }
+
+    // Multi-group path
+    let mut lf_global_writer = BitWriter::new();
+    write_lf_global_section_huffman(&mut lf_global_writer, 0, predictor, None, uint_config)?;
+    let lf_global_section = lf_global_writer.finish();
+
+    let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
+    for group in 0..num_groups {
+        let gx = group % num_groups_x;
+        let gy = group / num_groups_x;
+        let ox = gx * 256;
+        let oy = gy * 256;
+        let gw = (width - ox).min(256);
+        let gh = (height - oy).min(256);
+
+        let residuals = collect_gray_residuals_west(gray, width_usize, (ox, oy), (gw, gh));
+        let mut group_writer = BitWriter::new();
+        write_hf_group_section_huffman(
+            &mut group_writer,
+            0,
+            predictor,
+            &residuals,
+            uint_config,
+        )?;
+        hf_group_sections.push(group_writer.finish());
+    }
+
+    let mut writer = BitWriter::new();
+    write_file_header(&mut writer, width, height, false, true)?;
     writer.byte_align_zero_pad()?;
     write_default_modular_frame_header_with_xyb(&mut writer, false)?;
 
@@ -1156,5 +1330,70 @@ mod tests {
         // 12) Edge values: min/max per channel
         assert_pixel_perfect_roundtrip(2, 1, &[0, 0, 0, 255, 255, 255]);
         assert_pixel_perfect_roundtrip(2, 1, &[0, 128, 255, 255, 128, 0]);
+    }
+
+    /// Helper: encode Gray8 image, decode with jxl-rs, verify pixel-perfect match.
+    fn assert_gray_roundtrip(width: u32, height: u32, gray: &[u8]) {
+        assert_eq!(
+            gray.len(),
+            (width as usize) * (height as usize),
+            "wrong buffer size"
+        );
+        let cs =
+            encode_modular_u8_gray_image_codestream((width, height), gray).unwrap();
+        let (_decoded, frames) =
+            crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
+        let img = &frames[0][0];
+        assert_eq!(
+            img.size(),
+            (width as usize, height as usize),
+            "decoded gray image size mismatch"
+        );
+        for y in 0..height as usize {
+            let row = img.row(y);
+            for x in 0..width as usize {
+                let decoded = (row[x] * 255.0 + 0.5) as u8;
+                assert_eq!(
+                    decoded,
+                    gray[y * width as usize + x],
+                    "gray pixel mismatch at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_corpus_gray() {
+        fn simple_rng(seed: u64) -> impl Iterator<Item = u8> {
+            let mut state = seed;
+            std::iter::from_fn(move || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                Some((state >> 33) as u8)
+            })
+        }
+
+        // 1) All-black
+        assert_gray_roundtrip(4, 4, &vec![0u8; 16]);
+
+        // 2) All-white
+        assert_gray_roundtrip(4, 4, &vec![255u8; 16]);
+
+        // 3) Single pixel
+        assert_gray_roundtrip(1, 1, &[128]);
+
+        // 4) Gradient
+        let grad: Vec<u8> = (0..=255u8).collect();
+        assert_gray_roundtrip(256, 1, &grad);
+
+        // 5) Random
+        let gray5: Vec<u8> = simple_rng(10).take(100 * 100).collect();
+        assert_gray_roundtrip(100, 100, &gray5);
+
+        // 6) Multi-group
+        let gray6: Vec<u8> = simple_rng(11).take(300 * 300).collect();
+        assert_gray_roundtrip(300, 300, &gray6);
+
+        // 7) Edge values
+        assert_gray_roundtrip(2, 1, &[0, 255]);
     }
 }
