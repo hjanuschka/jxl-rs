@@ -1055,4 +1055,103 @@ mod tests {
             );
         }
     }
+
+    /// Helper: encode RGB8 image, decode with jxl-rs, verify pixel-perfect match.
+    fn assert_pixel_perfect_roundtrip(width: u32, height: u32, rgb: &[u8]) {
+        assert_eq!(
+            rgb.len(),
+            (width as usize) * (height as usize) * 3,
+            "wrong buffer size"
+        );
+        let cs =
+            encode_modular_u8_rgb_image_codestream((width, height), rgb).unwrap();
+        let (_decoded, frames) =
+            crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
+        let img = &frames[0][0];
+        assert_eq!(
+            img.size(),
+            ((width * 3) as usize, height as usize),
+            "decoded image size mismatch"
+        );
+        for y in 0..height as usize {
+            let row = img.row(y);
+            for x in 0..width as usize {
+                let r = (row[x * 3] * 255.0 + 0.5) as u8;
+                let g = (row[x * 3 + 1] * 255.0 + 0.5) as u8;
+                let b = (row[x * 3 + 2] * 255.0 + 0.5) as u8;
+                let idx = (y * width as usize + x) * 3;
+                assert_eq!(
+                    (r, g, b),
+                    (rgb[idx], rgb[idx + 1], rgb[idx + 2]),
+                    "pixel mismatch at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_corpus() {
+        // Deterministic PRNG for reproducibility.
+        fn simple_rng(seed: u64) -> impl Iterator<Item = u8> {
+            let mut state = seed;
+            std::iter::from_fn(move || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                Some((state >> 33) as u8)
+            })
+        }
+
+        // 1) All-black
+        assert_pixel_perfect_roundtrip(4, 4, &vec![0u8; 4 * 4 * 3]);
+
+        // 2) All-white
+        assert_pixel_perfect_roundtrip(4, 4, &vec![255u8; 4 * 4 * 3]);
+
+        // 3) Single pixel
+        assert_pixel_perfect_roundtrip(1, 1, &[42, 128, 200]);
+
+        // 4) Gradient (1x256)
+        let grad: Vec<u8> = (0..=255u8).flat_map(|v| [v, v, v]).collect();
+        assert_pixel_perfect_roundtrip(256, 1, &grad);
+
+        // 5) Random small image
+        let rgb5: Vec<u8> = simple_rng(1).take(16 * 16 * 3).collect();
+        assert_pixel_perfect_roundtrip(16, 16, &rgb5);
+
+        // 6) Random medium image (single-group boundary)
+        let rgb6: Vec<u8> = simple_rng(2).take(100 * 100 * 3).collect();
+        assert_pixel_perfect_roundtrip(100, 100, &rgb6);
+
+        // 7) Multi-group image (>256 in one dimension)
+        let rgb7: Vec<u8> = simple_rng(3).take(300 * 2 * 3).collect();
+        assert_pixel_perfect_roundtrip(300, 2, &rgb7);
+
+        // 8) Multi-group image (>256 in both dimensions)
+        let rgb8: Vec<u8> = simple_rng(4).take(257 * 257 * 3).collect();
+        assert_pixel_perfect_roundtrip(257, 257, &rgb8);
+
+        // 9) Narrow tall image
+        let rgb9: Vec<u8> = simple_rng(5).take(1 * 300 * 3).collect();
+        assert_pixel_perfect_roundtrip(1, 300, &rgb9);
+
+        // 10) Wide short image
+        let rgb10: Vec<u8> = simple_rng(6).take(500 * 1 * 3).collect();
+        assert_pixel_perfect_roundtrip(500, 1, &rgb10);
+
+        // 11) Checkerboard pattern
+        let mut checker = vec![0u8; 64 * 64 * 3];
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                let idx = (y * 64 + x) * 3;
+                checker[idx] = v;
+                checker[idx + 1] = v;
+                checker[idx + 2] = v;
+            }
+        }
+        assert_pixel_perfect_roundtrip(64, 64, &checker);
+
+        // 12) Edge values: min/max per channel
+        assert_pixel_perfect_roundtrip(2, 1, &[0, 0, 0, 255, 255, 255]);
+        assert_pixel_perfect_roundtrip(2, 1, &[0, 128, 255, 255, 128, 0]);
+    }
 }
