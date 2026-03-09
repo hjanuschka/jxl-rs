@@ -160,4 +160,10 @@ mod tests {
 
         assert_eq!(dec.basic_info().size, (77, 66));
     }
+
+    #[test]
+    fn test_minimal_header_snapshot_1x1() {
+        let codestream = encode_minimal_codestream_header((1, 1)).unwrap();
+        assert_eq!(codestream, vec![0xFF, 0x0A, 0x00, 0x00, 0x00, 0x0C]);
+    }
 }
