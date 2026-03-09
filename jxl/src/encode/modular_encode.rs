@@ -346,6 +346,77 @@ mod tests {
     }
 
     #[test]
+    fn test_2x1_image_standalone_section_bytes() {
+        // Reproduce the exact section bytes for 2x1 (50,0,0) + (100,0,0)
+        let residuals: Vec<i32> = vec![0, 50, -50, -50, -50, -50];
+        let uint_config = HybridUintConfig::new(4, 2, 0);
+        let offset = 50;
+
+        let mut writer = BitWriter::new();
+        super::write_lf_global_section_huffman(
+            &mut writer,
+            offset,
+            0,
+            Some(&residuals),
+            uint_config,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        eprintln!(
+            "Standalone section ({} bytes): {}",
+            bytes.len(),
+            bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+        );
+    }
+
+    #[test]
+    fn test_residual_stream_neg25_pos25_roundtrip() {
+        // Test encoding [-25, 25] roundtrip at the raw stream level.
+        let uint_config = HybridUintConfig::new(4, 2, 0);
+        let signed_residuals: Vec<i32> = vec![-25, 25, -25, 25, -25, 25];
+
+        // Build token stream
+        let stream = super::build_token_stream(&signed_residuals, uint_config).unwrap();
+
+        // Check tokens
+        for (i, enc) in stream.tokens.iter().enumerate() {
+            eprintln!(
+                "Token {}: token={}, nbits={}, extra={}",
+                i, enc.token, enc.nbits, enc.extra_bits
+            );
+        }
+
+        // Write just the Huffman table + token stream
+        let mut writer = BitWriter::new();
+        let context_map = [0u8];
+        super::write_huffman_histograms(
+            &mut writer,
+            &context_map,
+            &[stream.uint_config],
+            &[stream.code.clone()],
+        )
+        .unwrap();
+        super::write_token_stream(&mut writer, &stream).unwrap();
+        let bytes = finish_with_padding(writer);
+
+        // Decode: read Huffman histograms then read tokens
+        let mut br = BitReader::new(&bytes);
+        // HuffmanCodes::decode expects the number of contexts and reads
+        // all alphabet sizes then all tables.
+        let hists = crate::entropy_coding::decode::Histograms::decode(1, &mut br, false).unwrap();
+
+        let mut reader = SymbolReader::new(&hists, &mut br, None).unwrap();
+        for (i, &expected) in signed_residuals.iter().enumerate() {
+            let got = reader.read_signed(&hists, &mut br, 0);
+            assert_eq!(
+                got, expected,
+                "Residual {i}: expected {expected}, got {got}"
+            );
+        }
+        reader.check_final_state(&hists, &mut br).unwrap();
+    }
+
+    #[test]
     fn test_2x1_image_roundtrip() {
         // 2x1 image: (50,0,0) and (100,0,0). Offset=50, residuals channel-major.
         // R: [50-50, 100-50] = [0, 50]

@@ -27,6 +27,14 @@ pub struct HuffmanCode {
     pub codes: Vec<u32>,
 }
 
+impl HuffmanCode {
+    /// Returns true if this code has at most 1 non-zero symbol.
+    /// The decoder's simple table (nsym=1) reads 0 bits per symbol in this case.
+    pub fn is_single_symbol(&self) -> bool {
+        self.code_lengths.iter().filter(|&&l| l > 0).count() <= 1
+    }
+}
+
 /// Build a canonical Huffman code from symbol frequencies.
 pub fn build_huffman_code(frequencies: &[u64]) -> Option<HuffmanCode> {
     let alphabet_size = frequencies.len();
@@ -46,6 +54,10 @@ pub fn build_huffman_code(frequencies: &[u64]) -> Option<HuffmanCode> {
     }
 
     if nonzero.len() == 1 {
+        // Single-symbol: decoder simple table (nsym=1) fills all entries with this
+        // symbol and reads 0 bits per symbol. We store code_length=1 / code=0 so the
+        // table writer can find the symbol, but write_huffman_symbol must skip writing
+        // for single-nonzero-symbol tables (see its is_single_symbol check).
         let mut code_lengths = vec![0u8; alphabet_size];
         code_lengths[nonzero[0].0] = 1;
         let mut codes = vec![0u32; alphabet_size];
@@ -585,8 +597,14 @@ pub fn write_huffman_symbol(
     if symbol >= code.alphabet_size {
         return Err(Error::InvalidHuffman);
     }
-    // Single-symbol alphabet: decoder returns symbol 0 without reading bits.
+    // Single-symbol alphabet (al_size==1): decoder returns symbol 0 without reading bits.
     if code.alphabet_size == 1 {
+        return Ok(());
+    }
+    // Single non-zero symbol in a multi-symbol alphabet: decoder's simple table
+    // (nsym=1) fills all entries with the symbol and reads 0 bits per symbol.
+    // Do NOT write any bits here.
+    if code.is_single_symbol() {
         return Ok(());
     }
     let len = code.code_lengths[symbol] as usize;
