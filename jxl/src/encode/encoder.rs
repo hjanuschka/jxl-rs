@@ -17,6 +17,13 @@ pub enum JxlEncoderBitstreamKind {
     Container,
 }
 
+/// Supported input buffer layouts for bootstrap image encoding.
+#[derive(Clone, Copy, Debug)]
+pub enum JxlEncoderImageData<'a> {
+    /// Interleaved RGB8 samples: `[r,g,b, r,g,b, ...]`.
+    Rgb8Interleaved(&'a [u8]),
+}
+
 /// High-level encoder entry point.
 pub struct JxlEncoder {
     options: JxlEncoderOptions,
@@ -39,6 +46,33 @@ impl JxlEncoder {
 
     pub fn options_mut(&mut self) -> &mut JxlEncoderOptions {
         &mut self.options
+    }
+
+    /// Encodes an image buffer to a bare codestream.
+    pub fn encode_image_codestream(
+        &self,
+        size: (u32, u32),
+        image: JxlEncoderImageData<'_>,
+    ) -> Result<Vec<u8>> {
+        match image {
+            JxlEncoderImageData::Rgb8Interleaved(rgb) => {
+                headers::encode_modular_u8_rgb_image_codestream(size, rgb)
+            }
+        }
+    }
+
+    /// Encodes an image buffer using the container preference in options.
+    pub fn encode_image(
+        &self,
+        size: (u32, u32),
+        image: JxlEncoderImageData<'_>,
+    ) -> Result<Vec<u8>> {
+        let codestream = self.encode_image_codestream(size, image)?;
+        if self.options.container {
+            container::wrap_codestream(&codestream)
+        } else {
+            Ok(codestream)
+        }
     }
 
     /// Encodes a standalone JPEG XL signature blob.
@@ -212,6 +246,49 @@ mod tests {
         }
 
         assert_eq!(out, codestream);
+    }
+
+    #[test]
+    fn test_encode_image_codestream_rgb8_has_codestream_signature() {
+        let enc = JxlEncoder::default();
+        let rgb = vec![0u8; 8 * 4 * 3];
+        let bytes = enc
+            .encode_image_codestream((8, 4), JxlEncoderImageData::Rgb8Interleaved(&rgb))
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_image_respects_container_option() {
+        let rgb = vec![0u8; 8 * 4 * 3];
+
+        let mut enc = JxlEncoder::new(JxlEncoderOptions::default());
+        enc.options_mut().container = true;
+        let bytes = enc
+            .encode_image((8, 4), JxlEncoderImageData::Rgb8Interleaved(&rgb))
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Container)
+            }
+        );
+
+        enc.options_mut().container = false;
+        let bytes = enc
+            .encode_image((8, 4), JxlEncoderImageData::Rgb8Interleaved(&rgb))
+            .unwrap();
+        assert_eq!(
+            check_signature(&bytes),
+            ProcessingResult::Complete {
+                result: Some(JxlSignatureType::Codestream)
+            }
+        );
     }
 
     #[test]
