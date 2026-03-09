@@ -14,6 +14,8 @@ mod options;
 mod signature;
 mod xyb_constants;
 
+#[cfg(feature = "encoder")]
+pub use crate::encode::{JxlEncoder, JxlEncoderBitstreamKind, JxlEncoderOptions};
 pub use crate::image::JxlOutputBuffer;
 pub use color::*;
 pub use data_types::*;

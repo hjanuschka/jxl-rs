@@ -8,6 +8,8 @@ pub mod api;
 pub mod bit_reader;
 pub mod color;
 pub mod container;
+#[cfg(feature = "encoder")]
+pub mod encode;
 pub mod entropy_coding;
 pub mod error;
 pub mod features;
