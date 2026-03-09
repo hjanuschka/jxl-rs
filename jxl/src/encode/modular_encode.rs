@@ -228,6 +228,32 @@ pub fn write_hf_group_section_huffman(
     )
 }
 
+/// Encode a multi-channel signed integer modular stream.
+///
+/// `data` contains `num_channels` channels stored sequentially,
+/// each of size `width * height`.
+///
+/// Uses Zero predictor (residual = raw value) with simple Huffman coding.
+/// Channels are encoded in order: all pixels of channel 0, then channel 1, etc.
+pub fn encode_modular_signed_stream(
+    writer: &mut BitWriter,
+    width: usize,
+    height: usize,
+    num_channels: usize,
+    data: &[i32],
+) -> Result<()> {
+    assert_eq!(data.len(), width * height * num_channels);
+
+    let uint_config = HybridUintConfig::new(4, 1, 2);
+    let offset = 0i32;
+    let predictor = 0u32; // Zero predictor
+
+    // For now, treat all channels as a single flat residual stream.
+    // The tree has a single leaf node that applies to all channels.
+    // Residuals are all channel pixels concatenated.
+    write_modular_section_huffman(writer, offset, predictor, data, uint_config, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

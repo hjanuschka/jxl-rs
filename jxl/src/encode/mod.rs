@@ -14,6 +14,7 @@ pub mod modular;
 pub mod modular_encode;
 pub mod options;
 pub mod toc;
+pub mod vardct;
 pub mod xyb;
 
 pub use bit_writer::BitWriter;

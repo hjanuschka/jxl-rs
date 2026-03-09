@@ -86,7 +86,7 @@ fn extra_channel_count_coder() -> U32Coder {
 
 /// Writes image metadata for non-XYB encoding.
 /// `grayscale`: if true, writes color_space=Gray instead of RGB.
-fn write_image_metadata(
+pub(crate) fn write_image_metadata(
     writer: &mut BitWriter,
     xyb_encoded: bool,
     grayscale: bool,
@@ -158,7 +158,7 @@ fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool
     write_image_metadata(writer, xyb_encoded, false)
 }
 
-fn write_file_header(
+pub(crate) fn write_file_header(
     writer: &mut BitWriter,
     width: u32,
     height: u32,
