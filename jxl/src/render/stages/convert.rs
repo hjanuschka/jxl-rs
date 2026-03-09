@@ -267,6 +267,7 @@ impl RenderPipelineInOutStage for ConvertModularToF32Stage {
         } else {
             let scale = 1.0 / ((1u64 << self.bit_depth.bits_per_sample()) - 1) as f32;
             modular_to_float_32bit_simd_dispatch(input[0], output_rows[0][0], scale, xsize);
+
         }
     }
 

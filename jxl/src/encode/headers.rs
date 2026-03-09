@@ -110,7 +110,7 @@ fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool
     // xyb_encoded = false
     writer.write(1, 0)?;
 
-    // color_encoding.all_default = true (defaults to RGB/sRGB)
+    // color_encoding.all_default = true (defaults to sRGB).
     writer.write(1, 1)?;
 
     // extensions selector = 0 (u64 coding)
@@ -126,7 +126,9 @@ fn write_minimal_file_header_fields_with_metadata(
     xyb_encoded: bool,
 ) -> Result<()> {
     writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
+
     write_size(writer, width, height)?;
+
     write_minimal_image_metadata_fields(writer, xyb_encoded)?;
 
     // CustomTransformData::all_default = true.
@@ -212,8 +214,16 @@ fn write_default_modular_frame_header_with_xyb(
         0,
     )?;
 
-    // restoration_filter.all_default = true
-    writer.write(1, 1)?;
+    // restoration_filter.all_default = false
+    // (defaults enable Gaborish + EPF which corrupt lossless modular data)
+    writer.write(1, 0)?;
+
+    // gab = false (disable Gaborish smoothing)
+    writer.write(1, 0)?;
+
+    // epf_iters = 0 (disable edge-preserving filter)
+    // Coded as Bits(2), value 0.
+    writer.write(2, 0)?;
 
     // extensions selector = 0 (u64 coding)
     writer.write(2, 0)?;
@@ -452,6 +462,7 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         write_default_modular_frame_header_with_xyb(&mut writer, false)?;
         write_toc(&mut writer, &[lf_global_section.len() as u32])?;
         writer.write_aligned_bytes(&lf_global_section)?;
+
         return Ok(writer.finish());
     }
 
@@ -909,6 +920,75 @@ mod tests {
             frames[0][0].size(),
             ((size.0 * 3) as usize, size.1 as usize)
         );
+    }
+
+    #[test]
+    fn test_encode_pixel_roundtrip_constant() {
+        // 2x1 constant image: (50,50,50) and (50,50,50).
+        let size = (2u32, 1u32);
+        let rgb: Vec<u8> = vec![50, 50, 50, 50, 50, 50];
+
+        let cs = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+        let (_decoded, frames) =
+            crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
+
+        let img = &frames[0][0];
+        let row = img.row(0);
+        for x in 0..size.0 as usize {
+            let r = (row[x * 3] * 255.0 + 0.5) as u8;
+            let g = (row[x * 3 + 1] * 255.0 + 0.5) as u8;
+            let b = (row[x * 3 + 2] * 255.0 + 0.5) as u8;
+            eprintln!(
+                "constant pixel ({x},0): decoded ({r},{g},{b}), expected (50,50,50)"
+            );
+            assert_eq!(r, 50, "R mismatch at x={x}");
+            assert_eq!(g, 50, "G mismatch at x={x}");
+            assert_eq!(b, 50, "B mismatch at x={x}");
+        }
+    }
+
+    #[test]
+    fn test_encode_pixel_roundtrip_2vals() {
+        // 2x1 image with two distinct pixel values.
+        let size = (2u32, 1u32);
+        let rgb: Vec<u8> = vec![50, 50, 50, 100, 100, 100];
+        let cs = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+
+        // Test with both pipelines
+        for use_simple in [true, false] {
+            let (_decoded, frames) =
+                crate::api::tests::decode(&cs, usize::MAX, use_simple, false, None).unwrap();
+            let img = &frames[0][0];
+            let row = img.row(0);
+            for x in 0..size.0 as usize {
+                let r = (row[x * 3] * 255.0 + 0.5) as u8;
+                let g = (row[x * 3 + 1] * 255.0 + 0.5) as u8;
+                let b = (row[x * 3 + 2] * 255.0 + 0.5) as u8;
+                assert_eq!(r, rgb[x * 3], "R mismatch at x={x}");
+                assert_eq!(g, rgb[x * 3 + 1], "G mismatch at x={x}");
+                assert_eq!(b, rgb[x * 3 + 2], "B mismatch at x={x}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_pixel_roundtrip_simple() {
+        // 2x1 image with different R values, G=B=0.
+        let size = (2u32, 1u32);
+        let rgb: Vec<u8> = vec![50, 0, 0, 100, 0, 0];
+        let cs = encode_modular_u8_rgb_image_codestream(size, &rgb).unwrap();
+        let (_decoded, frames) =
+            crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
+        let img = &frames[0][0];
+        let row = img.row(0);
+        for x in 0..size.0 as usize {
+            let r = (row[x * 3] * 255.0 + 0.5) as u8;
+            let g = (row[x * 3 + 1] * 255.0 + 0.5) as u8;
+            let b = (row[x * 3 + 2] * 255.0 + 0.5) as u8;
+            assert_eq!(r, rgb[x * 3], "R mismatch at x={x}");
+            assert_eq!(g, rgb[x * 3 + 1], "G mismatch at x={x}");
+            assert_eq!(b, rgb[x * 3 + 2], "B mismatch at x={x}");
+        }
     }
 
     #[test]
