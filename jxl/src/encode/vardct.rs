@@ -18,6 +18,7 @@ use crate::error::Result;
 use crate::frame::block_context_map::{
     self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT,
 };
+use crate::encode::entropy::huffman_encode::build_huffman_code;
 use crate::headers::encodings::{U32, U32Coder};
 use jxl_transforms::dct2d_8_scalar;
 
@@ -262,26 +263,107 @@ fn encode_vardct_frame(
         Ok(result)
     } else {
         // Multi-group: LfGlobal + LfGroups + HfGlobal + HfGroups
-        let total_sections = 2 + num_groups + num_groups;
+        //
+        // LF groups operate on DC blocks; each LF group covers group_dim blocks
+        // (= group_dim * 8 pixels = 2048px with default group_dim=256).
+        // HF groups operate on AC data; each covers group_dim pixels (256px).
+        //
+        // Section order: [LfGlobal, LfGroup0..NLF-1, HfGlobal, HfGroup0..NHF-1]
+        // TOC entries:  2 + num_lf_groups + num_groups (from FrameHeader::num_toc_entries)
+        let lf_group_dim_blocks = group_dim_blocks * 8; // 256 blocks = 2048px
+        let num_lf_groups_x = bw.div_ceil(lf_group_dim_blocks);
+        let num_lf_groups_y = bh.div_ceil(lf_group_dim_blocks);
+        let num_lf_groups = num_lf_groups_x * num_lf_groups_y;
+
+        let total_sections = 2 + num_lf_groups + num_groups;
         let mut sections: Vec<Vec<u8>> = Vec::with_capacity(total_sections);
 
-        sections.push(encode_lf_global_section(global_scale, quant_lf)?);
+        // --- Phase 1: Tokenize ALL HF groups' AC data to build global histogram ---
+        let num_contexts = 15; // default BlockContextMap
+        let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
+        let ac_channels = [ac_y, ac_x, ac_b]; // order Y,X,B matching decoder's [1,0,2]
+        let channel_indices = [1usize, 0, 2];
+
+        // Per-HF-group token lists
+        let mut group_tokens: Vec<Vec<AcToken>> = Vec::with_capacity(num_groups);
 
         for g in 0..num_groups {
             let gx = g % num_groups_x;
             let gy = g / num_groups_x;
+            let x0 = gx * group_dim_blocks;
+            let y0 = gy * group_dim_blocks;
+            let gw = (x0 + group_dim_blocks).min(bw) - x0;
+            let gh = (y0 + group_dim_blocks).min(bh) - y0;
+
+            let mut tokens: Vec<AcToken> = Vec::new();
+            let mut num_nzeros: Vec<Vec<u32>> = vec![vec![0u32; gw]; gh];
+
+            for by in 0..gh {
+                for bx in 0..gw {
+                    let global_blk = (y0 + by) * bw + (x0 + bx);
+                    for (ci, &c) in channel_indices.iter().enumerate() {
+                        let ac = ac_channels[ci];
+                        let blk_coeffs = &ac[global_blk * 64..(global_blk + 1) * 64];
+                        let block_ctx = default_block_context(c, 0);
+                        let left_nz = if bx > 0 { num_nzeros[by][bx - 1] } else { 0 };
+                        let top_nz = if by > 0 { num_nzeros[by - 1][bx] } else { 0 };
+                        let predicted = predict_num_nonzeros_simple(left_nz, top_nz);
+                        let nz = tokenize_block_8x8(
+                            blk_coeffs, c, block_ctx, num_contexts,
+                            0, predicted, &mut tokens,
+                        );
+                        num_nzeros[by][bx] = nz as u32;
+                    }
+                }
+            }
+            group_tokens.push(tokens);
+        }
+
+        // Build global Huffman code from all groups' tokens
+        let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
+        let all_encoded: Vec<Vec<_>> = group_tokens.iter().map(|tokens| {
+            tokens.iter().map(|t| uint_config.encode(t.value)).collect::<Vec<_>>()
+        }).collect();
+        let max_token = all_encoded.iter()
+            .flat_map(|enc| enc.iter().map(|e| e.token))
+            .max().unwrap_or(0);
+        let alphabet_size = (max_token as usize + 1).max(1);
+        let mut frequencies = vec![0u64; alphabet_size];
+        for enc_group in &all_encoded {
+            for enc in enc_group {
+                frequencies[enc.token as usize] += 1;
+            }
+        }
+
+        let global_code = if frequencies.iter().all(|&f| f == 0) {
+            build_huffman_code(&[1]).ok_or(crate::error::Error::InvalidHuffman)?
+        } else {
+            build_huffman_code(&frequencies).ok_or(crate::error::Error::InvalidHuffman)?
+        };
+
+        // --- Phase 2: Write sections ---
+
+        // LfGlobal
+        sections.push(encode_lf_global_section(global_scale, quant_lf)?);
+
+        // LfGroups (use LF group dimensions)
+        for g in 0..num_lf_groups {
+            let gx = g % num_lf_groups_x;
+            let gy = g / num_lf_groups_x;
             sections.push(encode_lf_group_section(
-                gx, gy, bw, bh, group_dim_blocks, dc_y, dc_x, dc_b,
+                gx, gy, bw, bh, lf_group_dim_blocks, dc_y, dc_x, dc_b,
             )?);
         }
 
-        sections.push(encode_hf_global_section(num_groups, bw, bh, group_dim_blocks, ac_x, ac_y, ac_b)?);
+        // HfGlobal: DequantMatrices + histograms (no token data)
+        sections.push(encode_hf_global_section_with_code(
+            num_groups, num_ac_contexts, &uint_config, &global_code,
+        )?);
 
+        // HfGroups: token data only (use HF group dimensions)
         for g in 0..num_groups {
-            let gx = g % num_groups_x;
-            let gy = g / num_groups_x;
-            sections.push(encode_hf_group_section(
-                gx, gy, bw, bh, group_dim_blocks, ac_x, ac_y, ac_b,
+            sections.push(encode_hf_group_tokens(
+                num_groups, &group_tokens[g], &all_encoded[g], &global_code,
             )?);
         }
 
@@ -742,7 +824,11 @@ fn encode_lf_group_section(
     let gw = (x0 + group_dim_blocks).min(bw) - x0;
     let gh = (y0 + group_dim_blocks).min(bh) - y0;
 
-    // VarDCT LF: DC coefficients as modular (3 channels: Y, X, B)
+    // === VarDCT LF: DC coefficients ===
+    // extra_precision = 0 (2 bits)
+    w.write(2, 0)?;
+
+    // DC as modular (3 channels: Y, X, B order matching decoder's decode_vardct_lf)
     let npixels = gw * gh;
     let mut dc_data = vec![0i32; npixels * 3];
     for y in 0..gh {
@@ -758,32 +844,41 @@ fn encode_lf_group_section(
         &mut w, gw, gh, 3, &dc_data,
     )?;
 
-    // ModularLF: empty (0 extra channels)
-    // (nothing to write)
+    // === ModularLF: empty (0 extra channels) ===
+    // Nothing to write.
 
-    // HF metadata: raw_quant_field (all 1) + transform_map (all 0 = DCT8x8)
-    let mut hf_meta = vec![0i32; npixels * 2];
-    for i in 0..npixels {
-        hf_meta[i] = 1; // raw_quant_field
+    // === HF metadata: 4 channels ===
+    // Same format as single-group: count field + 4-channel modular stream.
+    // Channels: ytox_map (cr_w x cr_h), ytob_map, transform_image (count x 2), epf_map (gw x gh)
+    let upper_bound = gw * gh;
+    let count_num_bits = if upper_bound <= 1 { 0 } else {
+        32 - (upper_bound as u32 - 1).leading_zeros()
+    };
+    let count = npixels; // one transform entry per block (all DCT8x8)
+    if count_num_bits > 0 {
+        w.write(count_num_bits as usize, (count - 1) as u64)?;
     }
-    // transform_map already 0 (DCT8x8)
-    crate::encode::modular_encode::encode_modular_signed_stream(
-        &mut w, gw, gh, 2, &hf_meta,
-    )?;
+
+    let cr_w = gw.div_ceil(8);
+    let cr_h = gh.div_ceil(8);
+    // All values zero: ytox=0, ytob=0, transform=DCT8x8 with quant-1=0, epf=0
+    let total = cr_w * cr_h + cr_w * cr_h + count * 2 + gw * gh;
+    let hf_meta_data = vec![0i32; total];
+    encode_hf_metadata_modular(&mut w, cr_w, cr_h, count, gw, gh, &hf_meta_data)?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
 
-/// Encode the HfGlobal section.
-fn encode_hf_global_section(
+/// Encode the HfGlobal section with pre-computed global Huffman code.
+///
+/// Writes: DequantMatrices, num_histograms, used_orders, Huffman histogram header.
+/// The histogram header defines the tables; token data goes in HfGroup sections.
+fn encode_hf_global_section_with_code(
     num_groups: usize,
-    _bw: usize,
-    _bh: usize,
-    _group_dim_blocks: usize,
-    _ac_x: &[i32],
-    _ac_y: &[i32],
-    _ac_b: &[i32],
+    num_ac_contexts: usize,
+    uint_config: &crate::encode::entropy::HybridUintConfig,
+    code: &crate::encode::entropy::huffman_encode::HuffmanCode,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -804,10 +899,14 @@ fn encode_hf_global_section(
     // used_orders: selector 2 = no custom orders (natural order)
     w.write(2, 2)?;
 
-    // AC coefficient histograms: placeholder for multi-group (not yet implemented)
-    let num_ac_contexts = 15 * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
-    let empty_tokens: Vec<AcToken> = Vec::new();
-    write_ac_histograms_and_tokens(&mut w, num_ac_contexts, &empty_tokens)?;
+    // Write Histograms header (tables only, no token data)
+    let context_map = vec![0u8; num_ac_contexts]; // all -> histogram 0
+    crate::encode::entropy::huffman_encode::write_huffman_histograms(
+        &mut w,
+        &context_map,
+        &[*uint_config],
+        &[code.clone()],
+    )?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -887,17 +986,34 @@ fn write_ac_histograms_and_tokens(
     Ok(())
 }
 
-/// Encode an HfGroup section (AC coefficients for one group).
-#[allow(clippy::too_many_arguments)]
-fn encode_hf_group_section(
-    _gx: usize, _gy: usize, _bw: usize, _bh: usize,
-    _group_dim_blocks: usize, _ac_x: &[i32], _ac_y: &[i32], _ac_b: &[i32],
+/// Encode an HfGroup section: histogram_index + AC token data.
+///
+/// The Huffman tables were written in HfGlobal; this section writes
+/// the entropy-coded symbols referencing those tables.
+fn encode_hf_group_tokens(
+    num_groups: usize,
+    tokens: &[AcToken],
+    encoded: &[crate::encode::entropy::HybridUintEncoded],
+    code: &crate::encode::entropy::huffman_encode::HuffmanCode,
 ) -> Result<Vec<u8>> {
+    use crate::encode::entropy::huffman_encode::write_huffman_symbol;
+
     let mut w = BitWriter::new();
-    // For now: empty (all AC coefficients are zero).
-    // The decoder reads AC coefficients using the histograms from HfGlobal.
-    // With a single-symbol histogram (symbol 0), no bits are read per symbol.
-    // We just need the section to exist.
+
+    // histogram_index: 0 (use first histogram set)
+    // Number of bits = ceil_log2(num_histograms) = ceil_log2(1) = 0 bits.
+    // But wait: the decoder reads ceil_log2(num_histograms) bits per HfGroup.
+    // With num_histograms=1, that's 0 bits. Nothing to write.
+    let _ = num_groups; // num_histograms=1, so 0 bits for histogram_index
+
+    // Write token data: Huffman symbols + extra bits
+    for (_token, enc) in tokens.iter().zip(encoded.iter()) {
+        write_huffman_symbol(&mut w, code, enc.token as usize)?;
+        if enc.nbits > 0 {
+            w.write(enc.nbits as usize, enc.extra_bits as u64)?;
+        }
+    }
+
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
@@ -1290,5 +1406,198 @@ mod tests {
         let config = VarDctConfig { distance: 2.0 };
         let result = encode_vardct_u8_rgb(&rgb, width, height, &config);
         assert!(result.is_ok(), "encode failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_vardct_multigroup() {
+        // 512x512 image -> 2x2 = 4 groups (group_dim = 256px = 32 blocks)
+        let width = 512;
+        let height = 512;
+        let mut rgb = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                rgb[i] = (x * 255 / (width - 1)) as u8;
+                rgb[i + 1] = (y * 255 / (height - 1)) as u8;
+                rgb[i + 2] = 128;
+            }
+        }
+
+        let config = VarDctConfig { distance: 1.0 };
+        let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
+            .expect("multi-group encode should succeed");
+        eprintln!("512x512 multi-group codestream: {} bytes", cs.len());
+
+        // Write to file for djxl verification
+        let container = encode_vardct_u8_rgb(&rgb, width, height, &config).unwrap();
+        std::fs::write("/tmp/test_vardct_512x512.jxl", &container).unwrap();
+
+        // Verify with jxl-rs decoder
+        let result = crate::api::tests::decode(
+            &cs, usize::MAX, true, false, None,
+        );
+        match result {
+            Ok((_n, frames)) => {
+                let buf = &frames[0][0];
+                assert_eq!(buf.size(), (width * 3, height));
+                // Spot-check a few pixels
+                let row0 = buf.row(0);
+                let r0 = (row0[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let g0 = (row0[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let b0 = (row0[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                eprintln!("  pixel(0,0): ({r0},{g0},{b0}) expected ~(0,0,128)");
+                // Center pixel
+                let cy = height / 2;
+                let cx = width / 2;
+                let rowc = buf.row(cy);
+                let rc = (rowc[cx * 3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let gc = (rowc[cx * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let bc = (rowc[cx * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                eprintln!("  pixel({cx},{cy}): ({rc},{gc},{bc}) expected ~(128,128,128)");
+                // Bottom-right
+                let lrow = buf.row(height - 1);
+                let rl = (lrow[(width - 1) * 3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let gl = (lrow[(width - 1) * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let bl = (lrow[(width - 1) * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                eprintln!("  pixel({},{height}): ({rl},{gl},{bl}) expected ~(255,255,128)", width-1);
+                eprintln!("  Multi-group 512x512 OK: {} bytes", cs.len());
+            }
+            Err(e) => {
+                panic!("Multi-group 512x512 decode failed: {e:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_vardct_multigroup_large() {
+        // Test images that cross HF and LF group boundaries
+        for (width, height, label) in [
+            (2049, 1, "2049x1 (2 LF groups wide)"),
+            (1024, 1024, "1024x1024 (16 HF groups, 1 LF group)"),
+        ] {
+            let mut rgb = vec![128u8; width * height * 3];
+            for y in 0..height {
+                for x in 0..width {
+                    let i = (y * width + x) * 3;
+                    rgb[i] = (x * 255 / width.max(1)) as u8;
+                    rgb[i + 1] = (y * 255 / height.max(1)) as u8;
+                    rgb[i + 2] = 128;
+                }
+            }
+
+            let config = VarDctConfig { distance: 1.0 };
+            let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
+                .expect(&format!("{label} encode failed"));
+            eprintln!("{label}: {} bytes", cs.len());
+
+            let container = encode_vardct_u8_rgb(&rgb, width, height, &config).unwrap();
+            let path = format!("/tmp/test_vardct_{width}x{height}.jxl");
+            std::fs::write(&path, &container).unwrap();
+
+            let result = crate::api::tests::decode(
+                &cs, usize::MAX, true, false, None,
+            );
+            match result {
+                Ok((_n, frames)) => {
+                    let buf = &frames[0][0];
+                    assert_eq!(buf.size(), (width * 3, height));
+                    eprintln!("  {label} OK");
+                }
+                Err(e) => {
+                    panic!("{label} decode failed: {e:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vardct_multigroup_small() {
+        use crate::bit_reader::BitReader;
+        use crate::headers::JxlHeader;
+        use crate::headers::encodings::UnconditionalCoder;
+        use crate::headers::frame_header::{FrameHeader, FrameHeaderNonserialized};
+        use crate::headers::toc::{Toc, TocNonserialized};
+
+        // 257x257 -> just barely multi-group (2x2 groups, last group is tiny)
+        let width = 257;
+        let height = 257;
+        let mut rgb = vec![128u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                rgb[i] = ((x * 3 + y) % 256) as u8;
+                rgb[i + 1] = ((x + y * 2) % 256) as u8;
+            }
+        }
+
+        let config = VarDctConfig { distance: 1.0 };
+        let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
+            .expect("257x257 multi-group encode should succeed");
+        eprintln!("257x257 multi-group codestream: {} bytes", cs.len());
+
+        // Write for djxl debugging
+        let container = encode_vardct_u8_rgb(&rgb, width, height, &config).unwrap();
+        std::fs::write("/tmp/test_vardct_257x257.jxl", &container).unwrap();
+
+        // Step-by-step parse to find the exact error location
+        let mut padded = cs.clone();
+        padded.extend_from_slice(&[0u8; 256]);
+        let mut br = BitReader::new(&padded);
+
+        // 1. File header
+        let fh = <crate::headers::FileHeader as JxlHeader>::read(&mut br)
+            .expect("FileHeader parse failed");
+        eprintln!("FileHeader OK at bit {}", br.total_bits_read());
+        eprintln!("  size: {}x{}", fh.size.xsize(), fh.size.ysize());
+
+        // 2. Byte-align before frame header
+        br.jump_to_byte_boundary().expect("byte align before frame header failed");
+        eprintln!("After byte-align: bit {}", br.total_bits_read());
+
+        // 3. Frame header
+        let frame_hdr = FrameHeader::read_unconditional(&(), &mut br, &FrameHeaderNonserialized {
+            xyb_encoded: true,
+            num_extra_channels: 0,
+            extra_channel_info: vec![],
+            have_animation: false,
+            have_timecode: false,
+            img_width: width as u32,
+            img_height: height as u32,
+        }).expect("FrameHeader parse failed");
+        eprintln!("FrameHeader OK at bit {}", br.total_bits_read());
+        eprintln!("  encoding: {:?}", frame_hdr.encoding);
+        eprintln!("  num_groups: {}", frame_hdr.num_groups());
+        eprintln!("  num_lf_groups: {}", frame_hdr.num_lf_groups());
+
+        // 4. TOC
+        let num_toc_entries = frame_hdr.num_toc_entries() as u32;
+        eprintln!("  toc_entries: {}", num_toc_entries);
+        let toc = Toc::read_unconditional(&(), &mut br, &TocNonserialized {
+            num_entries: num_toc_entries,
+        });
+        match &toc {
+            Ok(toc) => {
+                eprintln!("TOC OK at bit {}: {:?}", br.total_bits_read(), toc.entries);
+            }
+            Err(e) => {
+                eprintln!("TOC FAILED at bit {}: {e:?}", br.total_bits_read());
+                panic!("TOC parse failed: {e:?}");
+            }
+        }
+
+        // 5. Full decode
+        let result = crate::api::tests::decode(
+            &cs, usize::MAX, true, false, None,
+        );
+        match result {
+            Ok((_n, frames)) => {
+                let buf = &frames[0][0];
+                assert_eq!(buf.size(), (width * 3, height));
+                eprintln!("  257x257 multi-group OK: {} bytes", cs.len());
+            }
+            Err(e) => {
+                panic!("257x257 multi-group decode failed: {e:?}");
+            }
+        }
     }
 }
