@@ -9,22 +9,36 @@ use jxl::encode::{JxlEncoder, JxlEncoderImageData};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(about = "Bootstrap JPEG XL encoder helper (header-only stream)")]
+#[command(about = "JPEG XL encoder")]
 struct Opt {
+    /// Input file (PPM/PGM P6/P5 with maxval=255)
+    input: Option<PathBuf>,
+
     /// Output .jxl filename
-    output: PathBuf,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 
-    /// Image width in pixels
-    #[arg(long)]
-    width: u32,
+    /// Quality distance (lower = better quality, 0.0 = lossless, 1.0 = visually lossless)
+    #[arg(short, long, default_value_t = 1.0)]
+    distance: f32,
 
-    /// Image height in pixels
+    /// Use modular (lossless) encoding instead of VarDCT
     #[arg(long)]
-    height: u32,
+    modular: bool,
 
     /// Emit bare codestream instead of container
     #[arg(long)]
     bare: bool,
+
+    // --- Legacy/advanced options ---
+
+    /// Image width in pixels (for raw input modes)
+    #[arg(long)]
+    width: Option<u32>,
+
+    /// Image height in pixels (for raw input modes)
+    #[arg(long)]
+    height: Option<u32>,
 
     /// Include minimal frame header + TOC (still no pixel section payload)
     #[arg(long)]
@@ -172,6 +186,80 @@ fn main() -> Result<()> {
     let opt = Opt::parse();
     let enc = JxlEncoder::default();
 
+    // --- Simple mode: jxle input.ppm [-o output.jxl] [-d distance] ---
+    if let Some(input_path) = &opt.input {
+        let pnm = read_pnm(input_path)?;
+        let output = opt.output.clone().unwrap_or_else(|| {
+            let mut p = input_path.clone();
+            p.set_extension("jxl");
+            p
+        });
+
+        let (width, height, rgb) = match &pnm {
+            PnmImage::Rgb8 { width, height, data } => (*width, *height, data.clone()),
+            PnmImage::Gray8 { width, height, data } => {
+                // Convert grayscale to RGB for VarDCT
+                let mut rgb = vec![0u8; ((*width) as usize) * ((*height) as usize) * 3];
+                for (i, &g) in data.iter().enumerate() {
+                    rgb[i * 3] = g;
+                    rgb[i * 3 + 1] = g;
+                    rgb[i * 3 + 2] = g;
+                }
+                (*width, *height, rgb)
+            }
+        };
+
+        let bytes = if opt.modular || opt.distance == 0.0 {
+            // Lossless modular encoding
+            match &pnm {
+                PnmImage::Rgb8 { data, .. } => {
+                    let image = JxlEncoderImageData::Rgb8Interleaved(data);
+                    if opt.bare {
+                        enc.encode_image_codestream((width, height), image)?
+                    } else {
+                        enc.encode_image((width, height), image)?
+                    }
+                }
+                PnmImage::Gray8 { data, .. } => {
+                    let image = JxlEncoderImageData::Gray8Interleaved(data);
+                    if opt.bare {
+                        enc.encode_image_codestream((width, height), image)?
+                    } else {
+                        enc.encode_image((width, height), image)?
+                    }
+                }
+            }
+        } else {
+            // VarDCT lossy encoding
+            use jxl::encode::vardct::{VarDctConfig, encode_vardct_u8_rgb, encode_vardct_u8_rgb_codestream};
+            let config = VarDctConfig { distance: opt.distance };
+            if opt.bare {
+                encode_vardct_u8_rgb_codestream(&rgb, width as usize, height as usize, &config)
+                    .map_err(|e| color_eyre::eyre::eyre!("VarDCT encode failed: {e:?}"))?
+            } else {
+                encode_vardct_u8_rgb(&rgb, width as usize, height as usize, &config)
+                    .map_err(|e| color_eyre::eyre::eyre!("VarDCT encode failed: {e:?}"))?
+            }
+        };
+
+        std::fs::write(&output, &bytes)
+            .wrap_err_with(|| format!("Failed to write {:?}", output))?;
+
+        let mode = if opt.modular || opt.distance == 0.0 { "modular" } else { "VarDCT" };
+        let ratio = (rgb.len() as f64) / (bytes.len() as f64);
+        eprintln!(
+            "{:?} -> {:?}: {}x{}, {} bytes ({mode}, d={:.2}, {:.1}:1)",
+            input_path, output, width, height, bytes.len(), opt.distance, ratio
+        );
+        return Ok(());
+    }
+
+    // --- Legacy advanced modes ---
+
+    let width = opt.width.unwrap_or(1);
+    let height = opt.height.unwrap_or(1);
+    let output = opt.output.clone().unwrap_or_else(|| PathBuf::from("output.jxl"));
+
     if opt.modular_image && opt.with_frame_info {
         return Err(color_eyre::eyre::eyre!(
             "--modular-image and --with-frame-info are mutually exclusive"
@@ -264,9 +352,9 @@ fn main() -> Result<()> {
             JxlEncoderImageData::Rgb8Interleaved(&rgb)
         };
         let bytes = if opt.bare {
-            enc.encode_image_codestream((opt.width, opt.height), image)?
+            enc.encode_image_codestream((width, height), image)?
         } else {
-            enc.encode_image((opt.width, opt.height), image)?
+            enc.encode_image((width, height), image)?
         };
         (bytes, "raw-rgb8 modular stream")
     } else if let Some(raw_gray_path) = &opt.raw_gray8_input {
@@ -281,21 +369,21 @@ fn main() -> Result<()> {
             JxlEncoderImageData::Gray8Interleaved(&gray)
         };
         let bytes = if opt.bare {
-            enc.encode_image_codestream((opt.width, opt.height), image)?
+            enc.encode_image_codestream((width, height), image)?
         } else {
-            enc.encode_image((opt.width, opt.height), image)?
+            enc.encode_image((width, height), image)?
         };
         (bytes, "raw-gray8 modular stream")
     } else if opt.modular_image {
         let bytes = if opt.bare {
             enc.encode_minimal_modular_image_codestream_with_params(
-                (opt.width, opt.height),
+                (width, height),
                 opt.modular_offset,
                 opt.modular_predictor,
             )?
         } else {
             enc.encode_minimal_modular_image_container_with_params(
-                (opt.width, opt.height),
+                (width, height),
                 opt.modular_offset,
                 opt.modular_predictor,
             )?
@@ -303,33 +391,33 @@ fn main() -> Result<()> {
         (bytes, "minimal modular-image stream")
     } else if opt.with_frame_info {
         let bytes = if opt.bare {
-            enc.encode_minimal_single_frame_codestream((opt.width, opt.height))?
+            enc.encode_minimal_single_frame_codestream((width, height))?
         } else {
-            enc.encode_minimal_single_frame_container((opt.width, opt.height))?
+            enc.encode_minimal_single_frame_container((width, height))?
         };
         (bytes, "minimal frame-info stream")
     } else {
         let bytes = if opt.bare {
-            enc.encode_minimal_codestream_header((opt.width, opt.height))?
+            enc.encode_minimal_codestream_header((width, height))?
         } else {
-            enc.encode_minimal_container_header((opt.width, opt.height))?
+            enc.encode_minimal_container_header((width, height))?
         };
         (bytes, "header-only stream")
     };
 
-    std::fs::write(&opt.output, &bytes)
-        .wrap_err_with(|| format!("Failed to write {:?}", opt.output))?;
+    std::fs::write(&output, &bytes)
+        .wrap_err_with(|| format!("Failed to write {:?}", output))?;
 
     if opt.modular_image {
         eprintln!(
             "Wrote {} bytes to {:?} ({mode}, offset={}, predictor={})",
             bytes.len(),
-            opt.output,
+            output,
             opt.modular_offset,
             opt.modular_predictor
         );
     } else {
-        eprintln!("Wrote {} bytes to {:?} ({mode})", bytes.len(), opt.output);
+        eprintln!("Wrote {} bytes to {:?} ({mode})", bytes.len(), output);
     }
     Ok(())
 }

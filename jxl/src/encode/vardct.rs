@@ -440,7 +440,8 @@ fn encode_hf_metadata_modular(
 
 /// A token in the AC coefficient stream, with its context.
 struct AcToken {
-    /// Context index for this token.
+    /// Context index for this token (used for multi-histogram routing).
+    #[allow(dead_code)]
     context: usize,
     /// The unsigned value to encode (via HybridUint).
     value: u32,
@@ -474,7 +475,7 @@ fn natural_coeff_order_8x8() -> [usize; 64] {
 /// Produces tokens matching the decoder's reading order in `decode_vardct_group`.
 fn tokenize_block_8x8(
     coeffs: &[i32],  // 64 coefficients, DC position is 0 (not used)
-    channel: usize,
+    _channel: usize,
     block_context: usize,
     num_contexts: usize,
     context_offset: usize,
@@ -522,7 +523,7 @@ fn tokenize_block_8x8(
 
 /// Compute block context for DCT8x8 using default BlockContextMap.
 /// Simplified version of BlockContextMap::block_context for default map.
-fn default_block_context(channel: usize, quant_lf_idx: usize) -> usize {
+fn default_block_context(channel: usize, _quant_lf_idx: usize) -> usize {
     // Default context map has:
     //   no lf thresholds (num_lf_contexts=1), no qf thresholds
     //   context_map indices for (channel, shape, qf, lf) -> block_context
@@ -976,7 +977,7 @@ fn write_ac_histograms_and_tokens(
     )?;
 
     // Write token data: for each token, write Huffman symbol + extra bits
-    for (token, enc) in tokens.iter().zip(encoded.iter()) {
+    for (_token, enc) in tokens.iter().zip(encoded.iter()) {
         write_huffman_symbol(w, &code, enc.token as usize)?;
         if enc.nbits > 0 {
             w.write(enc.nbits as usize, enc.extra_bits as u64)?;
