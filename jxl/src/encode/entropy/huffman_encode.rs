@@ -923,7 +923,6 @@ mod tests {
     #[test]
     fn test_write_complex_table_many_symbols_roundtrip() {
         // Test with increasing alphabet sizes to find the breaking point
-        // Test with specific code lengths that reproduce the failure
         for al_size in [6, 20, 50, 58, 60, 87] {
             let mut freqs = vec![0u64; al_size];
             for (i, f) in freqs.iter_mut().enumerate() {
