@@ -154,6 +154,7 @@ pub(crate) fn write_image_metadata(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool) -> Result<()> {
     write_image_metadata(writer, xyb_encoded, false)
 }
