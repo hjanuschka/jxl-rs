@@ -2038,7 +2038,7 @@ fn build_entropy_merge_transform_map(
     dct8_ac_b: &[i32],
     global_scale: u32,
     raw_quant_map: &[u8],
-    dequant_weights_8x8: &[f32],
+    _dequant_weights_8x8: &[f32],
     x_dm_multiplier: f32,
     b_dm_multiplier: f32,
     distance: f32,
@@ -2133,13 +2133,9 @@ fn build_entropy_merge_transform_map(
             e16 *= entropy_mul_16;
 
             // DCT16 wins if its estimated entropy is lower.
-            if bx == 0 && by == 0 {
-                // Debug: print weight stats
-                let dw16_y = &dct16_weights[256..512];
             // Currently, DCT16 entropy tends to be higher than 4x DCT8 due to
             // the forward solver producing slightly different coefficients than
             // libjxl's TransformFromPixels. This means very few merges happen.
-            }
             if e16 < e8_sum {
                 map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
                 map[by * bw + bx + 1] = DCT16_TRANSFORM_ID;
