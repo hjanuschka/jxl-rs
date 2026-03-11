@@ -16,6 +16,7 @@ use crate::encode::headers::write_file_header;
 use crate::encode::toc::write_toc;
 use crate::encode::xyb::srgb_u8_to_xyb;
 use crate::error::Result;
+use crate::encode::entropy::context_map::write_context_map;
 use crate::frame::block_context_map::{self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT};
 use crate::headers::encodings::{U32, U32Coder};
 use jxl_transforms::{
@@ -3481,8 +3482,13 @@ fn encode_vardct_frame(
         let total_sections = 2 + num_lf_groups + num_groups;
         let mut sections: Vec<Vec<u8>> = Vec::with_capacity(total_sections);
 
+        // Block context map: currently disabled as the overhead exceeds savings
+        // without per-block transform selection (all DCT8, uniform shape).
+        // TODO: enable when FindBest8x8Transform gives shape variety.
+        let block_ctx: Option<CustomBlockCtx> = None;
+        let num_contexts = 15; // default
+
         // --- Phase 1: Tokenize ALL HF groups' AC data to build global histogram ---
-        let num_contexts = 15; // default BlockContextMap
         let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
 
         // Per-HF-group token lists
@@ -3509,6 +3515,8 @@ fn encode_vardct_frame(
                 num_contexts,
                 0,
                 None, // TODO: add custom orders for multi-group
+                Some(raw_quant_map),
+                block_ctx.as_ref(),
             )?;
             group_tokens.push(tokens);
         }
@@ -3534,7 +3542,7 @@ fn encode_vardct_frame(
         // --- Phase 2: Write sections ---
 
         // LfGlobal
-        sections.push(encode_lf_global_section(global_scale, quant_lf)?);
+        sections.push(encode_lf_global_section(global_scale, quant_lf, block_ctx.as_ref())?);
 
         // LfGroups (use LF group dimensions)
         for g in 0..num_lf_groups {
@@ -3734,6 +3742,9 @@ fn tokenize_hf_region(
     num_contexts: usize,
     context_offset: usize,
     custom_orders_8x8: Option<&[[usize; 64]; 3]>,
+    // For custom block context maps:
+    raw_quant_map: Option<&[u8]>,
+    block_ctx_info: Option<&CustomBlockCtx>,
 ) -> Result<Vec<AcToken>> {
     let mut tokens = Vec::new();
     let mut num_nzeros = [
@@ -3767,7 +3778,11 @@ fn tokenize_hf_region(
 
             for (ci, &c) in channel_indices.iter().enumerate() {
                 let ac = ac_channels[ci];
-                let block_ctx = default_block_context(c, shape_id, 0);
+                let block_ctx = if let (Some(rqm), Some(bci)) = (raw_quant_map, block_ctx_info) {
+                    custom_block_context(c, shape_id, rqm[global_idx] as u32, &bci.qf_thresholds, &bci.context_map)
+                } else {
+                    default_block_context(c, shape_id, 0)
+                };
                 let predicted = predict_num_nonzeros(&num_nzeros[c], rw, bx, by);
 
                 if transform_id == DCT8_TRANSFORM_ID {
@@ -4213,6 +4228,29 @@ fn tokenize_block_8x8(
     nonzeros
 }
 
+/// Compute block context using a custom BlockContextMap.
+fn custom_block_context(
+    channel: usize, shape_id: usize, qf: u32,
+    qf_thresholds: &[u32], context_map: &[u8],
+) -> usize {
+    let ch_remap = if channel < 2 { channel ^ 1 } else { 2 };
+    let num_orders = 13;
+    let shape_id = shape_id.min(num_orders - 1);
+    let mut qf_idx = 0usize;
+    for t in qf_thresholds {
+        if qf > *t { qf_idx += 1; }
+    }
+    // No lf_thresholds -> num_lf_contexts = 1, lf_idx = 0
+    let idx = ch_remap * num_orders + shape_id;
+    let idx = idx * (qf_thresholds.len() + 1) + qf_idx;
+    // idx * num_lf_contexts + lf_idx = idx * 1 + 0
+    if idx < context_map.len() {
+        context_map[idx] as usize
+    } else {
+        0
+    }
+}
+
 /// Compute block context using the default BlockContextMap.
 /// Simplified version of BlockContextMap::block_context for default map.
 fn default_block_context(channel: usize, shape_id: usize, _quant_lf_idx: usize) -> usize {
@@ -4499,6 +4537,8 @@ fn encode_single_group_section(
         } else {
             None
         },
+        None,  // no custom block context for single-group
+        None,
     )?;
 
     // === HfGlobal ===
@@ -4526,15 +4566,166 @@ fn encode_single_group_section(
 }
 
 /// Encode the LfGlobal section.
-fn encode_lf_global_section(global_scale: u32, quant_lf: u32) -> Result<Vec<u8>> {
+/// Custom block context map parameters.
+struct CustomBlockCtx {
+    qf_thresholds: Vec<u32>,      // quant field thresholds
+    context_map: Vec<u8>,         // context map entries
+    num_contexts: usize,          // max(context_map) + 1
+}
+
+/// Compute an optimized block context map (port of libjxl's FindBestBlockEntropyModel).
+/// Returns None if the image is too small to benefit.
+fn compute_block_context_map(
+    raw_quant_map: &[u8],
+    _transform_map: &[u8],
+    bw: usize,
+    bh: usize,
+) -> Option<CustomBlockCtx> {
+    let tot = bw * bh;
+    // libjxl: size_for_ctx_model = 1024 * distance.
+    // Only create custom map for sufficiently large images where the overhead
+    // of encoding the context map is amortized.
+    if tot < 8192 {
+        return None;
+    }
+
+    // Count qf value occurrences
+    let mut qf_counts = [0usize; 256];
+    for &rq in raw_quant_map {
+        qf_counts[rq as usize] += 1;
+    }
+
+    // Find median qf to use as threshold
+    let mut cumsum = 0usize;
+    let half = tot / 2;
+    let mut median_qf = 0u32;
+    for j in 0..256 {
+        cumsum += qf_counts[j];
+        if cumsum > half {
+            median_qf = j as u32;
+            break;
+        }
+    }
+
+    // Only create custom map if there's actual variance in qf
+    let qf_min = raw_quant_map.iter().copied().min().unwrap_or(0);
+    let qf_max = raw_quant_map.iter().copied().max().unwrap_or(0);
+    if qf_min == qf_max {
+        return None; // Uniform quant field, no benefit
+    }
+
+    let qf_thresholds = vec![median_qf];
+
+    // Build context map: 3 channels * 13 orders * 2 qf segments = 78 entries.
+    // Use the default 15-context structure but split by qf for the most
+    // common orders (DCT8 = order 0). This gives better entropy separation
+    // for blocks with different quantization levels.
+    //
+    // Default context map for qf=0 (low): same as default 15-context map.
+    // For qf=1 (high): offset the Y channel contexts by num_default_y_contexts.
+    let num_orders = 13usize;
+    let num_qf_segments = 2usize;
+    let map_size = 3 * num_orders * num_qf_segments;
+
+    // Start with the default map structure (39 entries) replicated for 2 qf segments
+    const DEFAULT_CTX_MAP: [u8; 39] = [
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
+        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+    ];
+    // Y uses contexts 0-6 (7 unique), X uses 7-14 (8 unique), B same as X
+    // For qf split: Y-low=0-6, Y-high=7-13 (shifted by 7), X/B use shared 14-15
+    // Total: 7 (Y-low) + 7 (Y-high) + 2 (X/B shared) = 16 -- too many (max 16)
+    // Simpler: just split Y's DCT8 context (order 0) by qf.
+    // Y-order0-lowqf = 0, Y-order0-highqf = new cluster.
+    // This just adds 1 extra cluster for the most common case.
+
+    let mut context_map = vec![0u8; map_size];
+    let mut max_ctx = 0u8;
+
+    for ch_remap in 0..3usize {
+        for order in 0..num_orders {
+            for qf_seg in 0..num_qf_segments {
+                let flat_idx = ch_remap * num_orders + order;
+                let base_ctx = DEFAULT_CTX_MAP[flat_idx.min(38)];
+                let ctx = if ch_remap == 1 && order == 0 && qf_seg == 1 {
+                    // Y channel, DCT8, high quant -> new context = 15
+                    15
+                } else {
+                    base_ctx
+                };
+                let out_idx = ch_remap * num_orders * num_qf_segments
+                    + order * num_qf_segments + qf_seg;
+                if out_idx < map_size {
+                    context_map[out_idx] = ctx;
+                    if ctx > max_ctx { max_ctx = ctx; }
+                }
+            }
+        }
+    }
+
+    let num_contexts = max_ctx as usize + 1;
+    if num_contexts > 16 {
+        return None; // Can't exceed 16 contexts
+    }
+
+    Some(CustomBlockCtx {
+        qf_thresholds,
+        context_map,
+        num_contexts,
+    })
+}
+
+fn encode_lf_global_section(
+    global_scale: u32,
+    quant_lf: u32,
+    block_ctx: Option<&CustomBlockCtx>,
+) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     // LfQuantFactors: all_default = true
     w.write(1, 1)?;
     // QuantizerParams
     write_u32(&mut w, &global_scale_coder(), global_scale)?;
     write_u32(&mut w, &quant_lf_coder(), quant_lf)?;
-    // BlockContextMap: all_default = true
-    w.write(1, 1)?;
+
+    if let Some(ctx) = block_ctx {
+        // BlockContextMap: all_default = false
+        w.write(1, 0)?;
+
+        // lf_thresholds: 3 channels, each with 0 thresholds
+        for _ in 0..3 {
+            w.write(4, 0)?; // num_lf_thresholds = 0
+        }
+
+        // qf_thresholds
+        let num_qf = ctx.qf_thresholds.len();
+        w.write(4, num_qf as u64)?;
+        for &t in &ctx.qf_thresholds {
+            // Encode threshold value: t is 1-based (threshold = t)
+            // Val = t - 1 (since we read +1 in decoder)
+            let val = t.saturating_sub(1) as u64;
+            if val < 4 {
+                w.write(2, 0)?; // tag 0
+                w.write(2, val)?;
+            } else if val < 12 {
+                w.write(2, 1)?; // tag 1
+                w.write(3, val - 4)?;
+            } else if val < 44 {
+                w.write(2, 2)?; // tag 2
+                w.write(5, val - 12)?;
+            } else {
+                w.write(2, 3)?; // tag 3
+                w.write(8, val - 44)?;
+            }
+        }
+
+        // Context map
+        write_context_map(&mut w, &ctx.context_map)?;
+    } else {
+        // BlockContextMap: all_default = true
+        w.write(1, 1)?;
+    }
+
     // ColorCorrelationParams: all_default = true
     w.write(1, 1)?;
     // Global tree: not present
@@ -6649,7 +6840,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -6703,7 +6894,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -6757,7 +6948,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -6810,7 +7001,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -6863,7 +7054,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -6916,7 +7107,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -6969,7 +7160,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7022,7 +7213,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7081,7 +7272,7 @@ mod tests {
             .unwrap();
 
             let tokens =
-                tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                     .unwrap();
             assert!(tokens.iter().any(|t| t.value > 0));
         }
@@ -7282,7 +7473,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7341,7 +7532,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7400,7 +7591,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7462,7 +7653,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7524,7 +7715,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7586,7 +7777,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7648,7 +7839,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7710,7 +7901,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7772,7 +7963,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7834,7 +8025,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7896,7 +8087,7 @@ mod tests {
         .unwrap();
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7932,7 +8123,7 @@ mod tests {
         }
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -7968,7 +8159,7 @@ mod tests {
         }
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
@@ -8004,7 +8195,7 @@ mod tests {
         }
 
         let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
                 .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
