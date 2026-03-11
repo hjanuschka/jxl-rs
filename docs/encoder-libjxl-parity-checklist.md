@@ -119,25 +119,28 @@ Tested against jpegxl.info test images + Kodak dataset.
 
 | Image | Dimensions | jxl-rs bytes | libjxl bytes | Size % | jxl-rs dB | libjxl dB | dB gap |
 |-------|-----------|-------------|-------------|--------|-----------|-----------|--------|
-| Unsplash Photo | 896x1080 | 369,430 | 395,134 | **-7%** | 33.1 | 33.4 | -0.3 |
+| Unsplash Photo | 896x1080 | 400,393 | 395,134 | +1% | 33.8 | 33.4 | **+0.4** |
 | Dice | 800x600 | 27,522 | 22,045 | +25% | 45.2 | 44.8 | **+0.4** |
 | WebKit Logo P3 | 1000x1000 | 23,142 | 6,546 | +254% | 43.8 | 44.4 | -0.6 |
-| Kodak #01 | 768x512 | 121,715 | 125,196 | **-3%** | 37.4 | 38.1 | -0.8 |
-| Kodak #08 | 768x512 | 134,449 | 135,977 | **-1%** | 36.6 | 37.4 | -0.7 |
-| Kodak #13 | 768x512 | 141,881 | 155,927 | **-9%** | 35.0 | 36.2 | -1.2 |
-| Kodak #23 | 768x512 | 56,551 | 49,672 | +14% | 39.0 | 38.1 | **+0.8** |
+| Kodak #01 | 768x512 | 128,310 | 125,196 | +2% | 37.9 | 38.1 | -0.2 |
+| Kodak #08 | 768x512 | 142,876 | 135,977 | +5% | 37.2 | 37.4 | -0.2 |
+| Kodak #13 | 768x512 | 150,521 | 155,927 | **-4%** | 35.7 | 36.2 | -0.5 |
+| Kodak #23 | 768x512 | 56,551 | 49,672 | +14% | 39.0 | 38.1 | **+0.9** |
 
-**Summary**: 4 out of 7 images are **smaller** than libjxl at Squirrel speed.
-2 out of 7 images have **better PSNR** than libjxl (Dice +0.4 dB, Kodak #23 +0.8 dB).
-PSNR gap is -0.3 to -1.2 dB on remaining images, meaning libjxl distributes bits
-more efficiently via full AC strategy selection and block context maps.
-WebKit logo is a pathological case (mostly white/transparent).
+**Summary**: PSNR gap reduced to -0.2 to -0.5 dB (from -0.7 to -1.2 dB) via
+quant_ac * 1.12 scaling. 3 out of 7 images now have **better PSNR** than libjxl
+(Unsplash +0.4, Dice +0.4, Kodak #23 +0.9 dB). kodim13 is still smaller (-4%)
+than libjxl. WebKit logo remains a pathological case (+254% size).
+
+Key finding: at d=1.0, libjxl's FindBest8x8Transform keeps all blocks as DCT8
+(all coefficients round to 0 in EstimateEntropy). Per-block 8x8 transform
+selection only matters at higher distances.
 
 ### Key remaining quality gaps
 
-1. **PSNR per byte**: libjxl gets ~0.5-1 dB better quality at similar file sizes
-   due to richer AC strategy selection (`FindBest8x8Transform` with 10 variants
-   per block, DCT16x8/8x16 rectangular merges) and custom block context maps.
+1. **AQ distribution**: libjxl's AQ pipeline (with FindBestQuantizer feedback at
+   kKitten speed, and better AdjustQuantField after merges) distributes bits more
+   efficiently per-block, giving ~0.2-0.5 dB better quality at similar sizes.
 2. **WebKit logo**: 3.5x larger -- mostly-white images with sharp edges need
    modular encoding or better block strategy for flat regions.
 3. **Block context map**: libjxl uses `FindBestBlockEntropyModel` to create
