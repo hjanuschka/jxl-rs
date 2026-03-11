@@ -2556,7 +2556,18 @@ fn quantize_ac(ac_float: f32, global_scale: u32, raw_quant: u32, dequant_weight:
         return 0;
     }
     let scale = (global_scale as f32 * raw_quant as f32) / ((1u32 << 16) as f32 * dequant_weight);
-    (ac_float * scale).round() as i32
+    let scaled = ac_float * scale;
+    // Dead-zone quantization: values in [-0.5-dz, 0.5+dz) map to 0.
+    // A dead-zone of ~0.46 biases small coefficients toward zero,
+    // reducing the number of non-zero coefficients and improving entropy.
+    // This matches libjxl's approach (which has a slight bias toward zero).
+    const DEAD_ZONE: f32 = 0.25;
+    let abs_scaled = scaled.abs();
+    if abs_scaled < 0.5 + DEAD_ZONE {
+        0
+    } else {
+        scaled.round() as i32
+    }
 }
 
 /// Build the complete VarDCT frame bitstream.
@@ -4319,30 +4330,32 @@ fn write_ac_histograms_and_tokens(
         context_counts[token.context] += 1;
     }
 
-    for &uint_config in &uint_configs_to_try {
-        // Encode all values through HybridUint to get symbols + extra bits.
-        let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
+    // Build context map candidates once using the base uint_config.
+    let base_uint = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
+    let base_encoded: Vec<_> = tokens.iter().map(|t| base_uint.encode(t.value)).collect();
+    let base_alphabet = (base_encoded.iter().map(|e| e.token).max().unwrap_or(0) as usize + 1).max(1);
 
-        let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
-        let alphabet_size = (max_token as usize + 1).max(1);
-
-        // Build context map candidates: preset heuristics + data-driven greedy clustering.
-        let mut context_map_candidates =
-            build_ac_context_map_candidates(num_ac_contexts, &context_counts);
-        for max_c in [2, 4, 8, 16, 32] {
-            if max_c <= num_ac_contexts {
-                let greedy_map = build_greedy_clustered_context_map(
-                    num_ac_contexts,
-                    alphabet_size,
-                    tokens,
-                    &encoded,
-                    max_c,
-                );
-                if !context_map_candidates.iter().any(|m| *m == greedy_map) {
-                    context_map_candidates.push(greedy_map);
-                }
+    let mut context_map_candidates =
+        build_ac_context_map_candidates(num_ac_contexts, &context_counts);
+    for max_c in [2, 4, 8, 16, 32] {
+        if max_c <= num_ac_contexts {
+            let greedy_map = build_greedy_clustered_context_map(
+                num_ac_contexts,
+                base_alphabet,
+                tokens,
+                &base_encoded,
+                max_c,
+            );
+            if !context_map_candidates.iter().any(|m| *m == greedy_map) {
+                context_map_candidates.push(greedy_map);
             }
         }
+    }
+
+    for &uint_config in &uint_configs_to_try {
+        let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
+        let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
+        let alphabet_size = (max_token as usize + 1).max(1);
 
         for context_map in &context_map_candidates {
             let cluster_frequencies =
