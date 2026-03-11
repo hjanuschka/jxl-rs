@@ -84,22 +84,86 @@ fn write_token_stream(writer: &mut BitWriter, stream: &TokenStream) -> Result<()
 ///   5. multiplier_bits (context 5) = 0
 ///
 /// Context 0 (split_val) is never read for leaf nodes.
+/// Build a single-leaf tree with the given offset and predictor.
 fn build_tree_token_stream(offset: i32, predictor: u32) -> Result<TokenStream> {
-    if predictor > 13 {
-        return Err(Error::InvalidPredictor(predictor));
+    build_tree_token_stream_multi(&[(offset, predictor)])
+}
+
+/// Build a tree from leaf specifications.
+///
+/// If `leaves.len() == 1`, creates a single-leaf tree.
+/// If `leaves.len() > 1`, creates a channel-split tree where leaf i applies to channel i.
+/// Each leaf has (offset, predictor).
+fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<TokenStream> {
+    for &(_, predictor) in leaves {
+        if predictor > 13 {
+            return Err(Error::InvalidPredictor(predictor));
+        }
     }
 
     let tree_config = HybridUintConfig::new(15, 0, 0);
-    let offset_unsigned = pack_signed(offset);
+    let mut tree_values: Vec<u32> = Vec::new();
 
-    // Symbols in the order the decoder reads them for a single leaf.
-    let tree_values = [
-        0u32,            // property = 0 (indicates leaf)
-        predictor,       // predictor
-        offset_unsigned, // offset (unsigned via pack_signed)
-        0,               // multiplier_log = 0 (multiplier = 1)
-        0,               // multiplier_bits = 0
-    ];
+    if leaves.len() == 1 {
+        // Single leaf: property=0 (leaf marker), predictor, offset, mult_log, mult_bits
+        let (offset, predictor) = leaves[0];
+        tree_values.extend_from_slice(&[
+            0,                        // property = 0 (leaf)
+            predictor,                // predictor
+            pack_signed(offset),      // offset
+            0,                        // multiplier_log = 0
+            0,                        // multiplier_bits = 0
+        ]);
+    } else {
+        // Multi-leaf tree: split by channel property.
+        // JXL tree node format: property, splitval, left_child, right_child
+        // Property 1 = channel index (0-based in decode stream context)
+        //
+        // Tree structure for N channels:
+        //   node 0: if channel < 1 -> leaf(ch0) else node1
+        //   node 1: if channel < 2 -> leaf(ch1) else node2/leaf(ch>=2)
+        //   ...
+        //
+        // Encoding: DFS pre-order. Each node writes:
+        //   property (non-zero = split), splitval, then left subtree, then right subtree.
+        // Each leaf writes: 0 (property=leaf), predictor, offset, mult_log, mult_bits.
+        //
+        // The property for "channel" in the decoder is property index 1 (0-indexed).
+        // But the encoding uses property + 1 as the packed token.
+        // Actually, in the JXL spec the tree is encoded as:
+        //   read property (0 = leaf, >0 = decision node with property = val-1)
+        //   if property > 0: read splitval, then encode left child, then right child
+        //   if property == 0: read predictor, offset, mult_log, mult_bits
+
+        for i in 0..leaves.len() {
+            if i == leaves.len() - 1 {
+                // Last leaf
+                let (offset, predictor) = leaves[i];
+                tree_values.push(0);  // leaf
+                tree_values.push(predictor);
+                tree_values.push(pack_signed(offset));
+                tree_values.push(0);  // multiplier_log
+                tree_values.push(0);  // multiplier_bits
+            } else {
+                // Decision node: split on channel < (i+1)
+                // property index for "channel" = 0 in the WP predictor properties list
+                // In the encoded tree, property value = (actual_property_index + 1)
+                // Channel is property 0 in JXL modular, so encoded as 1
+                tree_values.push(1);                    // property = channel (0+1=1)
+                tree_values.push(pack_signed(i as i32)); // splitval = i (channel < i+1 means channel == i)
+
+                // Left child is the leaf for channel i
+                let (offset, predictor) = leaves[i];
+                tree_values.push(0);  // leaf
+                tree_values.push(predictor);
+                tree_values.push(pack_signed(offset));
+                tree_values.push(0);  // multiplier_log
+                tree_values.push(0);  // multiplier_bits
+
+                // Right child continues to next iteration
+            }
+        }
+    }
 
     let mut max_token = 0u32;
     let mut tokens = Vec::with_capacity(tree_values.len());
