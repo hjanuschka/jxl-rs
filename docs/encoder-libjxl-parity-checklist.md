@@ -76,8 +76,9 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[x]` **Loss term infrastructure** (dead code, for future activation):
   `estimate_transform_entropy_full()` with full libjxl `EstimateEntropy` port,
   `inverse_transform_error()` for DCT-to-pixel error, `compute_masking_1x1()`
-  for perceptual masking. Currently inactive due to forward transform
-  normalization differences making quantization errors near-zero.
+  for perceptual masking, `inverse_transform_8x8_all_channels()` for pixel-domain
+  loss measurement. Currently inactive due to forward transform normalization
+  differences making quantization errors near-zero in the L8 norm loss term.
 - `[x]` Conservative small-special candidate generation (`DCT4X8`/`DCT8X4`,
   `IDENTITY`/`DCT2X2`/`DCT4X4`, mixed special maps) and sparse AFV candidates
   for high-distance modes, all gated by exact-byte winner selection.
@@ -219,10 +220,12 @@ Includes all 7 test images with side-by-side jxl-rs vs libjxl decoded output.
 
 - [x] E01 Forward lossy color pipeline (sRGB -> XYB).
 - [~] E02 Block strategy selection and transform dispatch.
-  - Done: DCT16 + DCT32 entropy-based merging (hierarchical), special-transform
-    candidates, AFV candidates, proper separable forward DCT-N.
-  - Remaining: full `ProcessRectACS` entropy estimation, DCT16x8/8x16 merging,
-    `FindBest8x8Transform` (10 variants), `FindBestFirstLevelDivisionForSquare`.
+  - Done: Quality-first DCT16 + DCT32 entropy-based merging (hierarchical),
+    special-transform candidates, AFV candidates, proper separable forward DCT-N,
+    loss term infrastructure for future per-block selection.
+  - Remaining: `FindBest8x8Transform` per-block selection (requires working
+    perceptual loss term -- entropy-only selection destroys quality),
+    DCT16x8/8x16 merging, `FindBestFirstLevelDivisionForSquare`.
 - [x] E03 Quant field generation pipeline (full libjxl Squirrel-speed AQ port).
 - [x] E04 LF/HF coefficient tokenization and entropy coding.
 - [~] E05 Quality tuning heuristics and effort tiers.
