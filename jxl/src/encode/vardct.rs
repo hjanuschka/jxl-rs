@@ -344,18 +344,16 @@ pub fn encode_vardct_u8_rgb_codestream(
     // For encoding: in_y = dc_y, in_x = dc_x, in_b = dc_b - dc_y
     // The channels in dct arrays are in XYB order.
 
-    let raw_quant_map_candidates = build_adaptive_raw_quant_map_candidates(
-        &dct_x,
-        &dct_y,
-        &dct_b,
-        &y_chan,
-        width,
-        height,
-        bw,
-        bh,
-        config.distance,
-        base_raw_quant,
+    // Adaptive quantization: libjxl-ported pipeline using all 3 XYB channels.
+    let quant_ac = 0.79f32 / config.distance;
+    let adaptive_map = build_adaptive_raw_quant_map_full(
+        &x_chan, &y_chan, &b_chan,
+        width, height, bw, bh, config.distance, quant_ac,
     );
+    let raw_quant_map_candidates = vec![
+        vec![base_raw_quant; bw * bh], // uniform candidate
+        adaptive_map,                   // libjxl-style adaptive candidate
+    ];
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
@@ -661,255 +659,371 @@ fn quantize_vardct_blocks(
     }
 }
 
-fn build_adaptive_raw_quant_map(
-    dct_x: &[f32],
-    dct_y: &[f32],
-    dct_b: &[f32],
-    xyb_y: &[f32],
-    img_w: usize,
-    img_h: usize,
-    bw: usize,
-    bh: usize,
-    distance: f32,
-    base_quant: u8,
-) -> Vec<u8> {
-    build_adaptive_raw_quant_map_with_profile(
-        dct_x, dct_y, dct_b, xyb_y, img_w, img_h, bw, bh, distance, base_quant, 0.0, true,
-    )
+// ==================== libjxl adaptive quantization port ====================
+// Direct port of enc_adaptive_quantization.cc: AdaptiveQuantizationMap +
+// PerBlockModulations pipeline. All constants and math from libjxl.
+
+/// SimpleGamma constants from libjxl.
+const K_SG_MUL: f32 = 226.77216153508914;
+const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
+const K_INV_LOG2E: f32 = 1.0 / std::f32::consts::LOG2_E;
+const K_SG_RET_MUL: f32 = K_SG_MUL2 * 18.6580932135 * K_INV_LOG2E;
+const K_SG_V_OFFSET: f32 = 7.7825991679894591;
+
+/// Ratio of derivatives of cubic root to SimpleGamma.
+/// Maps opsin space to psychovisual space for masking computations.
+fn ratio_of_derivatives(v: f32, invert: bool) -> f32 {
+    let v = v.max(0.0);
+    let k_epsilon = 1e-2f32;
+    let k_num_mul = K_SG_RET_MUL * 3.0 * K_SG_MUL;
+    let k_v_offset = K_SG_V_OFFSET * K_INV_LOG2E + k_epsilon;
+    let k_den_mul = K_INV_LOG2E * K_SG_MUL;
+
+    let v2 = v * v;
+    let num = k_num_mul * v2 + k_epsilon;
+    let den = k_den_mul * v * v2 + k_v_offset;
+    if invert { den / num } else { num / den }
 }
 
-fn build_adaptive_raw_quant_map_with_profile(
-    _dct_x: &[f32],
-    _dct_y: &[f32],
-    _dct_b: &[f32],
-    xyb_y: &[f32],
-    img_w: usize,
-    img_h: usize,
-    bw: usize,
-    bh: usize,
-    distance: f32,
-    base_quant: u8,
-    percentile_shift: f32,
-    regularize: bool,
-) -> Vec<u8> {
-    let num_blocks = bw * bh;
-    let mut raw_quant_map = vec![base_quant; num_blocks];
+/// MaskingSqrt from libjxl.
+fn masking_sqrt(v: f32) -> f32 {
+    const K_LOG_OFFSET: f32 = 27.505837037000106;
+    const K_MUL: f32 = 211.66567973503678;
+    let mul_v = K_MUL * 1e8;
+    0.25 * (v * mul_v.sqrt() + K_LOG_OFFSET).sqrt()
+}
 
-    // Preserve high-quality behavior and avoid overhead on tiny images.
-    if distance < 1.0 || num_blocks < 64 {
-        return raw_quant_map;
+/// ComputeMask from libjxl: maps aq_map values to masking multipliers.
+fn compute_mask(out_val: f32) -> f32 {
+    const K_BASE: f32 = -0.7647;
+    const K_MUL4: f32 = 9.4708735624378946;
+    const K_MUL2: f32 = 17.35036561631863;
+    const K_OFFSET2: f32 = 302.59587815579727;
+    const K_MUL3: f32 = 6.7943250517376494;
+    const K_OFFSET3: f32 = 3.7179635626140772;
+    const K_OFFSET4: f32 = 0.25 * K_OFFSET3;
+    const K_MUL0: f32 = 0.80061762862741759;
+
+    let v1 = (out_val * K_MUL0).max(1e-3);
+    let v2 = 1.0 / (v1 + K_OFFSET2);
+    let v3 = 1.0 / (v1 * v1 + K_OFFSET3);
+    let v4 = 1.0 / (v1 * v1 + K_OFFSET4);
+    K_BASE + K_MUL4 * v4 + K_MUL2 * v2 + K_MUL3 * v3
+}
+
+/// Fast log2 approximation matching libjxl's FastLog2f.
+fn fast_log2f(v: f32) -> f32 {
+    v.max(1e-30).log2()
+}
+
+/// GammaModulation from libjxl: adjusts mask based on opsin gamma.
+fn gamma_modulation(
+    bx: usize, by: usize,
+    xyb_x: &[f32], xyb_y: &[f32],
+    img_w: usize, img_h: usize,
+) -> f32 {
+    const K_BIAS: f32 = 0.16;
+    let mut overall_ratio = 0.0f32;
+    for dy in 0..8usize {
+        let py = (by * 8 + dy).min(img_h - 1);
+        for dx in 0..8usize {
+            let px = (bx * 8 + dx).min(img_w - 1);
+            let iny = xyb_y[py * img_w + px] + K_BIAS;
+            let inx = xyb_x[py * img_w + px];
+            let r = iny - inx;
+            overall_ratio += ratio_of_derivatives(r, true);
+            let g = iny + inx;
+            overall_ratio += ratio_of_derivatives(g, true);
+        }
     }
+    overall_ratio *= 0.5 / 64.0;
+    const K_GAMMA: f32 = 0.1005613337192697;
+    K_GAMMA * fast_log2f(overall_ratio)
+}
 
-    // Pixel-domain HF activity measure, inspired by libjxl's HfModulation.
-    // Sum of clamped 4-connected pixel differences in Y channel per 8x8 block.
-    // High sum = edges/texture = visually important = needs LOWER raw_quant.
-    // Low sum = smooth area = can tolerate HIGHER raw_quant.
-    let mut activity = vec![0.0f32; num_blocks];
-    let val_clamp = 0.0206f32; // libjxl's valmin_y: clamp large diffs
-    for by in 0..bh {
-        for bx in 0..bw {
-            let mut sum = 0.0f32;
-            for dy in 0..8u32 {
-                for dx in 0..8u32 {
-                    let py = (by * 8 + dy as usize).min(img_h - 1);
-                    let px = (bx * 8 + dx as usize).min(img_w - 1);
-                    let v = xyb_y[py * img_w + px];
-                    // Right neighbor
-                    if dx < 7 {
-                        let px2 = (bx * 8 + dx as usize + 1).min(img_w - 1);
-                        sum += (v - xyb_y[py * img_w + px2]).abs().min(val_clamp);
-                    }
-                    // Bottom neighbor
-                    if dy < 7 {
-                        let py2 = (by * 8 + dy as usize + 1).min(img_h - 1);
-                        sum += (v - xyb_y[py2 * img_w + px]).abs().min(val_clamp);
-                    }
+/// HfModulation from libjxl: per-block HF activity from pixel gradients.
+fn hf_modulation(
+    bx: usize, by: usize,
+    xyb_y: &[f32], img_w: usize, img_h: usize,
+) -> f32 {
+    const VAL_CLAMP: f32 = 0.0206;
+    let mut sum_y = 0.0f32;
+    for dy in 0..8usize {
+        let py = (by * 8 + dy).min(img_h - 1);
+        let py_next = if dy < 7 { (by * 8 + dy + 1).min(img_h - 1) } else { py };
+        for dx in 0..8usize {
+            let px = (bx * 8 + dx).min(img_w - 1);
+            let v = xyb_y[py * img_w + px];
+            // Right neighbor (skip last col)
+            if dx < 7 {
+                let px2 = (bx * 8 + dx + 1).min(img_w - 1);
+                sum_y += (v - xyb_y[py * img_w + px2]).abs().min(VAL_CLAMP);
+            }
+            // Bottom neighbor
+            sum_y += (v - xyb_y[py_next * img_w + px]).abs().min(VAL_CLAMP);
+        }
+    }
+    const K_MUL_Y: f32 = -0.38;
+    const K_OFFSET: f32 = 0.42;
+    sum_y * K_MUL_Y + K_OFFSET
+}
+
+/// BlueModulation from libjxl: boosts quality for blue-dominant blocks.
+fn blue_modulation(
+    bx: usize, by: usize,
+    xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
+    img_w: usize, img_h: usize,
+) -> f32 {
+    const K_LIMIT: f32 = 0.010474084867598155;
+    const K_OFFSET: f32 = 0.0031994768654636393;
+    let mut sum = 0.0f32;
+    for dy in 0..8usize {
+        let py = (by * 8 + dy).min(img_h - 1);
+        for dx in 0..8usize {
+            let px = (bx * 8 + dx).min(img_w - 1);
+            let idx = py * img_w + px;
+            let p_x = xyb_x[idx];
+            let p_b = xyb_b[idx];
+            let p_y_raw = xyb_y[idx] + K_OFFSET;
+            let p_y_effective = p_y_raw + p_x.abs();
+            if p_b > p_y_effective {
+                sum += (p_b - p_y_effective).min(K_LIMIT);
+            }
+        }
+    }
+    // If all blue, don't boost
+    if sum >= 32.0 * K_LIMIT {
+        sum = 64.0 * K_LIMIT - sum;
+    }
+    const K_MAX_LIMIT: f32 = 15.463398341612438;
+    if sum >= K_MAX_LIMIT * K_LIMIT {
+        sum = K_MAX_LIMIT * K_LIMIT;
+    }
+    const K_MUL: f32 = 0.90590804735610064;
+    sum * K_MUL
+}
+
+/// Compute per-pixel Laplacian-based diff in Y channel, squared, clamped,
+/// then MaskingSqrt'd, downsampled 4x, and FuzzyErosion'd to get per-block
+/// aq_map values. Direct port of libjxl ComputeTile.
+fn compute_aq_map(
+    xyb_y: &[f32], img_w: usize, img_h: usize,
+    bw: usize, bh: usize, distance: f32,
+) -> Vec<f32> {
+    let pw = bw * 8; // padded width (block-aligned)
+    let ph = bh * 8;
+    const MATCH_GAMMA_OFFSET: f32 = 0.019;
+    const LIMIT: f32 = 0.2;
+
+    // Step 1: Per-pixel Laplacian diff -> squared -> clamped -> MaskingSqrt
+    // libjxl accumulates 4 rows into row_out, then averages groups of 4 columns.
+    // This gives a 4x downsampled image (ds_w x ds_h) = (bw*2 x bh*2).
+    let ds_w = pw / 4;
+    let ds_h = ph / 4;
+    let mut pre_erosion = vec![0.0f32; ds_w * ds_h];
+    let mut row_buf = vec![0.0f32; pw]; // accumulator for 4 rows
+
+    let get_y = |x: usize, y: usize| -> f32 {
+        let cx = x.min(img_w - 1);
+        let cy = y.min(img_h - 1);
+        xyb_y[cy * img_w + cx]
+    };
+
+    for y in 0..ph {
+        for x in 0..pw {
+            let x1 = if x > 0 { x - 1 } else { x };
+            let x2 = if x + 1 < pw { x + 1 } else { x };
+            let y1 = if y > 0 { y - 1 } else { y };
+            let y2 = if y + 1 < ph { y + 1 } else { y };
+
+            let center = get_y(x, y);
+            let base = 0.25 * (get_y(x2, y) + get_y(x1, y) + get_y(x, y1) + get_y(x, y2));
+            let gammac = ratio_of_derivatives(center + MATCH_GAMMA_OFFSET, false);
+            let mut diff = gammac * (center - base);
+            diff *= diff;
+            diff = diff.min(LIMIT);
+            diff = masking_sqrt(diff);
+
+            if y % 4 != 0 {
+                row_buf[x] += diff;
+            } else {
+                row_buf[x] = diff;
+            }
+        }
+        // At end of each 4-row group, downsample columns by averaging groups of 4
+        if y % 4 == 3 {
+            let dy = y / 4;
+            if dy < ds_h {
+                for qx in 0..ds_w {
+                    let avg = (row_buf[qx * 4] + row_buf[qx * 4 + 1]
+                             + row_buf[qx * 4 + 2] + row_buf[qx * 4 + 3]) * 0.25;
+                    pre_erosion[dy * ds_w + qx] = avg;
                 }
             }
-            activity[by * bw + bx] = sum;
         }
     }
 
-    // Light spatial smoothing to reduce map entropy.
-    let mut smoothed = vec![0.0f32; num_blocks];
+    // Step 2: FuzzyErosion - 3x3 min-4-of-9 weighted, downsampled 2x -> per-block
+    // pre_erosion is (ds_w x ds_h) = (bw*2 x bh*2), output is (bw x bh)
+    let pe_w = ds_w;
+    let pe_h = ds_h;
+
+    // FuzzyErosion weights from libjxl
+    let mut k_mul_base = [0.125f32, 0.1, 0.09, 0.06];
+    let k_mul_add = [0.0f32, -0.1, -0.09, -0.06];
+    let mul = if distance < 2.0 { (2.0 - distance) * 0.5 } else { 0.0 };
+    let mut norm_sum = 0.0f32;
+    for i in 0..4 {
+        k_mul_base[i] += mul * k_mul_add[i];
+        norm_sum += k_mul_base[i];
+    }
+    const K_TOTAL: f32 = 0.29959705784054957;
+    let k_mul: [f32; 4] = [
+        k_mul_base[0] * K_TOTAL / norm_sum,
+        k_mul_base[1] * K_TOTAL / norm_sum,
+        k_mul_base[2] * K_TOTAL / norm_sum,
+        k_mul_base[3] * K_TOTAL / norm_sum,
+    ];
+
+    let mut aq_map = vec![0.0f32; bw * bh];
+    let pe_get = |x: usize, y: usize| -> f32 {
+        pre_erosion[y.min(pe_h - 1) * pe_w + x.min(pe_w - 1)]
+    };
+
+    for fy in 0..pe_h.min(bh * 2) {
+        for fx in 0..pe_w.min(bw * 2) {
+            let x = fx;
+            let y = fy;
+            let xm1 = if x > 0 { x - 1 } else { x };
+            let xp1 = if x + 1 < pe_w { x + 1 } else { x };
+            let ym1 = if y > 0 { y - 1 } else { y };
+            let yp1 = if y + 1 < pe_h { y + 1 } else { y };
+
+            // Collect all 9 neighbors
+            let mut vals = [
+                pe_get(x, y), pe_get(xm1, y), pe_get(xp1, y),
+                pe_get(xm1, ym1), pe_get(x, ym1), pe_get(xp1, ym1),
+                pe_get(xm1, yp1), pe_get(x, yp1), pe_get(xp1, yp1),
+            ];
+            // Sort to find 4 smallest
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let v = k_mul[0] * vals[0] + k_mul[1] * vals[1] +
+                    k_mul[2] * vals[2] + k_mul[3] * vals[3];
+
+            let bx = fx / 2;
+            let by = fy / 2;
+            if bx < bw && by < bh {
+                if fx % 2 == 0 && fy % 2 == 0 {
+                    aq_map[by * bw + bx] = v;
+                } else {
+                    aq_map[by * bw + bx] += v;
+                }
+            }
+        }
+    }
+
+    aq_map
+}
+
+/// Apply PerBlockModulations from libjxl: ComputeMask + GammaModulation +
+/// HfModulation + BlueModulation, then exp2 scaling.
+fn apply_per_block_modulations(
+    aq_map: &mut [f32],
+    xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
+    img_w: usize, img_h: usize,
+    bw: usize, bh: usize,
+    distance: f32, scale: f32,
+) {
+    let base_level = 0.48 * scale;
+    let dampen = if distance >= 2.0 {
+        let d = 1.0 - (distance - 2.0) / 12.0;
+        d.max(0.0)
+    } else {
+        1.0
+    };
+    let mul = scale * dampen;
+    let add = (1.0 - dampen) * base_level;
+
     for by in 0..bh {
         for bx in 0..bw {
             let idx = by * bw + bx;
-            let mut acc = activity[idx] * 2.0;
-            let mut w = 2.0;
-            if bx > 0 {
-                acc += activity[idx - 1];
-                w += 1.0;
-            }
-            if bx + 1 < bw {
-                acc += activity[idx + 1];
-                w += 1.0;
-            }
-            if by > 0 {
-                acc += activity[idx - bw];
-                w += 1.0;
-            }
-            if by + 1 < bh {
-                acc += activity[idx + bw];
-                w += 1.0;
-            }
-            smoothed[idx] = acc / w;
+            let mut out_val = compute_mask(aq_map[idx]);
+            out_val = gamma_modulation(bx, by, xyb_x, xyb_y, img_w, img_h) + out_val;
+            let hf_val = hf_modulation(bx, by, xyb_y, img_w, img_h) + out_val;
+            let blue_val = blue_modulation(bx, by, xyb_x, xyb_y, xyb_b, img_w, img_h) + out_val;
+            out_val = hf_val.min(blue_val);
+            // exp2(out_val * log2(e)^-1 * log2(e)) = exp2(out_val * 1.442695...)
+            aq_map[idx] = (out_val * std::f32::consts::LOG2_E).exp2() * mul + add;
         }
     }
+}
 
-    // Continuous quantization modulation based on activity.
-    // Maps activity to a multiplier: low activity -> higher quant (coarser),
-    // high activity -> lower quant (finer, preserving detail).
-    //
-    // Inspired by libjxl's PerBlockModulations: the quant field is a
-    // multiplicative modulation of the base quant, with the modulation
-    // strength damped at high distances (where all blocks are coarse anyway).
-    let mut sorted = smoothed.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p10 = sorted[(sorted.len() as f32 * (0.10 + percentile_shift).clamp(0.01, 0.99)) as usize];
-    let p90 = sorted[(sorted.len() as f32 * (0.90 + percentile_shift).clamp(0.01, 0.99)) as usize];
-    let range = (p90 - p10).max(1e-6);
+/// Build the adaptive raw_quant map using libjxl's full adaptive quantization pipeline.
+/// Takes XYB pixel channels + distance, returns per-block raw_quant values.
+fn build_adaptive_raw_quant_map(
+    _dct_x: &[f32], _dct_y: &[f32], _dct_b: &[f32],
+    xyb_y: &[f32], img_w: usize, img_h: usize,
+    bw: usize, bh: usize, distance: f32, base_quant: u8,
+) -> Vec<u8> {
+    let num_blocks = bw * bh;
+    if distance < 1.0 || num_blocks < 64 {
+        return vec![base_quant; num_blocks];
+    }
+    // We need all 3 XYB channels for the full pipeline
+    // but only xyb_y is passed. Use base_quant as fallback for the simple path.
+    vec![base_quant; num_blocks]
+}
 
-    // Dampen modulation at high distances (libjxl: ramp from 2.0 to 14.0)
-    let dampen = if distance < 2.0 {
-        1.0f32
-    } else if distance < 14.0 {
-        1.0 - (distance - 2.0) / 12.0
-    } else {
-        0.0
-    };
-
-    // Modulation range: how many raw_quant steps from base.
-    // Wider range lets smooth areas save significantly more bytes while
-    // preserving detail in textured/edge areas with finer quantization.
-    let max_mod = if distance < 1.5 { 4.0f32 } else if distance < 2.5 { 5.0 } else { 6.0 };
-    let mod_range = max_mod * dampen;
-
-    let bq = base_quant as f32;
-    for (idx, &a) in smoothed.iter().enumerate() {
-        // Normalize activity to [0, 1] (0=smooth, 1=textured)
-        let t = ((a - p10) / range).clamp(0.0, 1.0);
-        // Map: smooth (t=0) -> +mod_range (coarser), textured (t=1) -> -mod_range (finer)
-        let offset = mod_range * (1.0 - 2.0 * t);
-        raw_quant_map[idx] = (bq + offset).round().clamp(1.0, 255.0) as u8;
+/// Full adaptive quant requiring all 3 XYB channels.
+fn build_adaptive_raw_quant_map_full(
+    xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
+    img_w: usize, img_h: usize,
+    bw: usize, bh: usize, distance: f32,
+    quant_ac: f32,
+) -> Vec<u8> {
+    let num_blocks = bw * bh;
+    if distance < 1.0 || num_blocks < 64 {
+        // At very low distance, use uniform quant
+        let base = (quant_ac * (65536.0 / (distance_to_full_quant_params(distance).0 as f32)) + 0.5)
+            .clamp(1.0, 255.0) as u8;
+        return vec![base; num_blocks];
     }
 
-    if regularize {
-        // One regularization pass: gently favor locally dominant raw_quant values.
-        let prev = raw_quant_map.clone();
-        for by in 0..bh {
-            for bx in 0..bw {
-                let idx = by * bw + bx;
-                let mut hist = [0u8; 256];
-                let mut add = |q: u8| hist[q as usize] = hist[q as usize].saturating_add(1);
+    // Step 1: Compute initial aq_map from Y-channel Laplacian masking
+    let mut aq_map = compute_aq_map(xyb_y, img_w, img_h, bw, bh, distance);
 
-                add(prev[idx]);
-                if bx > 0 {
-                    add(prev[idx - 1]);
-                }
-                if bx + 1 < bw {
-                    add(prev[idx + 1]);
-                }
-                if by > 0 {
-                    add(prev[idx - bw]);
-                }
-                if by + 1 < bh {
-                    add(prev[idx + bw]);
-                }
+    // Step 2: Apply per-block modulations (ComputeMask + Gamma + HF + Blue)
+    let scale = quant_ac;
+    apply_per_block_modulations(&mut aq_map, xyb_x, xyb_y, xyb_b, img_w, img_h, bw, bh, distance, scale);
 
-                let mut best_q = prev[idx];
-                let mut best_count = hist[best_q as usize];
-                for q in 1..hist.len() {
-                    if hist[q] > best_count {
-                        best_q = q as u8;
-                        best_count = hist[q];
-                    }
-                }
-                if best_count >= 3 {
-                    raw_quant_map[idx] = best_q;
-                }
-            }
-        }
+    // Step 3: Convert float aq_map to raw_quant (integer)
+    // aq_map values are already in quant_ac units. We need to convert to
+    // raw_quant = aq_map * inv_global_scale.
+    let (global_scale, _, _) = distance_to_full_quant_params(distance);
+    let inv_global_scale = 65536.0 / global_scale as f32;
+
+    let mut raw_quant_map = Vec::with_capacity(num_blocks);
+    for &v in &aq_map {
+        let rq = (v * inv_global_scale + 0.5).clamp(1.0, 255.0) as u8;
+        raw_quant_map.push(rq);
     }
 
     raw_quant_map
 }
 
 fn build_adaptive_raw_quant_map_candidates(
-    dct_x: &[f32],
-    dct_y: &[f32],
-    dct_b: &[f32],
-    xyb_y: &[f32],
-    img_w: usize,
-    img_h: usize,
-    bw: usize,
-    bh: usize,
-    distance: f32,
-    base_quant: u8,
+    _dct_x: &[f32], _dct_y: &[f32], _dct_b: &[f32],
+    xyb_y: &[f32], img_w: usize, img_h: usize,
+    bw: usize, bh: usize, distance: f32, base_quant: u8,
 ) -> Vec<Vec<u8>> {
+    // The full pipeline returns a single optimal map -- no need for multiple candidates.
+    // We still include the uniform base_quant as a candidate for the byte-size selector.
     let num_blocks = bw * bh;
-    let mut candidates = vec![vec![base_quant; num_blocks]];
+    let uniform = vec![base_quant; num_blocks];
     if distance < 1.0 || num_blocks < 64 {
-        return candidates;
+        return vec![uniform];
     }
-
-    let profiles: &[(f32, bool)] = if num_blocks > 8192 {
-        if distance < 1.5 {
-            &[(0.0, true), (0.15, true)]
-        } else if distance < 2.5 {
-            &[(-0.05, true), (0.10, true), (0.0, false)]
-        } else {
-            &[(-0.05, true), (0.0, false)]
-        }
-    } else if distance < 1.5 {
-        &[(-0.15, true), (0.0, true), (0.15, true), (0.0, false)]
-    } else if distance < 2.5 {
-        &[
-            (-0.15, true),
-            (0.0, true),
-            (0.15, true),
-            (0.30, true),
-            (0.0, false),
-        ]
-    } else {
-        &[
-            (-0.20, true),
-            (-0.05, true),
-            (0.10, true),
-            (0.25, true),
-            (0.0, false),
-        ]
-    };
-
-    for (shift, regularize) in profiles {
-        let map = if *shift == 0.0 && *regularize {
-            build_adaptive_raw_quant_map(dct_x, dct_y, dct_b, xyb_y, img_w, img_h, bw, bh, distance, base_quant)
-        } else {
-            build_adaptive_raw_quant_map_with_profile(
-                dct_x,
-                dct_y,
-                dct_b,
-                xyb_y,
-                img_w,
-                img_h,
-                bw,
-                bh,
-                distance,
-                base_quant,
-                *shift,
-                *regularize,
-            )
-        };
-        candidates.push(map);
-    }
-
-    let mut unique = Vec::new();
-    for candidate in candidates {
-        if !unique.iter().any(|u: &Vec<u8>| *u == candidate) {
-            unique.push(candidate);
-        }
-    }
-    unique
+    vec![uniform] // placeholder -- will be replaced with full map in caller
 }
 
 fn build_default_transform_map(bw: usize, bh: usize) -> Vec<u8> {
@@ -3619,7 +3733,9 @@ fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32) 
     writer.write(1, 0)?; // epf_sharp_custom = false
     writer.write(1, 0)?; // epf_weight_custom = false
     writer.write(1, 0)?; // epf_sigma_custom = false
-    // 25. extensions = 0 (u64: selector 00)
+    // LoopFilter extensions = 0 (u64: selector 00)
+    writer.write(2, 0)?;
+    // 25. FrameHeader extensions = 0 (u64: selector 00)
     writer.write(2, 0)?;
     Ok(())
 }
@@ -4742,23 +4858,40 @@ mod tests {
 
         // Create a dummy Y pixel channel for the test
         let (img_w, img_h) = (bw * 8, bh * 8);
-        let xyb_y_dummy = vec![0.5f32; img_w * img_h];
+        // Create non-uniform XYB channels with per-pixel variation
+        let mut xyb_x = vec![0.0f32; img_w * img_h];
+        let mut xyb_y = vec![0.0f32; img_w * img_h];
+        let mut xyb_b = vec![0.0f32; img_w * img_h];
+        for y in 0..img_h {
+            for x in 0..img_w {
+                let idx = y * img_w + x;
+                // Checkerboard pattern creates high-frequency content in some blocks
+                let t = ((x + y) % 2) as f32;
+                if x < img_w / 2 {
+                    xyb_y[idx] = 0.5; // smooth region
+                } else {
+                    xyb_y[idx] = 0.3 + 0.4 * t; // textured region
+                }
+                xyb_x[idx] = 0.1 + 0.05 * t;
+                xyb_b[idx] = 0.3 + 0.1 * t;
+            }
+        }
 
-        let (_, _, base_low) = distance_to_full_quant_params(0.8);
+        let quant_ac_low = 0.79 / 0.8;
         let low_dist_map =
-            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, &xyb_y_dummy, img_w, img_h, bw, bh, 0.8, base_low);
+            build_adaptive_raw_quant_map_full(&xyb_x, &xyb_y, &xyb_b, img_w, img_h, bw, bh, 0.8, quant_ac_low);
         assert!(
-            low_dist_map.iter().all(|&q| q == base_low),
-            "distance gating should keep raw_quant=base({base_low})"
+            low_dist_map.iter().all(|&q| q == low_dist_map[0]),
+            "distance gating should keep raw_quant uniform at d<1"
         );
 
-        let (_, _, base_high) = distance_to_full_quant_params(2.0);
+        let quant_ac_high = 0.79 / 2.0;
         let high_dist_map =
-            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, &xyb_y_dummy, img_w, img_h, bw, bh, 2.0, base_high);
+            build_adaptive_raw_quant_map_full(&xyb_x, &xyb_y, &xyb_b, img_w, img_h, bw, bh, 2.0, quant_ac_high);
         assert_eq!(high_dist_map.len(), num_blocks);
         assert!(high_dist_map.iter().all(|&q| q >= 1));
         assert!(
-            high_dist_map.iter().any(|&q| q != base_high),
+            high_dist_map.iter().any(|&q| q != high_dist_map[0]),
             "expected non-uniform quant map at higher distance"
         );
     }
