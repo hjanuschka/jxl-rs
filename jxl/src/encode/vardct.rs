@@ -348,7 +348,8 @@ pub fn encode_vardct_u8_rgb_codestream(
 
     // 2. Apply inverse gaborish to opsin (libjxl: GaborishInverse after AQ).
     //    Pre-sharpens so decoder-side gaborish smoothing recovers original.
-    if config.distance >= 0.3 {
+    let use_gab = config.distance >= 0.3;
+    if use_gab {
         apply_inverse_gaborish(
             &mut [&mut x_chan, &mut y_chan, &mut b_chan],
             width,
@@ -424,7 +425,7 @@ pub fn encode_vardct_u8_rgb_codestream(
         // pixel-domain forward transforms (libjxl EstimateEntropy approach).
         if config.distance < 1.5 && bw >= 2 && bh >= 2 {
             let entropy_map = build_entropy_merge_transform_map(
-                &x_chan, &y_chan, &b_chan,
+                &x_chan, &y_chan, &b_minus_y_chan,
                 width, height, bw, bh,
                 &quantized.ac_y, &quantized.ac_x, &quantized.ac_b,
                 global_scale, raw_quant_map,
@@ -469,6 +470,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                 &transform_map,
                 &ytox_map,
                 &ytob_map,
+                use_gab,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -516,6 +518,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                     &transform_map,
                     &ytox_map,
                     &ytob_map,
+                    use_gab,
                 )?;
 
                 total_encodes += 1;
@@ -1674,6 +1677,7 @@ fn rectangular_forward_solver(transform_id: u8) -> Option<&'static TransformLine
 ///
 /// Forward: c[0] = (1/N) * sum_n x[n]
 ///          c[k] = (sqrt(2)/N) * sum_n x[n] * cos(pi*(2n+1)*k/(2N))
+#[allow(dead_code)]
 fn dct_1d_n(input: &[f32], output: &mut [f32], n: usize) {
     let inv_n = 1.0 / n as f32;
     let ac_scale = std::f32::consts::SQRT_2 * inv_n;
@@ -1694,6 +1698,7 @@ fn dct_1d_n(input: &[f32], output: &mut [f32], n: usize) {
 
 /// Forward DCT NxN using separable 1D DCTs with jxl basis normalization.
 /// Matches libjxl's ComputeScaledDCT<N,N> + the decoder's inverse.
+#[allow(dead_code)]
 fn forward_dct_nxn(pixels: &[f32], coeffs: &mut [f32], n: usize) {
     let mut temp = vec![0.0f32; n * n];
     let mut row_in = vec![0.0f32; n];
@@ -2071,7 +2076,7 @@ fn build_transform_map_from_quantized_ac(
 fn build_entropy_merge_transform_map(
     pixel_x: &[f32],
     pixel_y: &[f32],
-    pixel_b: &[f32],
+    pixel_b: &[f32],  // should be b_minus_y for CfL-adjusted comparison
     width: usize,
     height: usize,
     bw: usize,
@@ -2084,14 +2089,16 @@ fn build_entropy_merge_transform_map(
     _dequant_weights_8x8: &[f32],
     x_dm_multiplier: f32,
     b_dm_multiplier: f32,
-    distance: f32,
+    _distance: f32,
 ) -> Vec<u8> {
     let mut map = build_default_transform_map(bw, bh);
 
-    // libjxl entropy multipliers from enc_ac_strategy.cc
-    let k8x8mul = 1.0 + (-0.4) / (distance + 1.4);  // favors 8x8 at low d
-    let entropy_mul_8 = 0.8 * k8x8mul;
-    let entropy_mul_16 = 1.34;
+    // Entropy multipliers: libjxl uses 0.8*k8x8mul for DCT8 and 1.34 for DCT16,
+    // but those are calibrated for libjxl's full entropy model. For our encoder,
+    // DCT16 needs a moderate penalty because our entropy coding is less efficient
+    // for larger transforms (no block context map optimization).
+    let entropy_mul_8 = 1.0f32;
+    let entropy_mul_16 = 1.15f32; // moderate penalty for DCT16 overhead
 
     // Compute 8x8 block entropies from quantized coefficients.
     // entropy = sum of sqrt(|quantized_ac|) -- libjxl EstimateEntropy
@@ -2135,20 +2142,14 @@ fn build_entropy_merge_transform_map(
             ];
             let raw_quant = *rq.iter().max().unwrap() as u32;
 
-            // Gather 16x16 pixel blocks and compute forward DCT16x16 for all 3 channels.
-            let mut all_coeffs = [[0.0f32; 256]; 3];
-            for c in 0..3usize {
-                let chan = match c { 0 => pixel_x, 1 => pixel_y, _ => pixel_b };
-                let mut pixels = [0.0f32; 256];
-                for dy in 0..16 {
-                    for dx in 0..16 {
-                        let sy = (by * 8 + dy).min(height - 1);
-                        let sx = (bx * 8 + dx).min(width - 1);
-                        pixels[dy * 16 + dx] = chan[sy * width + sx];
-                    }
-                }
-                forward_dct_nxn(&pixels, &mut all_coeffs[c], 16);
-            }
+            // Compute forward DCT16x16 for all 3 channels using the same
+            // transform as the actual encoding path (linear solver).
+            let all_coeffs_vecs = compute_forward_transform_coeffs(
+                DCT16_TRANSFORM_ID,
+                pixel_x, pixel_y, pixel_b,
+                width, height, bx, by, 16, 16,
+            );
+            let all_coeffs: [&[f32]; 3] = [&all_coeffs_vecs[0], &all_coeffs_vecs[1], &all_coeffs_vecs[2]];
 
             // Get CfL factors for this tile.
             // Quantize and estimate entropy.
@@ -2175,6 +2176,7 @@ fn build_entropy_merge_transform_map(
             }
             e16 *= entropy_mul_16;
 
+            // DCT16 wins if estimated entropy is lower.
             // DCT16 wins if estimated entropy is lower.
             if e16 < e8_sum {
                 map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
@@ -2551,6 +2553,8 @@ fn build_transform_map_candidates_from_quantized_ac(
 ) -> Vec<Vec<u8>> {
     let default_map = build_default_transform_map(bw, bh);
     if distance < 1.5 {
+        // At low distances, only use default (DCT8). The entropy-based DCT16
+        // merge in build_entropy_merge_transform_map handles DCT16 selection.
         return vec![default_map];
     }
 
@@ -2980,6 +2984,7 @@ fn quantize_ac(
 
 
 /// Build the complete VarDCT frame bitstream.
+#[allow(clippy::too_many_arguments)]
 fn encode_vardct_frame(
     width: usize,
     height: usize,
@@ -2997,6 +3002,7 @@ fn encode_vardct_frame(
     transform_map: &[u8],
     ytox_map: &[i32],
     ytob_map: &[i32],
+    use_gab: bool,
 ) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
 
@@ -3007,7 +3013,7 @@ fn encode_vardct_frame(
     writer.byte_align_zero_pad()?;
 
     // Frame header (VarDCT)
-    write_vardct_frame_header(&mut writer, width as u32, height as u32)?;
+    write_vardct_frame_header(&mut writer, width as u32, height as u32, use_gab)?;
 
     // Group layout
     let group_dim_blocks = 32usize; // 256 pixels / 8
@@ -3877,7 +3883,7 @@ fn quant_lf_coder() -> U32Coder {
 ///
 /// Writes all fields of FrameHeader for a VarDCT, XYB-encoded, single-pass,
 /// last frame with no extra channels, no animation, no timecodes.
-fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32) -> Result<()> {
+fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32, use_gab: bool) -> Result<()> {
     // 1. all_default = false (we need VarDCT settings)
     writer.write(1, 0)?;
     // 2. frame_type = RegularFrame (0), Bits(2)
@@ -3921,8 +3927,10 @@ fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32) 
     writer.write(2, 0)?; // selector 00 = Val(0)
     // 24. restoration_filter: all_default=false, gab=true, epf_iters=2
     writer.write(1, 0)?; // all_default = false
-    writer.write(1, 1)?; // gab = true
-    writer.write(1, 0)?; // gab_custom = false (default weights)
+    writer.write(1, if use_gab { 1 } else { 0 })?; // gab
+    if use_gab {
+        writer.write(1, 0)?; // gab_custom = false (default weights)
+    }
     writer.write(2, 2)?; // epf_iters = 2, Bits(2)
     // EPF fields (epf_iters > 0, !is_modular):
     writer.write(1, 0)?; // epf_sharp_custom = false
@@ -6792,6 +6800,7 @@ mod tests {
                 &transform_map,
                 &ytox_map,
                 &ytob_map,
+                true, // use_gab
             )
             .unwrap();
 
