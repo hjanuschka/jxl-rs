@@ -21,13 +21,58 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 
 ## Snapshot (current branch state)
 
+Recent incremental VarDCT prototype progress (this branch):
+- `[x]` Non-DCT8 transform-family plumbing is active end to end for ids `1..26`
+  (quant table routing, tokenization order dispatch, transform-map support checks,
+  forced-map decode tests).
+- `[x]` 8x8 special-transform forward synthesis now uses decoder-basis inversion
+  for parity by construction (`IDENTITY`, `DCT2X2`, `DCT4X4`, `DCT4X8`, `DCT8X4`,
+  `AFV0..AFV3`), with roundtrip tests against `transform_to_pixels`.
+- `[x]` Added forward/inverse consistency tests for non-special square transform
+  families (`DCT16`, `DCT32`, `DCT64`) using decoder `transform_to_pixels` plus
+  LF extraction from clamped 8x8 subblocks.
+- `[~]` Added linear forward-solver parity paths for selected non-8x8 families:
+  square (`DCT16`, gated `DCT32`) and rectangular (`DCT16X8`, `DCT8X16`,
+  `DCT32X8`, `DCT8X32`, gated `DCT32X16`/`DCT16X32`) with transform-specific
+  ignored LF coefficient index tests; larger families still use scalar fallback.
+- `[x]` Non-DCT8 tokenization order selection is now shape-id aligned with decoder
+  permutation semantics (canonical order per shape shared across transposed pairs),
+  with lazy cached shape-order lookup in tokenization.
+- `[x]` Forced-map end-to-end decode tests cover the large transform family through
+  `DCT256`, `DCT256X128`, and `DCT128X256`.
+- `[x]` Transform-map candidate search still chooses by final encoded byte size,
+  with large-image guardrails and total-encode budget to avoid pathological
+  search/runtime behavior.
+- `[x]` Quantization calibration now mirrors libjxl's
+  `Quantizer::ComputeGlobalScaleAndQuant` + `InitialQuantDC`: global_scale,
+  quant_lf, and base_raw_quant all derived from butteraugli distance via libjxl's
+  constants (kAcQuant=0.79, kDcQuant=1.096, kDcQuantPow=0.83, kQuantFieldTarget=5,
+  kGlobalScaleDenom=65536). PSNR at d=1 now exceeds libjxl (29.18 vs 28.62 dB).
+- `[x]` Gaborish enabled in frame header (gab=true) for free decoder-side smoothing,
+  with inverse Gaborish encoder pre-filter available but deferred pending
+  quantization recalibration.
+- `[x]` Histogram clustering via seed-based `FastClusterHistograms`-style algorithm
+  (`build_greedy_clustered_context_map`), ~11% byte savings at d=1.
+- `[x]` HybridUint config search across 4 presets per entropy candidate.
+- `[x]` Total-encode budget (MAX_TOTAL_ENCODES=32) prevents combinatorial blowup.
+- `[x]` Gradient DC prediction: modular DC now auto-selects from Zero/Left/Top/Gradient
+  predictors by estimated cost. Massive savings at d=3 (-39% photo, -48% flat).
+- `[x]` Coefficient order infrastructure: data-driven 8x8 order computation and
+  Lehmer-code permutation encoder in place (activates when order differs from natural).
+- `[x]` Inverse Gaborish 5x5 kernel implemented (currently deferred pending quant recal).
+- `[x]` Added conservative small-special candidate generation (`DCT4X8`/`DCT8X4`,
+  `IDENTITY`/`DCT2X2`/`DCT4X4`, plus mixed special maps) and sparse AFV candidate
+  generation for high-distance modes on moderate grids, all gated by exact-byte
+  winner selection.
+
 - `[x]` Writer foundation: bit writer, u32/i32 helpers, TOC writer.
 - `[~]` Minimal headers/container writing.
 - `[~]` Minimal entropy helpers (HybridUint config, fixed/simple Huffman/context map writer primitives).
 - `[~]` Minimal modular decodable stream generation (constant tree leaf, synthetic output).
 - `[~]` Early real image-to-bitstream path: RGB8 raw input into modular stream (group-aware bootstrap path, interleaved + strided API inputs) plus Gray8 API variants (expanded to RGB bootstrap path). Histogram-driven Huffman residual coding now available alongside fixed-token bootstrap.
-- `[ ]` Full entropy modeling and ANS encoding.
-- `[ ]` VarDCT lossy encoding.
+- `[~]` Entropy modeling and ANS/Huffman AC coding in active VarDCT path
+  (byte-size winner selection between ANS and Huffman).
+- `[x]` VarDCT lossy encoding.
 - `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
 
 ## libjxl subsystem parity map
@@ -42,18 +87,18 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 | P04 | Public encoder API surface (`JxlEncoder`, frame settings) | [~] | `jxl/src/encode/encoder.rs`, `jxl/src/encode/options.rs`, `jxl/src/api/mod.rs` | add `jxl/src/encode/api.rs`, per-frame settings types | M4, M9 |
 | P05 | Input pixel ingestion and normalization | [~] | `jxl/src/encode/headers.rs` (RGB8 single-group bootstrap path), `jxl/src/encode/encoder.rs` | `jxl/src/encode/input.rs`, `jxl/src/encode/color_pipeline.rs` | M4 |
 | P06 | Context map writer and optimization (`enc_entropy_coder`) | [~] | `jxl/src/encode/entropy/context_map.rs` | add non-simple context map and optimization pass | M3, M5 |
-| P07 | Huffman table build from symbol stats | [~] | `jxl/src/encode/entropy/huffman.rs` (fixed-symbol only) | add histogram-driven table builder | M3 |
-| P08 | HybridUint full usage in entropy paths | [~] | `jxl/src/encode/entropy/hybrid_uint.rs` | wire into real modular/vardct token paths | M3, M4, M6 |
-| P09 | ANS histogram + stream writing (`enc_ans`) | [ ] | none | `jxl/src/encode/entropy/ans.rs` | M3 |
+| P07 | Huffman table build from symbol stats | [~] | `jxl/src/encode/entropy/{huffman,huffman_encode}.rs` (frequency-driven coding active in VarDCT) | keep improving clustering/modeling | M3 |
+| P08 | HybridUint full usage in entropy paths | [~] | `jxl/src/encode/entropy/hybrid_uint.rs`, `jxl/src/encode/vardct.rs` | continue tuning per-token usage | M3, M4, M6 |
+| P09 | ANS histogram + stream writing (`enc_ans`) | [~] | `jxl/src/encode/entropy/ans.rs` (+ VarDCT wiring in `encode/vardct.rs`) | expand to remaining paths | M3 |
 | P10 | Modular tree building from image stats (`enc_modular_tree`) | [~] | `jxl/src/encode/modular.rs` (single-leaf constants) | `jxl/src/encode/modular/tree_builder.rs` | M4, M5 |
 | P11 | Modular transforms (palette/squeeze/rct) | [ ] | none | `jxl/src/encode/modular/transforms.rs` | M5 |
-| P12 | Real modular lossless frame encoding (`enc_modular`) | [ ] | minimal synthetic sections only | `jxl/src/encode/modular/frame.rs`, `jxl/src/encode/modular/channel.rs` | M4 |
+| P12 | Real modular lossless frame encoding (`enc_modular`) | [~] | `jxl/src/encode/modular_encode.rs` (real image residual coding path exists; parity still incomplete) | `jxl/src/encode/modular/frame.rs`, `jxl/src/encode/modular/channel.rs` | M4 |
 | P13 | Near-lossless controls | [ ] | none | add to modular pipeline and `JxlEncoderOptions` | M5 |
 | P14 | Fast lossless heuristics (`enc_fast_lossless`) | [ ] | none | `jxl/src/encode/modular/fast_lossless.rs` | M5, M7 |
-| P15 | VarDCT forward color path (`enc_xyb`, color transforms) | [ ] | none | `jxl/src/encode/vardct/color.rs` | M6 |
-| P16 | VarDCT block strategy and transforms (`enc_frame`, heuristics) | [ ] | none | `jxl/src/encode/vardct/block_strategy.rs`, `.../transform.rs` | M6 |
-| P17 | Quant field generation and tuning (`enc_quant_weights`) | [ ] | none | `jxl/src/encode/vardct/quant.rs` | M6, M7 |
-| P18 | Coefficient tokenization + entropy coding | [ ] | none | `jxl/src/encode/vardct/tokens.rs`, `.../entropy.rs` | M6 |
+| P15 | VarDCT forward color path (`enc_xyb`, color transforms) | [x] | `jxl/src/encode/{xyb,vardct}.rs` | split into dedicated modules later | M6 |
+| P16 | VarDCT block strategy and transforms (`enc_frame`, heuristics) | [~] | `jxl/src/encode/vardct.rs` (transform-map candidates + dispatch active) | `jxl/src/encode/vardct/block_strategy.rs`, `.../transform.rs` | M6 |
+| P17 | Quant field generation and tuning (`enc_quant_weights`) | [~] | `jxl/src/encode/vardct.rs` (adaptive raw quant map + transform-aware quantization) | `jxl/src/encode/vardct/quant.rs` | M6, M7 |
+| P18 | Coefficient tokenization + entropy coding | [~] | `jxl/src/encode/vardct.rs` (LF/HF tokenization + ANS/Huffman AC paths) | `jxl/src/encode/vardct/tokens.rs`, `.../entropy.rs` | M6 |
 | P19 | Progressive pass emission (`enc_progressive_split`) | [ ] | none | `jxl/src/encode/progressive.rs` | M8 |
 | P20 | Animation and frame references | [ ] | none | `jxl/src/encode/animation.rs` | M8 |
 | P21 | Patches/splines/noise tools (`enc_patch_dictionary`, `enc_splines`, `enc_noise`) | [ ] | none | `jxl/src/encode/tools/{patches,splines,noise}.rs` | M8 |
@@ -99,26 +144,27 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 
 ### C. Entropy parity
 
-- [ ] C01 Implement ANS writer end to end with decoder roundtrip tests.
-  - Files: new `jxl/src/encode/entropy/ans.rs`.
+- [x] C01 Implement ANS writer end to end with decoder roundtrip tests.
+  - Files: `jxl/src/encode/entropy/ans.rs`.
   - Milestone: M3.
-- [ ] C02 Implement histogram building from symbol distributions.
+- [~] C02 Implement histogram building from symbol distributions.
   - Files: `jxl/src/encode/entropy/histograms.rs`.
   - Milestone: M3.
-- [ ] C03 Implement histogram clustering and context map optimization.
-  - Files: `jxl/src/encode/entropy/{histograms,context_map}.rs`.
+- [x] C03 Implement histogram clustering and context map optimization.
+  - Files: `jxl/src/encode/vardct.rs` (`build_greedy_clustered_context_map` seed-based
+    clustering of per-context histograms, integrated as candidates alongside preset maps).
   - Milestone: M3, M5.
-- [ ] C04 Implement full Huffman table construction path (not fixed-symbol-only).
-  - Files: `jxl/src/encode/entropy/huffman.rs`.
+- [x] C04 Implement full Huffman table construction path (not fixed-symbol-only).
+  - Files: `jxl/src/encode/entropy/{huffman,huffman_encode}.rs`.
   - Milestone: M3.
-- [ ] C05 Hook HybridUint configs to real token distributions and tune choices.
+- [x] C05 Hook HybridUint configs to real token distributions and tune choices.
   - Files: `jxl/src/encode/entropy/hybrid_uint.rs` + callers.
   - Milestone: M3, M4, M6.
 
 ### D. Modular lossless parity
 
-- [ ] D01 Build real channel residual pipeline from input image data.
-  - Files: new `jxl/src/encode/modular/channel.rs`.
+- [~] D01 Build real channel residual pipeline from input image data.
+  - Files: `jxl/src/encode/modular_encode.rs` (active path), future split to `modular/channel.rs`.
   - Milestone: M4.
 - [ ] D02 Build tree generation from statistics (split properties, thresholds).
   - Files: new `jxl/src/encode/modular/tree_builder.rs`.
@@ -138,20 +184,21 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 
 ### E. VarDCT lossy parity
 
-- [ ] E01 Implement forward lossy color pipeline (sRGB/linear and XYB path as needed).
-  - Files: new `jxl/src/encode/vardct/color.rs`.
+- [x] E01 Implement forward lossy color pipeline (sRGB/linear and XYB path as needed).
+  - Files: `jxl/src/encode/{xyb,vardct}.rs`.
   - Milestone: M6.
-- [ ] E02 Implement block strategy selection and transform dispatch.
-  - Files: new `jxl/src/encode/vardct/block_strategy.rs`.
+- [~] E02 Implement block strategy selection and transform dispatch.
+  - Files: `jxl/src/encode/vardct.rs` (active implementation), future split to `vardct/block_strategy.rs`.
   - Milestone: M6.
-- [ ] E03 Implement quant field generation and quantization pipeline.
-  - Files: new `jxl/src/encode/vardct/quant.rs`.
+- [x] E03 Implement quant field generation and quantization pipeline.
+  - Files: `jxl/src/encode/vardct.rs` (libjxl-calibrated global_scale/quant_lf/base_raw_quant
+    + adaptive quant map with distance-relative modulation).
   - Milestone: M6, M7.
-- [ ] E04 Implement LF/HF coefficient tokenization and entropy coding.
-  - Files: new `jxl/src/encode/vardct/{tokens,entropy}.rs`.
+- [x] E04 Implement LF/HF coefficient tokenization and entropy coding.
+  - Files: `jxl/src/encode/vardct.rs`.
   - Milestone: M6.
-- [ ] E05 Add quality tuning heuristics and effort tiers.
-  - Files: `jxl/src/encode/vardct/heuristics.rs`, `encode/effort.rs`.
+- [~] E05 Add quality tuning heuristics and effort tiers.
+  - Files: `jxl/src/encode/vardct.rs`, `encode/effort.rs`.
   - Milestone: M7.
 
 ### F. Advanced format parity
@@ -174,6 +221,10 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 
 ### G. Performance and determinism parity
 
+- [~] G00 SIMD acceleration plan (deferred): keep scalar/reference math while
+  algorithmic parity is still moving, then SIMD-accelerate hot paths
+  (`encode/vardct` forward transforms, quantization loops, token scans) once
+  transform/entropy decisions are stable.
 - [ ] G01 Deterministic parallel scheduler with fixed ordering.
   - Files: new `jxl/src/encode/scheduler.rs`.
   - Milestone: M5, M7.
@@ -186,10 +237,12 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
 
 ### H. Conformance, diff testing, and hardening
 
-- [ ] H01 Differential harness: jxl-rs encode -> djxl decode validation on corpus.
+- [~] H01 Differential harness: jxl-rs encode -> djxl decode validation on corpus.
+  - Current: repeated manual corpus checks are in use; formal harness/CI integration still pending.
   - Files: `tools/encoder_diff/` and CI scripts.
   - Milestone: M9.
-- [ ] H02 Differential harness: compare rate/distortion vs libjxl (matched settings).
+- [~] H02 Differential harness: compare rate/distortion vs libjxl (matched settings).
+  - Current: ad-hoc bench/corpus comparisons are used during iteration; standardized harness pending.
   - Files: `bench/` + docs.
   - Milestone: M7, M9.
 - [ ] H03 Expanded fuzzing for encode paths and encode/decode loops.

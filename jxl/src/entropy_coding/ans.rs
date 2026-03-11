@@ -14,14 +14,14 @@ const SUM_PROBS: u16 = 1 << LOG_SUM_PROBS;
 const RLE_MARKER_SYM: u16 = LOG_SUM_PROBS as u16 + 1;
 
 #[derive(Debug)]
-struct AnsHistogram {
+pub(crate) struct AnsHistogram {
     // Safety invariant:
     // - log_bucket_size <= LOG_SUM_PROBS
     // - buckets.len() = 2^(LOG_SUM_PROBS - log_bucket_size)
     // This relationship ensures that for any ANS state (12 bits), the bucket index
     // computed as (state & 0xfff) >> log_bucket_size is always < buckets.len()
-    buckets: Vec<Bucket>,
-    log_bucket_size: usize,
+    pub(crate) buckets: Vec<Bucket>,
+    pub(crate) log_bucket_size: usize,
     bucket_mask: u32,
     // For optimizing fast-lossless case.
     single_symbol: Option<u32>,
@@ -30,12 +30,12 @@ struct AnsHistogram {
 // log_alphabet_size <= 8 and log_bucket_size <= 7, so u8 is sufficient for symbols and cutoffs.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
-struct Bucket {
-    alias_symbol: u8,
-    alias_cutoff: u8,
-    dist: u16,
-    alias_offset: u16,
-    alias_dist_xor: u16,
+pub(crate) struct Bucket {
+    pub(crate) alias_symbol: u8,
+    pub(crate) alias_cutoff: u8,
+    pub(crate) dist: u16,
+    pub(crate) alias_offset: u16,
+    pub(crate) alias_dist_xor: u16,
 }
 
 impl AnsHistogram {

@@ -10,9 +10,7 @@ use crate::{
 
 use super::{
     BitWriter, JxlEncoderOptions, container, headers,
-    input::{
-        pack_gray8_strided, pack_rgb8_strided, validate_rgb8_interleaved_len,
-    },
+    input::{pack_gray8_strided, pack_rgb8_strided, validate_rgb8_interleaved_len},
 };
 
 /// Top-level bitstream flavor for encoder output.
@@ -445,10 +443,7 @@ mod tests {
             let row = img.row(y);
             for x in 0..width {
                 let decoded = (row[x] * 255.0 + 0.5) as u8;
-                assert_eq!(
-                    decoded, gray[y * width + x],
-                    "pixel mismatch at ({x},{y})"
-                );
+                assert_eq!(decoded, gray[y * width + x], "pixel mismatch at ({x},{y})");
             }
         }
     }

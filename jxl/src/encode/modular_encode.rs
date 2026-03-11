@@ -240,12 +240,46 @@ pub fn write_tree_token_stream(writer: &mut BitWriter, stream: &TokenStream) -> 
     write_token_stream(writer, stream)
 }
 
+/// Compute gradient prediction residuals for a 2D channel.
+///
+/// Gradient (ClampedGradient): pred = left + top - topleft, clamped to [min(left,top), max(left,top)].
+/// This matches JXL predictor 5.
+fn compute_gradient_residuals(data: &[i32], width: usize, height: usize) -> Vec<i32> {
+    let mut residuals = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            let val = data[y * width + x];
+            let left = if x > 0 { data[y * width + x - 1] } else { 0 };
+            let top = if y > 0 { data[(y - 1) * width + x] } else { 0 };
+            let topleft = if x > 0 && y > 0 {
+                data[(y - 1) * width + x - 1]
+            } else {
+                0
+            };
+            // ClampedGradient: gradient clamped to [min(left,top), max(left,top)]
+            let grad = left as i64 + top as i64 - topleft as i64;
+            let lo = left.min(top) as i64;
+            let hi = left.max(top) as i64;
+            let pred = grad.clamp(lo, hi) as i32;
+            residuals.push(val - pred);
+        }
+    }
+    residuals
+}
+
 /// Encode a multi-channel signed integer modular stream.
 ///
 /// `data` contains `num_channels` channels stored sequentially,
 /// each of size `width * height`.
 ///
-/// Uses Zero predictor (residual = raw value) with simple Huffman coding.
+/// Tries both Zero predictor and Gradient predictor, picks the smaller output.
+/// Channels are encoded in order: all pixels of channel 0, then channel 1, etc.
+/// Encode a multi-channel signed integer modular stream.
+///
+/// `data` contains `num_channels` channels stored sequentially,
+/// each of size `width * height`.
+///
+/// Tries both Zero predictor and Gradient predictor, picks the smaller output.
 /// Channels are encoded in order: all pixels of channel 0, then channel 1, etc.
 pub fn encode_modular_signed_stream(
     writer: &mut BitWriter,
@@ -257,13 +291,84 @@ pub fn encode_modular_signed_stream(
     assert_eq!(data.len(), width * height * num_channels);
 
     let uint_config = HybridUintConfig::new(4, 1, 2);
-    let offset = 0i32;
-    let predictor = 0u32; // Zero predictor
 
-    // For now, treat all channels as a single flat residual stream.
-    // The tree has a single leaf node that applies to all channels.
-    // Residuals are all channel pixels concatenated.
-    write_modular_section_huffman(writer, offset, predictor, data, uint_config, false)
+    // Estimate cost with multiple predictors and pick the best.
+    // We use sum of pack_signed(residual) as a proxy for entropy.
+    let channel_size = width * height;
+    let zero_cost: u64 = data.iter().map(|&v| pack_signed(v) as u64).sum();
+
+    // Gradient predictor (5): ClampedGradient
+    let mut grad_residuals = Vec::with_capacity(data.len());
+    for c in 0..num_channels {
+        let ch = &data[c * channel_size..(c + 1) * channel_size];
+        grad_residuals.extend(compute_gradient_residuals(ch, width, height));
+    }
+    let grad_cost: u64 = grad_residuals
+        .iter()
+        .map(|&v| pack_signed(v) as u64)
+        .sum();
+
+    // Left predictor (1)
+    let mut left_residuals = Vec::with_capacity(data.len());
+    for c in 0..num_channels {
+        let ch = &data[c * channel_size..(c + 1) * channel_size];
+        for y in 0..height {
+            for x in 0..width {
+                let val = ch[y * width + x];
+                let left = if x > 0 { ch[y * width + x - 1] } else { 0 };
+                left_residuals.push(val - left);
+            }
+        }
+    }
+    let left_cost: u64 = left_residuals
+        .iter()
+        .map(|&v| pack_signed(v) as u64)
+        .sum();
+
+    // Top predictor (2)
+    let mut top_residuals = Vec::with_capacity(data.len());
+    for c in 0..num_channels {
+        let ch = &data[c * channel_size..(c + 1) * channel_size];
+        for y in 0..height {
+            for x in 0..width {
+                let val = ch[y * width + x];
+                let top = if y > 0 { ch[(y - 1) * width + x] } else { 0 };
+                top_residuals.push(val - top);
+            }
+        }
+    }
+    let top_cost: u64 = top_residuals
+        .iter()
+        .map(|&v| pack_signed(v) as u64)
+        .sum();
+
+    // Pick the best
+    let mut best_cost = zero_cost;
+    let mut best_predictor = 0u32;
+    let mut best_residuals: Option<Vec<i32>> = None;
+
+    if grad_cost < best_cost {
+        best_cost = grad_cost;
+        best_predictor = 5;
+        best_residuals = Some(grad_residuals);
+    }
+    if left_cost < best_cost {
+        best_cost = left_cost;
+        best_predictor = 1;
+        best_residuals = Some(left_residuals);
+    }
+    if top_cost < best_cost {
+        best_cost = top_cost;
+        best_predictor = 2;
+        best_residuals = Some(top_residuals);
+    }
+    let _ = best_cost;
+
+    if let Some(residuals) = best_residuals {
+        write_modular_section_huffman(writer, 0, best_predictor, &residuals, uint_config, false)
+    } else {
+        write_modular_section_huffman(writer, 0, 0, data, uint_config, false)
+    }
 }
 
 #[cfg(test)]
@@ -403,7 +508,11 @@ mod tests {
         eprintln!(
             "Standalone section ({} bytes): {}",
             bytes.len(),
-            bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
 

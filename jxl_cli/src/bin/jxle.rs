@@ -31,7 +31,6 @@ struct Opt {
     bare: bool,
 
     // --- Legacy/advanced options ---
-
     /// Image width in pixels (for raw input modes)
     #[arg(long)]
     width: Option<u32>,
@@ -196,8 +195,16 @@ fn main() -> Result<()> {
         });
 
         let (width, height, rgb) = match &pnm {
-            PnmImage::Rgb8 { width, height, data } => (*width, *height, data.clone()),
-            PnmImage::Gray8 { width, height, data } => {
+            PnmImage::Rgb8 {
+                width,
+                height,
+                data,
+            } => (*width, *height, data.clone()),
+            PnmImage::Gray8 {
+                width,
+                height,
+                data,
+            } => {
                 // Convert grayscale to RGB for VarDCT
                 let mut rgb = vec![0u8; ((*width) as usize) * ((*height) as usize) * 3];
                 for (i, &g) in data.iter().enumerate() {
@@ -231,8 +238,12 @@ fn main() -> Result<()> {
             }
         } else {
             // VarDCT lossy encoding
-            use jxl::encode::vardct::{VarDctConfig, encode_vardct_u8_rgb, encode_vardct_u8_rgb_codestream};
-            let config = VarDctConfig { distance: opt.distance };
+            use jxl::encode::vardct::{
+                VarDctConfig, encode_vardct_u8_rgb, encode_vardct_u8_rgb_codestream,
+            };
+            let config = VarDctConfig {
+                distance: opt.distance,
+            };
             if opt.bare {
                 encode_vardct_u8_rgb_codestream(&rgb, width as usize, height as usize, &config)
                     .map_err(|e| color_eyre::eyre::eyre!("VarDCT encode failed: {e:?}"))?
@@ -245,11 +256,21 @@ fn main() -> Result<()> {
         std::fs::write(&output, &bytes)
             .wrap_err_with(|| format!("Failed to write {:?}", output))?;
 
-        let mode = if opt.modular || opt.distance == 0.0 { "modular" } else { "VarDCT" };
+        let mode = if opt.modular || opt.distance == 0.0 {
+            "modular"
+        } else {
+            "VarDCT"
+        };
         let ratio = (rgb.len() as f64) / (bytes.len() as f64);
         eprintln!(
             "{:?} -> {:?}: {}x{}, {} bytes ({mode}, d={:.2}, {:.1}:1)",
-            input_path, output, width, height, bytes.len(), opt.distance, ratio
+            input_path,
+            output,
+            width,
+            height,
+            bytes.len(),
+            opt.distance,
+            ratio
         );
         return Ok(());
     }
@@ -258,7 +279,10 @@ fn main() -> Result<()> {
 
     let width = opt.width.unwrap_or(1);
     let height = opt.height.unwrap_or(1);
-    let output = opt.output.clone().unwrap_or_else(|| PathBuf::from("output.jxl"));
+    let output = opt
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("output.jxl"));
 
     if opt.modular_image && opt.with_frame_info {
         return Err(color_eyre::eyre::eyre!(
@@ -405,8 +429,7 @@ fn main() -> Result<()> {
         (bytes, "header-only stream")
     };
 
-    std::fs::write(&output, &bytes)
-        .wrap_err_with(|| format!("Failed to write {:?}", output))?;
+    std::fs::write(&output, &bytes).wrap_err_with(|| format!("Failed to write {:?}", output))?;
 
     if opt.modular_image {
         eprintln!(

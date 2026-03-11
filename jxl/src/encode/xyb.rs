@@ -105,12 +105,15 @@ pub fn srgb_u8_to_xyb(
         let b_lin = srgb_to_linear(rgb[i * 3 + 2] as f32 / 255.0);
 
         // Step 2: Apply forward opsin matrix (linear sRGB -> linear LMS)
-        let l_lin =
-            forward_mat[0][0] as f32 * r_lin + forward_mat[0][1] as f32 * g_lin + forward_mat[0][2] as f32 * b_lin;
-        let m_lin =
-            forward_mat[1][0] as f32 * r_lin + forward_mat[1][1] as f32 * g_lin + forward_mat[1][2] as f32 * b_lin;
-        let s_lin =
-            forward_mat[2][0] as f32 * r_lin + forward_mat[2][1] as f32 * g_lin + forward_mat[2][2] as f32 * b_lin;
+        let l_lin = forward_mat[0][0] as f32 * r_lin
+            + forward_mat[0][1] as f32 * g_lin
+            + forward_mat[0][2] as f32 * b_lin;
+        let m_lin = forward_mat[1][0] as f32 * r_lin
+            + forward_mat[1][1] as f32 * g_lin
+            + forward_mat[1][2] as f32 * b_lin;
+        let s_lin = forward_mat[2][0] as f32 * r_lin
+            + forward_mat[2][1] as f32 * g_lin
+            + forward_mat[2][2] as f32 * b_lin;
 
         // Step 3: Undo biased gamma
         // Decoder does: l_lin = l^3 * intensity_scale + bias * intensity_scale
@@ -295,11 +298,7 @@ mod tests {
             let mut out = [0u8; 3];
             xyb_to_srgb_u8(&x, &y, &b, 1, 1, &mut out);
 
-            assert_eq!(
-                out, rgb,
-                "Roundtrip failed for gray {v}: got {:?}",
-                out
-            );
+            assert_eq!(out, rgb, "Roundtrip failed for gray {v}: got {:?}", out);
         }
     }
 

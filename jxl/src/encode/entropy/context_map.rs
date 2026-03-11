@@ -44,6 +44,101 @@ pub fn write_simple_context_map(writer: &mut BitWriter, context_map: &[u8]) -> R
     Ok(())
 }
 
+fn mtf_forward(context_map: &[u8]) -> Vec<u8> {
+    let mut mtf = [0u8; 256];
+    for (i, v) in mtf.iter_mut().enumerate() {
+        *v = i as u8;
+    }
+
+    let mut out = Vec::with_capacity(context_map.len());
+    for &sym in context_map {
+        let mut idx = 0usize;
+        while idx < mtf.len() && mtf[idx] != sym {
+            idx += 1;
+        }
+        debug_assert!(idx < mtf.len());
+        out.push(idx as u8);
+
+        if idx != 0 {
+            let val = mtf[idx];
+            for i in (1..=idx).rev() {
+                mtf[i] = mtf[i - 1];
+            }
+            mtf[0] = val;
+        }
+    }
+    out
+}
+
+fn write_compressed_context_map(writer: &mut BitWriter, context_map: &[u8]) -> Result<()> {
+    use super::huffman_encode::{
+        build_huffman_code, write_huffman_histograms, write_huffman_symbol,
+    };
+
+    // is_simple = false
+    writer.write(1, 0)?;
+
+    // use_mtf = true (helps with long runs / few symbols)
+    writer.write(1, 1)?;
+
+    let mtf_stream = mtf_forward(context_map);
+
+    let max_symbol = mtf_stream.iter().copied().max().unwrap_or(0) as usize;
+    let alphabet_size = (max_symbol + 1).max(1);
+    let mut freqs = vec![0u64; alphabet_size];
+    for &s in &mtf_stream {
+        freqs[s as usize] += 1;
+    }
+
+    let code = if freqs.iter().all(|&f| f == 0) {
+        build_huffman_code(&[1]).ok_or(Error::InvalidHuffman)?
+    } else {
+        build_huffman_code(&freqs).ok_or(Error::InvalidHuffman)?
+    };
+
+    // Context map symbols are <= 255, encode directly as token=value (< split_token).
+    let uint_config = super::HybridUintConfig::new(8, 0, 0);
+
+    // Inner histogram stream for context-map symbols.
+    // num_contexts = 1 so this won't recursively write another context map.
+    write_huffman_histograms(writer, &[0u8], &[uint_config], &[code.clone()])?;
+
+    for &s in &mtf_stream {
+        write_huffman_symbol(writer, &code, s as usize)?;
+    }
+
+    Ok(())
+}
+
+/// Writes a context map with adaptive strategy:
+/// - all-zero maps -> simple encoding (3 bits)
+/// - small maps with few contexts -> simple encoding
+/// - larger/non-zero maps -> compressed non-simple encoding with MTF + Huffman
+pub fn write_context_map(writer: &mut BitWriter, context_map: &[u8]) -> Result<()> {
+    let max_symbol = context_map.iter().copied().max().unwrap_or(0);
+    if context_map.len() <= 32 || max_symbol == 0 {
+        return write_simple_context_map(writer, context_map);
+    }
+
+    // Non-simple context maps are validated by the decoder and must not have
+    // histogram-id holes (i.e. ids must be contiguous 0..max).
+    let mut seen = [false; 256];
+    let mut distinct = 0usize;
+    for &v in context_map {
+        let idx = v as usize;
+        if !seen[idx] {
+            seen[idx] = true;
+            distinct += 1;
+        }
+    }
+    let has_holes = distinct != max_symbol as usize + 1;
+    if has_holes {
+        return write_simple_context_map(writer, context_map);
+    }
+
+    write_compressed_context_map(writer, context_map)
+}
+
 /// Writes a simple all-zero context map with `num_contexts` entries.
 pub fn write_simple_zero_context_map(writer: &mut BitWriter, num_contexts: usize) -> Result<()> {
     let zeros = vec![0u8; num_contexts];
@@ -76,6 +171,24 @@ mod tests {
 
         let mut writer = BitWriter::new();
         write_simple_context_map(&mut writer, &map).unwrap();
+        let bytes = writer.finish();
+
+        let got = decode_map(&bytes, map.len());
+        assert_eq!(got, map);
+    }
+
+    #[test]
+    fn test_write_context_map_compressed_roundtrip() {
+        // Long map with multiple histogram ids and long runs.
+        let mut map = vec![0u8; 555];
+        map.extend(vec![1u8; 1200]);
+        map.extend(vec![2u8; 1200]);
+        map.extend(vec![3u8; 1200]);
+        map.extend(vec![4u8; 1200]);
+
+        let mut writer = BitWriter::new();
+        write_context_map(&mut writer, &map).unwrap();
+        writer.write(32, 0).unwrap(); // padding for safe peeks
         let bytes = writer.finish();
 
         let got = decode_map(&bytes, map.len());
