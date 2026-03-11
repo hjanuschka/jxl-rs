@@ -464,6 +464,14 @@ pub fn encode_vardct_u8_rgb_codestream(
             if total_encodes >= MAX_TOTAL_ENCODES {
                 break;
             }
+            // AdjustQuantField: for merged blocks, set quant to MAX of constituents.
+            // This matches libjxl's behavior and ensures merged blocks use the
+            // finest quantization step among their constituent 8x8 blocks.
+            let adj_quant = adjust_quant_field(
+                raw_quant_map, &transform_map, bw, bh, config.distance,
+            );
+            let quant_for_encode = &adj_quant;
+
             // Candidate A: legacy bootstrap behavior for non-8x8 transforms (all-zero AC).
             let mut ac_x_zero = quantized.ac_x.clone();
             let mut ac_y_zero = quantized.ac_y.clone();
@@ -484,7 +492,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                 &ac_x_zero,
                 &ac_y_zero,
                 &ac_b_zero,
-                raw_quant_map,
+                quant_for_encode,
                 &transform_map,
                 &ytox_map,
                 &ytob_map,
@@ -513,7 +521,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                         bw,
                         bh,
                         global_scale,
-                        raw_quant_map,
+                        quant_for_encode,
                         &transform_map,
                         Some(&mut forward_transform_cache),
                         x_dm_multiplier,
@@ -532,7 +540,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                     &ac_x_for_map,
                     &ac_y_for_map,
                     &ac_b_for_map,
-                    raw_quant_map,
+                    quant_for_encode,
                     &transform_map,
                     &ytox_map,
                     &ytob_map,
@@ -1099,6 +1107,86 @@ fn build_adaptive_raw_quant_map_full(
     // Return aq_map as well -- libjxl's EstimateEntropy uses the float
     // quant field values (not integer raw_quant) for quant_norm16.
     (raw_quant_map, global_scale, quant_lf, aq_map)
+}
+
+/// Port of libjxl's `AdjustQuantField`: for merged (non-8x8) blocks, replace
+/// all constituent 8x8 blocks' raw_quant with the MAX of the group.
+/// At d <= 1.54, uses pure max. At higher d, interpolates towards mean.
+/// This ensures merged blocks use the finest quantization step among their
+/// constituents, preventing quality loss from coarse-quant blocks in the group.
+fn adjust_quant_field(
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
+    bw: usize, bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    let mut adjusted = raw_quant_map.to_vec();
+
+    // libjxl constants for max/mean interpolation
+    const K_LIMIT: f32 = 1.54138;
+    const K_MUL: f32 = 0.56391;
+    const K_MIN: f32 = 0.0;
+    let mean_max_mixer = if distance > K_LIMIT {
+        (1.0 - (distance - K_LIMIT) * K_MUL).max(K_MIN)
+    } else {
+        1.0
+    };
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let idx = by * bw + bx;
+            let t = transform_map[idx];
+            if (t & TRANSFORM_FIRST_BLOCK_FLAG) == 0 {
+                continue;
+            }
+            let tid_raw = (t & !TRANSFORM_FIRST_BLOCK_FLAG) as usize;
+            let Some(tid) = HfTransformType::from_usize(tid_raw) else {
+                continue;
+            };
+            let cbx = covered_blocks_x(tid) as usize;
+            let cby = covered_blocks_y(tid) as usize;
+            if cbx == 1 && cby == 1 {
+                continue; // 8x8 block, nothing to adjust
+            }
+
+            // Compute max and mean of constituent blocks
+            let mut max_val = 0u8;
+            let mut sum = 0u32;
+            let count = (cbx * cby) as u32;
+            for iy in 0..cby {
+                for ix in 0..cbx {
+                    let qi = (by + iy) * bw + (bx + ix);
+                    if qi < raw_quant_map.len() {
+                        let v = raw_quant_map[qi];
+                        max_val = max_val.max(v);
+                        sum += v as u32;
+                    }
+                }
+            }
+            let mean = sum as f32 / count as f32;
+
+            // Interpolate between max and mean
+            let result = if count >= 4 {
+                let max_f = max_val as f32;
+                max_f * mean_max_mixer + (1.0 - mean_max_mixer) * mean
+            } else {
+                max_val as f32
+            };
+            let rq = (result + 0.5).clamp(1.0, 255.0) as u8;
+
+            // Set all constituent blocks to the adjusted value
+            for iy in 0..cby {
+                for ix in 0..cbx {
+                    let qi = (by + iy) * bw + (bx + ix);
+                    if qi < adjusted.len() {
+                        adjusted[qi] = rq;
+                    }
+                }
+            }
+        }
+    }
+
+    adjusted
 }
 
 
@@ -2465,6 +2553,130 @@ fn build_entropy_merge_transform_map(
     let dct16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(4);
     let allow_square_solver = bw * bh <= SQUARE_SOLVER_MAX_BLOCKS;
 
+    // Phase 0.5: DCT16x8 / DCT8x16 rectangular merges (pairs of 8x8 blocks).
+    // These are common in libjxl and help in areas smooth in one direction.
+    let dct8x16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(6);
+    let entropy_mul_rect = 2.0f32; // Conservative multiplier for rect merges
+
+    // DCT16X8 (id=6): 16 rows x 8 cols = 1 block wide, 2 blocks tall
+    // Merge 2 vertically adjacent blocks (must not cross group boundaries)
+    let group_dim = 32usize; // 256 pixels / 8 = 32 blocks per group dimension
+    for bx in 0..bw {
+        let mut by = 0;
+        while by + 1 < bh {
+            // Don't cross group boundary vertically
+            if by / group_dim != (by + 1) / group_dim {
+                by += 1;
+                continue;
+            }
+            if map[by * bw + bx] != (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)
+                || map[(by + 1) * bw + bx] != (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)
+            {
+                by += 1;
+                continue;
+            }
+
+            let rq0 = raw_quant_map[by * bw + bx] as f32;
+            let rq1 = raw_quant_map[(by + 1) * bw + bx] as f32;
+            if rq0.max(rq1) > rq0.min(rq1) * 1.5 + 1.0 {
+                by += 1;
+                continue;
+            }
+
+            let e8_sum = estimate_8x8_entropy(by * bw + bx, bx, by)
+                + estimate_8x8_entropy((by + 1) * bw + bx, bx, by + 1);
+
+            let rq = rq0.max(rq1) as u32;
+            // DCT16X8: 8 cols (1 block), 16 rows (2 blocks)
+            let coeffs = compute_forward_transform_coeffs(
+                DCT16X8_TRANSFORM_ID,
+                pixel_x, pixel_y, pixel_b,
+                width, height, bx, by, 8, 16,
+            );
+            let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
+            let mut e_rect = 0.0f32;
+            for c in 0..3usize {
+                let dw_base = &dct8x16_weights[c * 128..(c + 1) * 128];
+                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
+                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                for k in 1..128 {
+                    let dw = dw_base[k] * dm_mul;
+                    if dw.abs() < 1e-10 { continue; }
+                    let q = (coeffs[c][k] * scale_rect / dw).round();
+                    e_rect += q.abs().sqrt() * chan_w;
+                }
+            }
+            e_rect *= entropy_mul_rect;
+
+            if e_rect < e8_sum {
+                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16X8_TRANSFORM_ID;
+                map[(by + 1) * bw + bx] = DCT16X8_TRANSFORM_ID;
+                by += 2;
+            } else {
+                by += 1;
+            }
+        }
+    }
+
+    // DCT8X16 (id=7): 8 rows x 16 cols = 2 blocks wide, 1 block tall
+    // Merge 2 horizontally adjacent blocks (must not cross group boundaries)
+    for by in 0..bh {
+        let mut bx = 0;
+        while bx + 1 < bw {
+            // Don't cross group boundary horizontally
+            if bx / group_dim != (bx + 1) / group_dim {
+                bx += 1;
+                continue;
+            }
+            if map[by * bw + bx] != (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)
+                || map[by * bw + bx + 1] != (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)
+            {
+                bx += 1;
+                continue;
+            }
+
+            let rq0 = raw_quant_map[by * bw + bx] as f32;
+            let rq1 = raw_quant_map[by * bw + bx + 1] as f32;
+            if rq0.max(rq1) > rq0.min(rq1) * 1.5 + 1.0 {
+                bx += 1;
+                continue;
+            }
+
+            let e8_sum = estimate_8x8_entropy(by * bw + bx, bx, by)
+                + estimate_8x8_entropy(by * bw + bx + 1, bx + 1, by);
+
+            let rq = rq0.max(rq1) as u32;
+            // DCT8X16: 16 cols (2 blocks), 8 rows (1 block)
+            let coeffs = compute_forward_transform_coeffs(
+                DCT8X16_TRANSFORM_ID,
+                pixel_x, pixel_y, pixel_b,
+                width, height, bx, by, 16, 8,
+            );
+            let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
+            let mut e_rect = 0.0f32;
+            for c in 0..3usize {
+                let dw_base = &dct8x16_weights[c * 128..(c + 1) * 128];
+                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
+                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                for k in 1..128 {
+                    let dw = dw_base[k] * dm_mul;
+                    if dw.abs() < 1e-10 { continue; }
+                    let q = (coeffs[c][k] * scale_rect / dw).round();
+                    e_rect += q.abs().sqrt() * chan_w;
+                }
+            }
+            e_rect *= entropy_mul_rect;
+
+            if e_rect < e8_sum {
+                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X16_TRANSFORM_ID;
+                map[by * bw + bx + 1] = DCT8X16_TRANSFORM_ID;
+                bx += 2;
+            } else {
+                bx += 1;
+            }
+        }
+    }
+
     // Phase 1: DCT16x16 merge (2x2 groups of 8x8 blocks).
     let h2 = bh / 2;
     let w2 = bw / 2;
@@ -2472,6 +2684,14 @@ fn build_entropy_merge_transform_map(
         for bx2 in 0..w2 {
             let bx = bx2 * 2;
             let by = by2 * 2;
+
+            // All 4 blocks must still be DCT8 (not already rect-merged)
+            let all_dct8 = [
+                (by, bx), (by, bx+1), (by+1, bx), (by+1, bx+1)
+            ].iter().all(|&(r, c)| {
+                map[r * bw + c] == (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)
+            });
+            if !all_dct8 { continue; }
 
             // Guard: skip merge if raw_quant values vary too much across the
             // 2x2 group. This prevents merging a smooth block with an edge
