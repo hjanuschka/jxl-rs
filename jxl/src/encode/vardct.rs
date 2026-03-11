@@ -312,6 +312,133 @@ pub fn encode_vardct_u8_rgb(
     wrap_codestream(&codestream)
 }
 
+/// Encode an sRGB u8 RGBA image as a VarDCT JXL with alpha channel.
+/// `rgba` is interleaved RGBA (4 bytes per pixel).
+pub fn encode_vardct_u8_rgba(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    config: &VarDctConfig,
+) -> Result<Vec<u8>> {
+    assert_eq!(rgba.len(), width * height * 4);
+    let npixels = width * height;
+    // Split into RGB + alpha
+    let mut rgb = vec![0u8; npixels * 3];
+    let mut alpha = vec![0u8; npixels];
+    for i in 0..npixels {
+        rgb[i * 3] = rgba[i * 4];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+        alpha[i] = rgba[i * 4 + 3];
+    }
+    let codestream = encode_single_rgba_frame(&rgb, width, height, config, None, Some(&alpha))?;
+    wrap_codestream(&codestream)
+}
+
+/// Encode multiple sRGB u8 RGB frames as an animated JXL.
+/// `frames`: slice of (rgb_data, duration_ms) pairs.
+/// All frames must have the same dimensions.
+/// Returns a JXL container wrapping the animation codestream.
+pub fn encode_vardct_animation_u8_rgb(
+    frames: &[(&[u8], u32)], // (rgb_data, duration_ms)
+    width: usize,
+    height: usize,
+    config: &VarDctConfig,
+) -> Result<Vec<u8>> {
+    assert!(!frames.is_empty(), "need at least one frame");
+    assert!(width > 0 && height > 0);
+
+    // Compute ticks per second from frame durations.
+    // Use 1000 TPS (millisecond precision) for simplicity.
+    let tps_num: u32 = 1000;
+    let tps_den: u32 = 1;
+
+    let mut codestream = Vec::new();
+
+    // Write animation file header
+    let mut header_writer = BitWriter::new();
+    crate::encode::headers::write_file_header_animated(
+        &mut header_writer,
+        width as u32, height as u32,
+        tps_num, tps_den,
+        0, // num_loops = 0 (infinite)
+    )?;
+    codestream.extend_from_slice(&header_writer.finish());
+
+    let npixels = width * height;
+    let bw = width.div_ceil(8);
+    let bh = height.div_ceil(8);
+
+    for (frame_idx, &(rgb, duration_ms)) in frames.iter().enumerate() {
+        assert_eq!(rgb.len(), npixels * 3, "frame {frame_idx} wrong size");
+        let is_last = frame_idx == frames.len() - 1;
+
+        let anim = AnimFrameParams {
+            duration: duration_ms,
+            is_last,
+        };
+        let frame_bytes = encode_single_rgb_frame(
+            rgb, width, height, config, Some(&anim),
+        )?;
+        codestream.extend_from_slice(&frame_bytes);
+    }
+
+    wrap_codestream(&codestream)
+}
+
+/// Encode multiple sRGB u8 RGBA frames as an animated JXL with alpha.
+/// `frames`: slice of (rgba_data, duration_ms) pairs.
+pub fn encode_vardct_animation_u8_rgba(
+    frames: &[(&[u8], u32)], // (rgba_data, duration_ms)
+    width: usize,
+    height: usize,
+    config: &VarDctConfig,
+) -> Result<Vec<u8>> {
+    assert!(!frames.is_empty(), "need at least one frame");
+    assert!(width > 0 && height > 0);
+    let npixels = width * height;
+
+    let tps_num: u32 = 1000;
+    let tps_den: u32 = 1;
+
+    let mut codestream = Vec::new();
+
+    // Write animation file header with alpha
+    let mut header_writer = BitWriter::new();
+    crate::encode::headers::write_file_header_animated_with_alpha(
+        &mut header_writer,
+        width as u32, height as u32,
+        tps_num, tps_den, 0,
+    )?;
+    codestream.extend_from_slice(&header_writer.finish());
+
+    for (frame_idx, &(rgba, duration_ms)) in frames.iter().enumerate() {
+        assert_eq!(rgba.len(), npixels * 4, "frame {frame_idx} wrong size");
+        let is_last = frame_idx == frames.len() - 1;
+
+        // Split RGBA -> RGB + alpha
+        let mut rgb = vec![0u8; npixels * 3];
+        let mut alpha = vec![0u8; npixels];
+        for i in 0..npixels {
+            rgb[i * 3] = rgba[i * 4];
+            rgb[i * 3 + 1] = rgba[i * 4 + 1];
+            rgb[i * 3 + 2] = rgba[i * 4 + 2];
+            alpha[i] = rgba[i * 4 + 3];
+        }
+
+        let anim = AnimFrameParams {
+            duration: duration_ms,
+            is_last,
+        };
+        let frame_bytes = encode_single_rgba_frame(
+            &rgb, width, height, config, Some(&anim), Some(&alpha),
+        )?;
+        codestream.extend_from_slice(&frame_bytes);
+    }
+
+    wrap_codestream(&codestream)
+}
+
 /// Encode an sRGB u8 RGB image as a raw VarDCT JXL codestream.
 pub fn encode_vardct_u8_rgb_codestream(
     rgb: &[u8],
@@ -319,7 +446,36 @@ pub fn encode_vardct_u8_rgb_codestream(
     height: usize,
     config: &VarDctConfig,
 ) -> Result<Vec<u8>> {
+    encode_single_rgb_frame(rgb, width, height, config, None)
+}
+
+/// Encode a single RGB frame. If `anim_params` is None, includes the file header
+/// (for standalone images). If Some, writes only the frame (for animation).
+fn encode_single_rgb_frame(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    config: &VarDctConfig,
+    anim_params: Option<&AnimFrameParams>,
+) -> Result<Vec<u8>> {
+    encode_single_rgba_frame(rgb, width, height, config, anim_params, None)
+}
+
+/// Encode a single frame from RGB + optional alpha.
+/// If `anim_params` is None, includes the file header (standalone image).
+/// If Some, writes only the frame (for animation).
+fn encode_single_rgba_frame(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    config: &VarDctConfig,
+    anim_params: Option<&AnimFrameParams>,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     assert_eq!(rgb.len(), width * height * 3);
+    if let Some(a) = alpha {
+        assert_eq!(a.len(), width * height);
+    }
     assert!(width > 0 && height > 0);
 
     let npixels = width * height;
@@ -478,7 +634,7 @@ pub fn encode_vardct_u8_rgb_codestream(
             zero_non_dct8_ac_coeffs(&mut ac_x_zero, &transform_map, bw, bh)?;
             zero_non_dct8_ac_coeffs(&mut ac_y_zero, &transform_map, bw, bh)?;
             zero_non_dct8_ac_coeffs(&mut ac_b_zero, &transform_map, bw, bh)?;
-            let frame_zero = encode_vardct_frame(
+            let frame_zero = encode_vardct_frame_inner(
                 width,
                 height,
                 bw,
@@ -496,6 +652,9 @@ pub fn encode_vardct_u8_rgb_codestream(
                 &ytox_map,
                 &ytob_map,
                 use_gab,
+                anim_params,
+                anim_params.is_none(), // include file header only for standalone images
+                alpha,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -526,7 +685,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                         x_dm_multiplier,
                         b_dm_multiplier,
                     )?;
-                let frame_nonzero = encode_vardct_frame(
+                let frame_nonzero = encode_vardct_frame_inner(
                     width,
                     height,
                     bw,
@@ -544,6 +703,9 @@ pub fn encode_vardct_u8_rgb_codestream(
                     &ytox_map,
                     &ytob_map,
                     use_gab,
+                    anim_params,
+                    anim_params.is_none(),
+                    alpha,
                 )?;
 
                 total_encodes += 1;
@@ -3650,8 +3812,13 @@ fn quantize_ac(
 /// Low dequant weight = visually important = small dead-zone (preserve detail).
 /// High dequant weight = less important = large dead-zone (save bytes).
 /// Returns dead-zone given the dequant_weight for the coefficient.
-#[inline]
 
+
+/// Animation parameters for a single frame.
+struct AnimFrameParams {
+    duration: u32,
+    is_last: bool,
+}
 
 /// Build the complete VarDCT frame bitstream.
 #[allow(clippy::too_many_arguments)]
@@ -3674,16 +3841,64 @@ fn encode_vardct_frame(
     ytob_map: &[i32],
     use_gab: bool,
 ) -> Result<Vec<u8>> {
+    encode_vardct_frame_inner(
+        width, height, bw, bh, global_scale, quant_lf,
+        dc_y, dc_x, dc_b, ac_x, ac_y, ac_b,
+        raw_quant_map, transform_map, ytox_map, ytob_map,
+        use_gab, None, true, // no animation, include file header
+        None, // no alpha
+    )
+}
+
+/// Inner function: encode a VarDCT frame.
+/// If `include_file_header` is true, writes the codestream file header first.
+/// If `anim_params` is Some, writes animation-aware frame header with duration/is_last.
+fn encode_vardct_frame_inner(
+    width: usize,
+    height: usize,
+    bw: usize,
+    bh: usize,
+    global_scale: u32,
+    quant_lf: u32,
+    dc_y: &[i32],
+    dc_x: &[i32],
+    dc_b: &[i32],
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
+    ytox_map: &[i32],
+    ytob_map: &[i32],
+    use_gab: bool,
+    anim_params: Option<&AnimFrameParams>,
+    include_file_header: bool,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let has_alpha = alpha.is_some();
+    let num_extra_channels = if has_alpha { 1u32 } else { 0 };
     let mut writer = BitWriter::new();
 
-    // Codestream header
-    write_file_header(&mut writer, width as u32, height as u32, true, false)?;
+    if include_file_header {
+        // Codestream header
+        if has_alpha {
+            crate::encode::headers::write_file_header_with_alpha(&mut writer, width as u32, height as u32)?;
+        } else {
+            write_file_header(&mut writer, width as u32, height as u32, true, false)?;
+        }
+    }
 
     // The decoder byte-aligns before frame-header parsing.
     writer.byte_align_zero_pad()?;
 
     // Frame header (VarDCT)
-    write_vardct_frame_header(&mut writer, width as u32, height as u32, use_gab)?;
+    write_vardct_frame_header_full(&mut writer, &FrameHeaderConfig {
+        use_gab,
+        num_extra_channels,
+        have_animation: anim_params.is_some(),
+        duration: anim_params.map_or(0, |ap| ap.duration),
+        is_last: anim_params.map_or(true, |ap| ap.is_last),
+    })?;
 
     // Group layout
     let group_dim_blocks = 32usize; // 256 pixels / 8
@@ -3699,6 +3914,8 @@ fn encode_vardct_frame(
         let section = encode_single_group_section(
             bw,
             bh,
+            width,
+            height,
             global_scale,
             quant_lf,
             dc_y,
@@ -3711,6 +3928,7 @@ fn encode_vardct_frame(
             transform_map,
             ytox_map,
             ytob_map,
+            alpha,
         )?;
 
         write_toc(&mut writer, &[section.len() as u32])?;
@@ -3741,6 +3959,28 @@ fn encode_vardct_frame(
         // TODO: enable when FindBest8x8Transform gives shape variety.
         let block_ctx: Option<CustomBlockCtx> = None;
         let num_contexts = 15; // default
+
+        // Pre-compute alpha tiles for multi-group encoding
+        let alpha_tiles: Vec<Option<(Vec<i32>, usize, usize)>> = if let Some(alpha_data) = alpha {
+            let group_dim = 256usize;
+            (0..num_groups).map(|g| {
+                let gx = g % num_groups_x;
+                let gy = g / num_groups_x;
+                let px0 = gx * group_dim;
+                let py0 = gy * group_dim;
+                let pw = (px0 + group_dim).min(width) - px0;
+                let ph = (py0 + group_dim).min(height) - py0;
+                let mut tile = vec![0i32; pw * ph];
+                for y in 0..ph {
+                    for x in 0..pw {
+                        tile[y * pw + x] = alpha_data[(py0 + y) * width + (px0 + x)] as i32;
+                    }
+                }
+                Some((tile, pw, ph))
+            }).collect()
+        } else {
+            vec![None; num_groups]
+        };
 
         // --- Phase 1: Tokenize ALL HF groups' AC data to build global histogram ---
         let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
@@ -3796,7 +4036,7 @@ fn encode_vardct_frame(
         // --- Phase 2: Write sections ---
 
         // LfGlobal
-        sections.push(encode_lf_global_section(global_scale, quant_lf, block_ctx.as_ref())?);
+        sections.push(encode_lf_global_section(global_scale, quant_lf, block_ctx.as_ref(), has_alpha)?);
 
         // LfGroups (use LF group dimensions)
         for g in 0..num_lf_groups {
@@ -3875,12 +4115,14 @@ fn encode_vardct_frame(
                 )?;
                 let mut hf_groups = Vec::with_capacity(num_groups);
                 for g in 0..num_groups {
+                    let at = alpha_tiles[g].as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h));
                     hf_groups.push(encode_hf_group_tokens_ans(
                         num_groups,
                         &group_tokens[g],
                         &all_encoded[g],
                         &context_map,
                         &distributions,
+                        at,
                     )?);
                 }
                 let bits =
@@ -3897,12 +4139,14 @@ fn encode_vardct_frame(
                 encode_hf_global_section_with_code(num_groups, &context_map, &uint_config, &codes)?;
             let mut hf_groups = Vec::with_capacity(num_groups);
             for g in 0..num_groups {
+                let at = alpha_tiles[g].as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h));
                 hf_groups.push(encode_hf_group_tokens(
                     num_groups,
                     &group_tokens[g],
                     &all_encoded[g],
                     &context_map,
                     &codes,
+                    at,
                 )?);
             }
             let bits = hf_global.len() * 8 + hf_groups.iter().map(|s| s.len() * 8).sum::<usize>();
@@ -4585,75 +4829,131 @@ fn quant_lf_coder() -> U32Coder {
     )
 }
 
-/// Write VarDCT frame header.
-/// Write VarDCT frame header.
-///
-/// Writes all fields of FrameHeader for a VarDCT, XYB-encoded, single-pass,
-/// last frame with no extra channels, no animation, no timecodes.
-fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32, use_gab: bool) -> Result<()> {
+/// Configuration for VarDCT frame header writing.
+struct FrameHeaderConfig {
+    use_gab: bool,
+    num_extra_channels: u32,
+    have_animation: bool,
+    duration: u32,
+    is_last: bool,
+}
+
+/// Unified VarDCT frame header writer.
+fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfig) -> Result<()> {
     // 1. all_default = false (we need VarDCT settings)
     writer.write(1, 0)?;
-    // 2. frame_type = RegularFrame (0), Bits(2)
+    // 2. frame_type = RegularFrame (0)
     writer.write(2, 0)?;
-    // 3. encoding = VarDCT (0), Bits(1)
+    // 3. encoding = VarDCT (0)
     writer.write(1, 0)?;
-    // 4. flags = 0 (u64: selector 00 = 0)
+    // 4. flags = 0
     writer.write(2, 0)?;
-    // 5. do_ycbcr: cond !xyb_encoded=false => NOT WRITTEN
-    // 6. jpeg_upsampling: cond do_ycbcr => NOT WRITTEN
-    // 7. upsampling = 1, u2S(1,2,4,8), Val(1) = selector 00
+    // 7. upsampling = 1
     writer.write(2, 0)?;
-    // 8. ec_upsampling: 0 extra channels => NOT WRITTEN
-    // 9. group_size_shift: cond encoding==Modular => NOT WRITTEN
-    // 10. x_qm_scale = 3 (default), Bits(3), cond VarDCT && xyb_encoded
+    // 8. ec_upsampling: one entry per extra channel, each = 1 (u2S(1,2,4,8), selector 00)
+    for _ in 0..cfg.num_extra_channels {
+        writer.write(2, 0)?; // upsampling = 1
+    }
+    // 10. x_qm_scale = 3
     writer.write(3, 3)?;
-    // 11. b_qm_scale = 2 (default), Bits(3)
+    // 11. b_qm_scale = 2
     writer.write(3, 2)?;
-    // 12. passes: cond frame_type != ReferenceOnly = true
-    //     num_passes = 1, u2S(1,2,3,Bits(3)+4), Val(1) = selector 00
+    // 12. passes: num_passes = 1
     writer.write(2, 0)?;
-    //     num_passes == 1, so num_ds/shift/downsampling not written
-    // 13. lf_level: cond frame_type==LFFrame => NOT WRITTEN
     // 14. have_crop = false
     writer.write(1, 0)?;
-    // 15. crop fields: cond have_crop => NOT WRITTEN
-    // 16. blending_info: cond RegularFrame = true
-    //     mode = Replace (0), u2S(0,1,2,Bits(2)+3), selector 00
+    // 16. blending_info: mode = Replace (0)
     writer.write(2, 0)?;
-    //     alpha_channel: cond num_extra_channels>0 => NOT WRITTEN
-    //     clamp: same cond => NOT WRITTEN
-    //     source: cond !(full_frame && Replace) = false => NOT WRITTEN
-    // 17. ec_blending_info: 0 extra channels => NOT WRITTEN
-    // 18. duration: cond have_animation=false => NOT WRITTEN
-    // 19. timecode: cond have_timecode=false => NOT WRITTEN
-    // 20. is_last = true (default for RegularFrame)
-    writer.write(1, 1)?;
-    // 21. save_as_reference: cond !LFFrame && !is_last = false => NOT WRITTEN
-    // 22. save_before_ct: cond false (is_last=true) => NOT WRITTEN
-    // 23. name: String, size = 0, u2S(0, Bits(4), Bits(5)+16, Bits(10)+48)
-    writer.write(2, 0)?; // selector 00 = Val(0)
-    // 24. restoration_filter: all_default=false, gab=true, epf_iters=2
-    writer.write(1, 0)?; // all_default = false
-    writer.write(1, if use_gab { 1 } else { 0 })?; // gab
-    if use_gab {
-        writer.write(1, 0)?; // gab_custom = false (default weights)
+    // For Replace mode: alpha_channel (cond Blend/AlphaWeightedAdd) NOT WRITTEN
+    //                    clamp (cond Blend/AlphaWeightedAdd/Mul) NOT WRITTEN
+    //                    source (cond !(full_frame && Replace)) NOT WRITTEN for full_frame
+    // 17. ec_blending_info: one per extra channel
+    for _ in 0..cfg.num_extra_channels {
+        // mode = Replace (0)
+        writer.write(2, 0)?;
+        // alpha_channel: cond num_extra_channels>0 && mode not Replace/None...
+        // Actually for Replace mode: alpha_channel, clamp, source conditions:
+        //   alpha_channel: cond num_extra_channels > 0 && (mode == kBlend || mode == kAlphaWeightedAdd)
+        //   For Replace: condition is false, NOT WRITTEN
+        //   clamp: same condition, NOT WRITTEN
+        //   source: cond !(full_frame && Replace) = false => NOT WRITTEN
     }
-    writer.write(2, 2)?; // epf_iters = 2, Bits(2)
-    // EPF fields (epf_iters > 0, !is_modular):
+    // 18. duration: cond have_animation
+    if cfg.have_animation {
+        write_u32(writer, &duration_coder(), cfg.duration)?;
+    }
+    // 20. is_last
+    writer.write(1, if cfg.is_last { 1 } else { 0 })?;
+    // 21. save_as_reference: cond !is_last
+    if !cfg.is_last {
+        writer.write(2, 0)?;
+    }
+    // 22. save_before_ct: #[condition(false)] - never serialized
+    // 23. name: size = 0
+    writer.write(2, 0)?;
+    // 24. restoration_filter
+    writer.write(1, 0)?; // all_default = false
+    writer.write(1, if cfg.use_gab { 1 } else { 0 })?;
+    if cfg.use_gab {
+        writer.write(1, 0)?; // gab_custom = false
+    }
+    writer.write(2, 2)?; // epf_iters = 2
     writer.write(1, 0)?; // epf_sharp_custom = false
     writer.write(1, 0)?; // epf_weight_custom = false
     writer.write(1, 0)?; // epf_sigma_custom = false
-    // LoopFilter extensions = 0 (u64: selector 00)
-    writer.write(2, 0)?;
-    // 25. FrameHeader extensions = 0 (u64: selector 00)
+    writer.write(2, 0)?; // LoopFilter extensions = 0
+    // 25. FrameHeader extensions = 0
     writer.write(2, 0)?;
     Ok(())
 }
 
+/// Legacy wrapper: no extra channels, no animation, is_last=true.
+fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32, use_gab: bool) -> Result<()> {
+    write_vardct_frame_header_full(writer, &FrameHeaderConfig {
+        use_gab,
+        num_extra_channels: 0,
+        have_animation: false,
+        duration: 0,
+        is_last: true,
+    })
+}
+
+/// Legacy wrapper for animation: no extra channels.
+fn write_vardct_frame_header_animated(
+    writer: &mut BitWriter,
+    _width: u32,
+    _height: u32,
+    use_gab: bool,
+    duration: u32,
+    is_last: bool,
+) -> Result<()> {
+    write_vardct_frame_header_full(writer, &FrameHeaderConfig {
+        use_gab,
+        num_extra_channels: 0,
+        have_animation: true,
+        duration,
+        is_last,
+    })
+}
+
+fn duration_coder() -> crate::headers::encodings::U32Coder {
+    use crate::headers::encodings::{U32, U32Coder};
+    // u2S(0, 1, Bits(8), Bits(32))
+    U32Coder::Select(
+        U32::Val(0),
+        U32::Val(1),
+        U32::Bits(8),
+        U32::Bits(32),
+    )
+}
+
 /// Encode all frame data as a single section (for single-group images).
+#[allow(clippy::too_many_arguments)]
 fn encode_single_group_section(
     bw: usize,
     bh: usize,
+    width: usize,
+    height: usize,
     global_scale: u32,
     quant_lf: u32,
     dc_y: &[i32],
@@ -4666,6 +4966,7 @@ fn encode_single_group_section(
     transform_map: &[u8],
     ytox_map: &[i32],
     ytob_map: &[i32],
+    alpha: Option<&[u8]>, // u8 alpha channel, width*height pixels
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
@@ -4684,7 +4985,18 @@ fn encode_single_group_section(
     w.write(1, 1)?;
     // Global tree: not present
     w.write(1, 0)?;
-    // Modular global: nothing for VarDCT with 0 extra channels
+    // Modular global: for VarDCT, only extra channels go here.
+    // With 0 extra channels: empty. With alpha: encode it as modular.
+    if let Some(alpha_data) = alpha {
+        // Alpha channel goes in the modular global subbitstream.
+        // For single-group images, all modular channels that are "small enough"
+        // (size <= group_dim) go into the global section.
+        // Our single-group images are always <= 256x256 pixels, so alpha fits.
+        let alpha_i32: Vec<i32> = alpha_data.iter().map(|&a| a as i32).collect();
+        crate::encode::modular_encode::encode_modular_signed_stream(
+            &mut w, width, height, 1, &alpha_i32,
+        )?;
+    }
 
     // === LfGroup0: VarDCT DC ===
     // extra_precision = 0 (2 bits)
@@ -4934,6 +5246,7 @@ fn encode_lf_global_section(
     global_scale: u32,
     quant_lf: u32,
     block_ctx: Option<&CustomBlockCtx>,
+    has_alpha: bool,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     // LfQuantFactors: all_default = true
@@ -4984,7 +5297,23 @@ fn encode_lf_global_section(
     w.write(1, 1)?;
     // Global tree: not present
     w.write(1, 0)?;
-    // Modular global: for VarDCT with 0 extra channels, nothing is read.
+    // Modular global:
+    // For VarDCT with 0 extra channels, nothing is read (channels list empty).
+    // For VarDCT with alpha (multi-group), the decoder reads a GroupHeader
+    // because channels is non-empty, but the global section has no channels to
+    // decode (all alpha data is in HF groups). We still must write the GroupHeader.
+    if has_alpha {
+        // Write empty GroupHeader: use_global_tree=false, no transforms
+        // GroupHeader:
+        //   use_global_tree: Bool(default false)
+        //   wp_params: WPHeader (default, only if !use_global_tree)
+        //   num_transforms: u2S(0, 1, Bits(4)+2, Bits(8)+18) = 0 (selector 00)
+        w.write(1, 0)?; // use_global_tree = false
+        // WPHeader: all_default = true
+        w.write(1, 1)?;
+        // num_transforms = 0
+        w.write(2, 0)?;
+    }
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
@@ -5785,6 +6114,7 @@ fn encode_hf_group_tokens(
     encoded: &[crate::encode::entropy::HybridUintEncoded],
     context_map: &[u8],
     codes: &[crate::encode::entropy::huffman_encode::HuffmanCode],
+    alpha_tile: Option<(&[i32], usize, usize)>, // (data, tile_w, tile_h)
 ) -> Result<Vec<u8>> {
     use crate::encode::entropy::huffman_encode::write_huffman_symbol;
 
@@ -5801,6 +6131,13 @@ fn encode_hf_group_tokens(
         }
     }
 
+    // Write modular alpha data after AC tokens, before byte-alignment
+    if let Some((tile_data, tw, th)) = alpha_tile {
+        crate::encode::modular_encode::encode_modular_signed_stream(
+            &mut w, tw, th, 1, tile_data,
+        )?;
+    }
+
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
@@ -5812,6 +6149,7 @@ fn encode_hf_group_tokens_ans(
     encoded: &[crate::encode::entropy::HybridUintEncoded],
     context_map: &[u8],
     distributions: &[crate::encode::entropy::ans::AnsDistribution],
+    alpha_tile: Option<(&[i32], usize, usize)>,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -5830,6 +6168,13 @@ fn encode_hf_group_tokens_ans(
         .collect();
 
     crate::encode::entropy::ans::write_ans_stream(&mut w, distributions, &ans_tokens)?;
+
+    // Write modular alpha data after AC tokens, before byte-alignment
+    if let Some((tile_data, tw, th)) = alpha_tile {
+        crate::encode::modular_encode::encode_modular_signed_stream(
+            &mut w, tw, th, 1, tile_data,
+        )?;
+    }
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -9179,5 +9524,108 @@ mod inverse_transform_tests {
                 .fold(0.0f32, f32::max);
             assert!(max_err < 0.01, "DCT8 roundtrip channel {}: max_err={}", c, max_err);
         }
+    }
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_rgba_small() {
+        // 16x16 RGBA: red with gradient alpha
+        let w = 16usize;
+        let h = 16usize;
+        let mut rgba = vec![0u8; w * h * 4];
+        for i in 0..w * h {
+            rgba[i * 4] = 255;     // R
+            rgba[i * 4 + 1] = 0;   // G
+            rgba[i * 4 + 2] = 0;   // B
+            rgba[i * 4 + 3] = ((i * 255) / (w * h - 1)) as u8; // gradient alpha
+        }
+        let config = VarDctConfig { distance: 2.0 };
+        let data = encode_vardct_u8_rgba(&rgba, w, h, &config).unwrap();
+        assert!(data.len() > 50);
+        std::fs::write("/tmp/test_rgba.jxl", &data).unwrap();
+        eprintln!("RGBA: {} bytes, 16x16", data.len());
+    }
+
+    #[test]
+    fn test_encode_rgba_dice() {
+        // Load dice RGBA (800x600, multi-group)
+        let bin = match std::fs::read("/tmp/dice_rgba.bin") {
+            Ok(b) => b,
+            Err(_) => { eprintln!("Skipping test_encode_rgba_dice: /tmp/dice_rgba.bin not found"); return; }
+        };
+        let w = 800usize;
+        let h = 600usize;
+        assert_eq!(bin.len(), w * h * 4);
+        let config = VarDctConfig { distance: 1.0 };
+        let data = encode_vardct_u8_rgba(&bin, w, h, &config).unwrap();
+        std::fs::write("/tmp/dice_jxlrs.jxl", &data).unwrap();
+        eprintln!("Dice RGBA: {} bytes, {}x{}", data.len(), w, h);
+    }
+
+    #[test]
+    fn test_encode_animation_3_frames() {
+        let w = 16usize;
+        let h = 16usize;
+        let mut frames = Vec::new();
+        // 3 frames: red, green, blue
+        for c in 0..3u8 {
+            let mut rgb = vec![0u8; w * h * 3];
+            for i in 0..w*h {
+                rgb[i*3 + c as usize] = 255;
+            }
+            frames.push((rgb, 100u32));
+        }
+        let frame_refs: Vec<(&[u8], u32)> = frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
+        let config = VarDctConfig { distance: 2.0 };
+        let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
+        assert!(data.len() > 100, "animation too small: {} bytes", data.len());
+        std::fs::write("/tmp/anim_test.jxl", &data).unwrap();
+        eprintln!("Animation: {} bytes, 3 frames 16x16", data.len());
+    }
+
+    #[test]
+    #[ignore] // requires /tmp/anim_rgba_frames.bin from APNG extraction
+    fn test_encode_icos_animation_rgba() {
+        let bin = std::fs::read("/tmp/anim_rgba_frames.bin").unwrap();
+        let w = u32::from_le_bytes(bin[0..4].try_into().unwrap()) as usize;
+        let h = u32::from_le_bytes(bin[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(bin[8..12].try_into().unwrap()) as usize;
+        let frame_size = w * h * 4; // RGBA
+        let mut frames = Vec::new();
+        for i in 0..n {
+            let start = 12 + i * frame_size;
+            let end = start + frame_size;
+            frames.push((bin[start..end].to_vec(), 50u32));
+        }
+        let frame_refs: Vec<(&[u8], u32)> = frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
+        let config = VarDctConfig { distance: 1.0 };
+        let data = encode_vardct_animation_u8_rgba(&frame_refs, w, h, &config).unwrap();
+        std::fs::write("/tmp/anim_icos_rgba_jxlrs.jxl", &data).unwrap();
+        eprintln!("Icos RGBA animation: {} bytes, {} frames {}x{}", data.len(), n, w, h);
+    }
+
+    #[test]
+    #[ignore] // requires /tmp/anim_rgb/frames.bin from APNG extraction
+    fn test_encode_icos_animation() {
+        let bin = std::fs::read("/tmp/anim_rgb/frames.bin").unwrap();
+        let w = u32::from_le_bytes(bin[0..4].try_into().unwrap()) as usize;
+        let h = u32::from_le_bytes(bin[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(bin[8..12].try_into().unwrap()) as usize;
+        let frame_size = w * h * 3;
+        let mut frames = Vec::new();
+        for i in 0..n {
+            let start = 12 + i * frame_size;
+            let end = start + frame_size;
+            frames.push((bin[start..end].to_vec(), 50u32)); // 50ms = 20fps
+        }
+        let frame_refs: Vec<(&[u8], u32)> = frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
+        let config = VarDctConfig { distance: 1.0 };
+        let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
+        std::fs::write("/tmp/anim_icos_jxlrs.jxl", &data).unwrap();
+        eprintln!("Icos animation: {} bytes, {} frames {}x{} (ref libjxl: 341449)", data.len(), n, w, h);
     }
 }

@@ -159,6 +159,239 @@ fn write_minimal_image_metadata_fields(writer: &mut BitWriter, xyb_encoded: bool
     write_image_metadata(writer, xyb_encoded, false)
 }
 
+/// Write image metadata for animated JXL: VarDCT, XYB-encoded, with animation header.
+/// `tps_numerator` and `tps_denominator` define ticks per second (e.g., 20/1 = 20fps).
+/// `num_loops` = 0 means infinite loop.
+pub(crate) fn write_image_metadata_animated(
+    writer: &mut BitWriter,
+    tps_numerator: u32,
+    tps_denominator: u32,
+    num_loops: u32,
+) -> Result<()> {
+    // ImageMetadata::all_default = false (need animation)
+    writer.write(1, 0)?;
+
+    // extra_fields = true (needed for have_animation)
+    writer.write(1, 1)?;
+
+    // orientation = Identity (1), Bits(3)+1, value=1 => write 0
+    writer.write(3, 0)?;
+
+    // have_intrinsic_size = false
+    writer.write(1, 0)?;
+
+    // have_preview = false
+    writer.write(1, 0)?;
+
+    // have_animation = true
+    writer.write(1, 1)?;
+
+    // Animation struct:
+    //   tps_numerator: u2S(100, 1000, Bits(10)+1, Bits(30)+1)
+    write_u32(writer, &tps_numerator_coder(), tps_numerator)?;
+    //   tps_denominator: u2S(1, 1001, Bits(8)+1, Bits(10)+1)
+    write_u32(writer, &tps_denominator_coder(), tps_denominator)?;
+    //   num_loops: u2S(0, Bits(3), Bits(16), Bits(32))
+    write_u32(writer, &num_loops_coder(), num_loops)?;
+    //   have_timecodes = false
+    writer.write(1, 0)?;
+
+    // bit_depth: default 8-bit int
+    writer.write(1, 0)?;  // floating_point_sample = false
+    write_u32(writer, &bit_depth_int_coder(), 8)?;
+
+    // modular_16bit_sufficient = true
+    writer.write(1, 1)?;
+
+    // extra_channel_info len = 0
+    write_u32(writer, &extra_channel_count_coder(), 0)?;
+
+    // xyb_encoded = true (VarDCT default)
+    writer.write(1, 1)?;
+
+    // color_encoding: all_default = true (sRGB)
+    writer.write(1, 1)?;
+
+    // tone_mapping: all_default = true (conditioned on extra_fields)
+    writer.write(1, 1)?;
+
+    // extensions = 0 (u64 coding: selector 00)
+    writer.write(2, 0)?;
+
+    Ok(())
+}
+
+/// Write image metadata for VarDCT, XYB-encoded, with 1 alpha extra channel.
+pub(crate) fn write_image_metadata_with_alpha(writer: &mut BitWriter) -> Result<()> {
+    // ImageMetadata::all_default = false
+    writer.write(1, 0)?;
+
+    // extra_fields = false (no orientation/animation/tone_mapping needed)
+    writer.write(1, 0)?;
+
+    // bit_depth: 8-bit integer default
+    writer.write(1, 0)?;  // floating_point_sample = false
+    write_u32(writer, &bit_depth_int_coder(), 8)?;
+
+    // modular_16bit_sufficient = true
+    writer.write(1, 1)?;
+
+    // extra_channel_info: 1 channel
+    write_u32(writer, &extra_channel_count_coder(), 1)?;
+
+    // ExtraChannelInfo[0]: Alpha, all_default = true
+    // all_default = true means: type=Alpha, bit_depth=8bit int, dim_shift=0,
+    // name="", alpha_associated=false
+    writer.write(1, 1)?;
+
+    // xyb_encoded = true
+    writer.write(1, 1)?;
+
+    // color_encoding: all_default = true (sRGB)
+    writer.write(1, 1)?;
+
+    // extensions = 0
+    writer.write(2, 0)?;
+
+    Ok(())
+}
+
+/// Write image metadata for animated JXL with alpha.
+pub(crate) fn write_image_metadata_animated_with_alpha(
+    writer: &mut BitWriter,
+    tps_numerator: u32,
+    tps_denominator: u32,
+    num_loops: u32,
+) -> Result<()> {
+    // ImageMetadata::all_default = false
+    writer.write(1, 0)?;
+
+    // extra_fields = true (needed for have_animation)
+    writer.write(1, 1)?;
+
+    // orientation = Identity (1), Bits(3)+1
+    writer.write(3, 0)?;
+
+    // have_intrinsic_size = false
+    writer.write(1, 0)?;
+
+    // have_preview = false
+    writer.write(1, 0)?;
+
+    // have_animation = true
+    writer.write(1, 1)?;
+    write_u32(writer, &tps_numerator_coder(), tps_numerator)?;
+    write_u32(writer, &tps_denominator_coder(), tps_denominator)?;
+    write_u32(writer, &num_loops_coder(), num_loops)?;
+    writer.write(1, 0)?; // have_timecodes = false
+
+    // bit_depth: 8-bit integer
+    writer.write(1, 0)?;
+    write_u32(writer, &bit_depth_int_coder(), 8)?;
+
+    // modular_16bit_sufficient = true
+    writer.write(1, 1)?;
+
+    // extra_channel_info: 1 channel (alpha)
+    write_u32(writer, &extra_channel_count_coder(), 1)?;
+    // ExtraChannelInfo[0]: all_default = true (Alpha, 8bit)
+    writer.write(1, 1)?;
+
+    // xyb_encoded = true
+    writer.write(1, 1)?;
+
+    // color_encoding: all_default = true (sRGB)
+    writer.write(1, 1)?;
+
+    // tone_mapping: all_default = true (conditioned on extra_fields)
+    writer.write(1, 1)?;
+
+    // extensions = 0
+    writer.write(2, 0)?;
+
+    Ok(())
+}
+
+/// Write file header with alpha channel (no animation).
+pub(crate) fn write_file_header_with_alpha(
+    writer: &mut BitWriter,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
+    write_size(writer, width, height)?;
+    write_image_metadata_with_alpha(writer)?;
+    // CustomTransformData::all_default = true.
+    writer.write(1, 1)?;
+    Ok(())
+}
+
+/// Write file header with alpha channel + animation.
+pub(crate) fn write_file_header_animated_with_alpha(
+    writer: &mut BitWriter,
+    width: u32,
+    height: u32,
+    tps_numerator: u32,
+    tps_denominator: u32,
+    num_loops: u32,
+) -> Result<()> {
+    writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
+    write_size(writer, width, height)?;
+    write_image_metadata_animated_with_alpha(writer, tps_numerator, tps_denominator, num_loops)?;
+    // CustomTransformData::all_default = true.
+    writer.write(1, 1)?;
+    Ok(())
+}
+
+/// Write file header (signature + size + metadata + CustomTransformData) for animation.
+pub(crate) fn write_file_header_animated(
+    writer: &mut BitWriter,
+    width: u32,
+    height: u32,
+    tps_numerator: u32,
+    tps_denominator: u32,
+    num_loops: u32,
+) -> Result<()> {
+    writer.write_aligned_bytes(&CODESTREAM_SIGNATURE)?;
+    write_size(writer, width, height)?;
+    write_image_metadata_animated(writer, tps_numerator, tps_denominator, num_loops)?;
+    // CustomTransformData::all_default = true.
+    writer.write(1, 1)?;
+    Ok(())
+}
+
+fn tps_numerator_coder() -> U32Coder {
+    // u2S(100, 1000, Bits(10)+1, Bits(30)+1)
+    U32Coder::Select(
+        U32::Val(100),
+        U32::Val(1000),
+        U32::BitsOffset { n: 10, off: 1 },
+        U32::BitsOffset { n: 30, off: 1 },
+    )
+}
+
+fn tps_denominator_coder() -> U32Coder {
+    // u2S(1, 1001, Bits(8)+1, Bits(10)+1)
+    U32Coder::Select(
+        U32::Val(1),
+        U32::Val(1001),
+        U32::BitsOffset { n: 8, off: 1 },
+        U32::BitsOffset { n: 10, off: 1 },
+    )
+}
+
+fn num_loops_coder() -> U32Coder {
+    // u2S(0, Bits(3), Bits(16), Bits(32))
+    U32Coder::Select(
+        U32::Val(0),
+        U32::Bits(3),
+        U32::Bits(16),
+        U32::Bits(32),
+    )
+}
+
+
+
 pub(crate) fn write_file_header(
     writer: &mut BitWriter,
     width: u32,
