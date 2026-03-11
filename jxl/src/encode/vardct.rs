@@ -1668,18 +1668,61 @@ fn rectangular_forward_solver(transform_id: u8) -> Option<&'static TransformLine
     Some(RECTANGULAR_FORWARD_SOLVERS[idx].get_or_init(|| build_linear_forward_solver(transform)))
 }
 
-/// Compute forward DCT NxN using the linear solver (decoder-basis inversion).
-/// N must be 16, 32, or 64.
+/// Forward 1D DCT of size N, matching jxl's basis convention:
+///   B[0][n] = 1               (DC)
+///   B[k][n] = sqrt(2) * cos(pi*(2n+1)*k/(2N))  (AC, k>0)
+///
+/// Forward: c[0] = (1/N) * sum_n x[n]
+///          c[k] = (sqrt(2)/N) * sum_n x[n] * cos(pi*(2n+1)*k/(2N))
+fn dct_1d_n(input: &[f32], output: &mut [f32], n: usize) {
+    let inv_n = 1.0 / n as f32;
+    let ac_scale = std::f32::consts::SQRT_2 * inv_n;
+    // DC
+    output[0] = input.iter().sum::<f32>() * inv_n;
+    // AC
+    for k in 1..n {
+        let mut sum = 0.0f32;
+        for i in 0..n {
+            sum += input[i]
+                * (std::f32::consts::PI * (2 * i + 1) as f32 * k as f32
+                    / (2 * n) as f32)
+                    .cos();
+        }
+        output[k] = sum * ac_scale;
+    }
+}
+
+/// Forward DCT NxN using separable 1D DCTs with jxl basis normalization.
+/// Matches libjxl's ComputeScaledDCT<N,N> + the decoder's inverse.
 fn forward_dct_nxn(pixels: &[f32], coeffs: &mut [f32], n: usize) {
-    let transform_id = match n {
-        16 => DCT16_TRANSFORM_ID,
-        32 => DCT32_TRANSFORM_ID,
-        _ => panic!("unsupported DCT size {}", n),
-    };
-    let solver = square_forward_solver(transform_id)
-        .unwrap_or_else(|| panic!("no solver for DCT{}", n));
-    let result = forward_with_linear_solver(pixels, solver);
-    coeffs[..result.len()].copy_from_slice(&result);
+    let mut temp = vec![0.0f32; n * n];
+    let mut row_in = vec![0.0f32; n];
+    let mut row_out = vec![0.0f32; n];
+
+    // Row-wise DCT
+    for y in 0..n {
+        row_in.copy_from_slice(&pixels[y * n..(y + 1) * n]);
+        dct_1d_n(&row_in, &mut row_out, n);
+        temp[y * n..(y + 1) * n].copy_from_slice(&row_out);
+    }
+
+    // Transpose
+    let mut transposed = vec![0.0f32; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            transposed[x * n + y] = temp[y * n + x];
+        }
+    }
+
+    // Column-wise DCT (on transposed = now rows)
+    for y in 0..n {
+        row_in.copy_from_slice(&transposed[y * n..(y + 1) * n]);
+        dct_1d_n(&row_in, &mut row_out, n);
+        // Store back transposed
+        for x in 0..n {
+            coeffs[x * n + y] = row_out[x];
+        }
+    }
 }
 
 fn forward_with_linear_solver(block: &[f32], solver: &TransformLinearForwardSolver) -> Vec<f32> {
@@ -2132,10 +2175,7 @@ fn build_entropy_merge_transform_map(
             }
             e16 *= entropy_mul_16;
 
-            // DCT16 wins if its estimated entropy is lower.
-            // Currently, DCT16 entropy tends to be higher than 4x DCT8 due to
-            // the forward solver producing slightly different coefficients than
-            // libjxl's TransformFromPixels. This means very few merges happen.
+            // DCT16 wins if estimated entropy is lower.
             if e16 < e8_sum {
                 map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
                 map[by * bw + bx + 1] = DCT16_TRANSFORM_ID;
