@@ -107,7 +107,10 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[ ]` Iterative `FindBestQuantization` butteraugli feedback loop (Kitten speed and slower).
 - `[ ]` DCT16x8/8x16 rectangular merges.
 - `[ ]` `AdjustQuantField` for non-8x8 transforms (max/mean interpolation).
-- `[ ]` Custom block entropy model (`FindBestBlockEntropyModel`).
+- `[~]` Custom block entropy model (`FindBestBlockEntropyModel`): infrastructure
+  in place (CustomBlockCtx, custom_block_context, compute_block_context_map,
+  custom LfGlobal encoding), but currently disabled -- overhead exceeds savings
+  without per-block transform variety.
 - `[ ]` Modular transforms (palette, squeeze, RCT).
 
 ### Current benchmarks (d=1.0, Squirrel speed)
