@@ -109,8 +109,8 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
 - `[ ]` Patches/splines/noise tools.
 - `[ ]` Iterative `FindBestQuantization` butteraugli feedback loop (Kitten speed and slower).
-- `[ ]` DCT16x8/8x16 rectangular merges.
-- `[ ]` `AdjustQuantField` for non-8x8 transforms (max/mean interpolation).
+- `[x]` DCT16x8/8x16 rectangular merges (entropy-based, group-boundary-safe).
+- `[x]` `AdjustQuantField` for non-8x8 transforms (max/mean interpolation).
 - `[~]` Custom block entropy model (`FindBestBlockEntropyModel`): infrastructure
   in place (CustomBlockCtx, custom_block_context, compute_block_context_map,
   custom LfGlobal encoding), but currently disabled -- overhead exceeds savings
@@ -140,22 +140,20 @@ Tested against jpegxl.info test images + Kodak dataset.
 
 | Image | Dimensions | jxl-rs bytes | libjxl bytes | Size % | jxl-rs dB | libjxl dB | dB gap |
 |-------|-----------|-------------|-------------|--------|-----------|-----------|--------|
-| Unsplash Photo | 896x1080 | 400,393 | 395,134 | +1% | 33.8 | 33.4 | **+0.4** |
-| Dice | 800x600 | 27,522 | 22,045 | +25% | 45.2 | 44.8 | **+0.4** |
-| WebKit Logo P3 | 1000x1000 | 23,142 | 6,546 | +254% | 43.8 | 44.4 | -0.6 |
-| Kodak #01 | 768x512 | 128,310 | 125,196 | +2% | 37.9 | 38.1 | -0.2 |
-| Kodak #08 | 768x512 | 142,876 | 135,977 | +5% | 37.2 | 37.4 | -0.2 |
-| Kodak #13 | 768x512 | 150,521 | 155,927 | **-4%** | 35.7 | 36.2 | -0.5 |
-| Kodak #23 | 768x512 | 56,551 | 49,672 | +14% | 39.0 | 38.1 | **+0.9** |
+| Unsplash Photo | 896x1080 | 403,256 | 395,134 | +2% | 33.9 | 33.4 | **+0.5** |
+| Dice | 800x600 | 27,383 | 22,045 | +24% | 45.0 | 44.8 | **+0.2** |
+| WebKit Logo P3 | 1000x1000 | 23,126 | 6,546 | +253% | 43.8 | 44.4 | -0.6 |
+| Kodak #01 | 768x512 | 130,170 | 125,196 | +4% | 38.1 | 38.1 | **0.0** |
+| Kodak #08 | 768x512 | 144,924 | 135,977 | +7% | 37.3 | 37.4 | -0.1 |
+| Kodak #13 | 768x512 | 152,070 | 155,927 | **-3%** | 35.8 | 36.2 | -0.4 |
+| Kodak #23 | 768x512 | 54,934 | 49,672 | +11% | 38.8 | 38.1 | **+0.6** |
 
-**Summary**: PSNR gap reduced to -0.2 to -0.5 dB (from -0.7 to -1.2 dB) via
-quant_ac * 1.12 scaling. 3 out of 7 images now have **better PSNR** than libjxl
-(Unsplash +0.4, Dice +0.4, Kodak #23 +0.9 dB). kodim13 is still smaller (-4%)
-than libjxl. WebKit logo remains a pathological case (+254% size).
-
-Key finding: at d=1.0, libjxl's FindBest8x8Transform keeps all blocks as DCT8
-(all coefficients round to 0 in EstimateEntropy). Per-block 8x8 transform
-selection only matters at higher distances.
+**Summary**: PSNR gap reduced to within **0.1 dB** for Kodak #01 and #08.
+3 out of 7 images have **better or equal PSNR** than libjxl (Unsplash +0.5,
+Kodak #01 matched, Kodak #23 +0.6 dB). kodim13 still has the largest gap
+(-0.4 dB) but is 3% smaller than libjxl. DCT16x8/DCT8x16 rectangular merges
+added. AdjustQuantField sets merged blocks to MAX of constituents.
+WebKit logo remains a pathological case (+253% size, needs modular encoding).
 
 ### Key remaining quality gaps
 
