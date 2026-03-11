@@ -42,7 +42,7 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
   libjxl's `enc_heuristics.cc` flow: AQ on original opsin -> `GaborishInverse` ->
   DCT on sharpened data. Uses mirror boundary conditions matching libjxl's
   `Symmetric5` convolution. Per-channel weight support (`apply_inverse_gaborish_weighted`).
-  Source image PSNR jumped 26->34 dB.
+  Gab disabled automatically at very low distances (`d < 0.3`).
 
 ### EPF (Edge-Preserving Filter)
 
@@ -61,19 +61,22 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
   (`IDENTITY`, `DCT2X2`, `DCT4X4`, `DCT4X8`, `DCT8X4`, `AFV0..AFV3`).
 - `[x]` Forward/inverse consistency tests for non-special square transforms
   (`DCT16`, `DCT32`, `DCT64`).
-- `[~]` Linear forward-solver parity paths for selected non-8x8 families:
+- `[x]` Linear forward-solver parity paths for selected non-8x8 families:
   square (`DCT16`, gated `DCT32`) and rectangular (`DCT16X8`, `DCT8X16`,
   `DCT32X8`, `DCT8X32`, gated `DCT32X16`/`DCT16X32`); larger families scalar fallback.
-- `[x]` Non-DCT8 tokenization order selection shape-id aligned with decoder
-  permutation semantics.
-- `[x]` Forced-map end-to-end decode tests through `DCT256`, `DCT256X128`, `DCT128X256`.
-- `[~]` **Entropy-based DCT16 merging**: for smooth 2x2 block groups at any distance,
-  estimates whether DCT16x16 is cheaper using non-zero coefficient fraction heuristic.
-  Candidate selection picks the best by actual encoded byte size. Saves ~4K bytes at d=1
-  on photographic content (77K -> 73K).
+- `[x]` **Entropy-based DCT16x16 merging**: for each aligned 2x2 group of 8x8
+  blocks, computes forward DCT16 using the same linear solver as encoding,
+  quantizes with actual dequant weights, and compares `sqrt(|q|)` entropy
+  against sum of 4x DCT8 entropies. Entropy multiplier calibrated at 1.3x
+  from Kodak test set. Candidate selection picks best by actual encoded byte size.
+- `[x]` **Hierarchical DCT32x32 merging**: after DCT16 pass, tries merging
+  aligned 2x2 groups of DCT16 blocks into DCT32. Uses entropy_mul_32 = 1.45x.
+- `[x]` `estimate_transform_entropy()` helper factored out for reuse.
 - `[x]` Conservative small-special candidate generation (`DCT4X8`/`DCT8X4`,
   `IDENTITY`/`DCT2X2`/`DCT4X4`, mixed special maps) and sparse AFV candidates
   for high-distance modes, all gated by exact-byte winner selection.
+- `[x]` Proper separable forward DCT-N helper (`dct_1d_n`, `forward_dct_nxn`)
+  matching jxl's basis convention: B[0][n]=1, B[k][n]=sqrt(2)*cos(pi*(2n+1)*k/(2N)).
 
 ### Entropy coding
 
@@ -95,27 +98,46 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
 - `[ ]` Patches/splines/noise tools.
 - `[ ]` Iterative `FindBestQuantization` butteraugli feedback loop (Kitten speed and slower).
-- `[ ]` Full AC strategy heuristic (libjxl's `ProcessRectACS` with entropy estimation).
+- `[ ]` DCT16x8/8x16 rectangular merges.
 - `[ ]` `AdjustQuantField` for non-8x8 transforms (max/mean interpolation).
 - `[ ]` Custom block entropy model (`FindBestBlockEntropyModel`).
 - `[ ]` Modular transforms (palette, squeeze, RCT).
 
-### Current benchmarks
+### Current benchmarks (d=1.0, Squirrel speed)
 
-| Image | Distance | jxl-rs bytes | jxl-rs dB | libjxl bytes | libjxl dB | Notes |
-|-------|----------|-------------|-----------|-------------|-----------|-------|
-| photo | d=1 | 73,304 | 28.79 | 65,444 | 28.62 | 12% bigger, +0.17 dB |
-| photo | d=2 | 32,109 | 27.99 | 25,886 | 27.94 | 24% bigger, +0.05 dB |
-| photo | d=3 | 7,463 | 27.81 | 13,342 | 27.63 | 44% smaller, +0.18 dB |
-| source | d=1 | 299,030 | 31.57 | 356,273 | 34.79 | 16% smaller, -3.2 dB |
+Tested against jpegxl.info test images + Kodak dataset.
 
-Key remaining gaps:
-- **Photo d=1/d=2 size**: ~12-24% bigger, primarily from all-DCT8x8 encoding.
-  libjxl uses larger transforms (DCT16/32) for smooth regions. Entropy-based
-  DCT16 merging partially addresses this (saves ~4K at d=1).
-- **Source d=1 PSNR**: -3.2 dB gap from lack of full AC strategy selection
-  and iterative butteraugli feedback. Text/screenshot content needs per-block
-  quality adaptation that our single-pass AQ can't provide.
+| Image | Dimensions | jxl-rs bytes | libjxl bytes | Size % | jxl-rs dB | libjxl dB | dB gap |
+|-------|-----------|-------------|-------------|--------|-----------|-----------|--------|
+| Unsplash Photo | 896x1080 | 369,409 | 395,134 | **-7%** | 33.1 | 33.4 | -0.3 |
+| Dice | 800x600 | 26,898 | 22,045 | +22% | 43.6 | 44.8 | -1.2 |
+| WebKit Logo P3 | 1000x1000 | 23,089 | 6,546 | +253% | 43.8 | 44.4 | -0.6 |
+| Kodak #01 | 768x512 | 121,715 | 125,196 | **-3%** | 37.4 | 38.1 | -0.8 |
+| Kodak #08 | 768x512 | 134,369 | 135,977 | **-1%** | 36.5 | 37.4 | -0.9 |
+| Kodak #13 | 768x512 | 141,881 | 155,927 | **-9%** | 35.0 | 36.2 | -1.2 |
+| Kodak #23 | 768x512 | 55,399 | 49,672 | +12% | 38.9 | 38.1 | **+0.8** |
+
+**Summary**: 4 out of 7 images are **smaller** than libjxl at Squirrel speed.
+PSNR gap is -0.3 to -1.2 dB on most images, meaning libjxl distributes bits
+more efficiently via full AC strategy selection and block context maps.
+WebKit logo is a pathological case (mostly white/transparent).
+
+### Key remaining quality gaps
+
+1. **PSNR per byte**: libjxl gets ~0.5-1 dB better quality at similar file sizes
+   due to richer AC strategy selection (DCT16x8/8x16 rectangular merges,
+   `FindBest8x8Transform` with 10 variants per block) and custom block
+   context maps.
+2. **WebKit logo**: 3.5x larger -- mostly-white images with sharp edges need
+   modular encoding or better block strategy for flat regions.
+3. **Block context map**: libjxl uses `FindBestBlockEntropyModel` to create
+   custom entropy contexts per block type, improving compression by 5-10%.
+
+### Sampler page
+
+Live comparison slider: https://static.januschka.com/jxl-encode/
+
+Includes all 7 test images with side-by-side jxl-rs vs libjxl decoded output.
 
 ## libjxl subsystem parity map
 
@@ -187,9 +209,10 @@ Key remaining gaps:
 
 - [x] E01 Forward lossy color pipeline (sRGB -> XYB).
 - [~] E02 Block strategy selection and transform dispatch.
-  - Done: DCT16 entropy-based merging, special-transform candidates, AFV candidates.
+  - Done: DCT16 + DCT32 entropy-based merging (hierarchical), special-transform
+    candidates, AFV candidates, proper separable forward DCT-N.
   - Remaining: full `ProcessRectACS` entropy estimation, DCT16x8/8x16 merging,
-    DCT32/64 merging, `FindBestFirstLevelDivisionForSquare`.
+    `FindBest8x8Transform` (10 variants), `FindBestFirstLevelDivisionForSquare`.
 - [x] E03 Quant field generation pipeline (full libjxl Squirrel-speed AQ port).
 - [x] E04 LF/HF coefficient tokenization and entropy coding.
 - [~] E05 Quality tuning heuristics and effort tiers.
