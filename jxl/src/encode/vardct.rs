@@ -2069,14 +2069,45 @@ fn build_transform_map_from_quantized_ac(
     build_default_transform_map(bw, bh)
 }
 
-/// Entropy-based DCT16x16 merging using libjxl's EstimateEntropy approach.
-/// For each aligned 2x2 group of 8x8 blocks, computes forward DCT16x16 on
-/// actual pixel data, quantizes, and compares sqrt(|q|) entropy against
+/// Estimate entropy for a forward-transformed block using sqrt(|quantized|).
+/// Matches libjxl's EstimateEntropy from enc_ac_strategy.cc.
+fn estimate_transform_entropy(
+    coeffs: &[Vec<f32>; 3],
+    weights: &[f32],
+    coeff_count: usize,
+    global_scale: u32,
+    raw_quant: u32,
+    x_dm_multiplier: f32,
+    b_dm_multiplier: f32,
+) -> f32 {
+    let scale = (global_scale as f32 * raw_quant as f32) / 65536.0;
+    let mut entropy = 0.0f32;
+    for c in 0..3usize {
+        let dw_base = &weights[c * coeff_count..(c + 1) * coeff_count];
+        let dm_mul = match c {
+            0 => x_dm_multiplier,
+            1 => 1.0,
+            _ => b_dm_multiplier,
+        };
+        let chan_weight = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+        for k in 1..coeff_count {
+            let dw = dw_base[k] * dm_mul;
+            if dw.abs() < 1e-10 { continue; }
+            let q = (coeffs[c][k] * scale / dw).round();
+            entropy += q.abs().sqrt() * chan_weight;
+        }
+    }
+    entropy
+}
+
+/// Entropy-based DCT16x16 (and DCT32x32) merging using libjxl's EstimateEntropy
+/// approach. For each aligned 2x2 group of 8x8 blocks, computes forward DCT16x16
+/// on actual pixel data, quantizes, and compares sqrt(|q|) entropy against
 /// the sum of 4x DCT8x8 entropies. Port of enc_ac_strategy.cc logic.
 fn build_entropy_merge_transform_map(
     pixel_x: &[f32],
     pixel_y: &[f32],
-    pixel_b: &[f32],  // should be b_minus_y for CfL-adjusted comparison
+    pixel_b: &[f32],  // b_minus_y for CfL-adjusted comparison
     width: usize,
     height: usize,
     bw: usize,
@@ -2093,15 +2124,12 @@ fn build_entropy_merge_transform_map(
 ) -> Vec<u8> {
     let mut map = build_default_transform_map(bw, bh);
 
-    // Entropy multipliers: libjxl uses 0.8*k8x8mul for DCT8 and 1.34 for DCT16,
-    // but those are calibrated for libjxl's full entropy model. For our encoder,
-    // DCT16 needs a moderate penalty because our entropy coding is less efficient
-    // for larger transforms (no block context map optimization).
-    let entropy_mul_8 = 1.0f32;
-    let entropy_mul_16 = 1.15f32; // moderate penalty for DCT16 overhead
+    // Entropy multiplier for DCT16/32: penalty calibrated against Kodak test
+    // images. Too low = over-merge = PSNR drop; too high = no merges at all.
+    let entropy_mul_16 = 1.3f32;
+    let entropy_mul_32 = 1.45f32;
 
     // Compute 8x8 block entropies from quantized coefficients.
-    // entropy = sum of sqrt(|quantized_ac|) -- libjxl EstimateEntropy
     let estimate_8x8_entropy = |blk: usize| -> f32 {
         let base = blk * 64;
         let mut e = 0.0f32;
@@ -2110,79 +2138,114 @@ fn build_entropy_merge_transform_map(
             e += (dct8_ac_x[base + k].abs() as f32).sqrt() * 0.3;
             e += (dct8_ac_b[base + k].abs() as f32).sqrt() * 0.3;
         }
-        e * entropy_mul_8
+        e
     };
 
-    // Try to merge aligned 2x2 groups into DCT16x16.
+    let dct16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(4);
+    let allow_square_solver = bw * bh <= SQUARE_SOLVER_MAX_BLOCKS;
+
+    // Phase 1: DCT16x16 merge (2x2 groups of 8x8 blocks).
     let h2 = bh / 2;
     let w2 = bw / 2;
-
-    // Get DCT16x16 dequant weights (needed for quantization).
-    // DCT16x16 dequant weights: quant_table_id=4, 3 channels * 256 coeffs each
-    let dct16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(4);
-
     for by2 in 0..h2 {
         for bx2 in 0..w2 {
             let bx = bx2 * 2;
             let by = by2 * 2;
 
-            // Sum of 4x DCT8x8 entropies (already scaled by entropy_mul_8).
             let e8_sum = estimate_8x8_entropy(by * bw + bx)
                 + estimate_8x8_entropy(by * bw + bx + 1)
                 + estimate_8x8_entropy((by + 1) * bw + bx)
                 + estimate_8x8_entropy((by + 1) * bw + bx + 1);
 
-            // Use the max raw_quant from the 4 blocks (libjxl AdjustQuantField
-            // uses max at low distances).
-            let rq = [
-                raw_quant_map[by * bw + bx],
-                raw_quant_map[by * bw + bx + 1],
-                raw_quant_map[(by + 1) * bw + bx],
-                raw_quant_map[(by + 1) * bw + bx + 1],
-            ];
-            let raw_quant = *rq.iter().max().unwrap() as u32;
+            let rq: u32 = (0..2).flat_map(|dy| (0..2).map(move |dx|
+                raw_quant_map[(by + dy) * bw + (bx + dx)] as u32
+            )).max().unwrap();
 
-            // Compute forward DCT16x16 for all 3 channels using the same
-            // transform as the actual encoding path (linear solver).
-            let all_coeffs_vecs = compute_forward_transform_coeffs(
+            let coeffs = compute_forward_transform_coeffs(
                 DCT16_TRANSFORM_ID,
                 pixel_x, pixel_y, pixel_b,
                 width, height, bx, by, 16, 16,
             );
-            let all_coeffs: [&[f32]; 3] = [&all_coeffs_vecs[0], &all_coeffs_vecs[1], &all_coeffs_vecs[2]];
+            let e16 = estimate_transform_entropy(
+                &coeffs, dct16_weights, 256,
+                global_scale, rq, x_dm_multiplier, b_dm_multiplier,
+            ) * entropy_mul_16;
 
-            // Get CfL factors for this tile.
-            // Quantize and estimate entropy.
-            let mut e16 = 0.0f32;
-            let scale = (global_scale as f32 * raw_quant as f32) / 65536.0;
-            for c in 0..3usize {
-                let dw_base = match c {
-                    0 => &dct16_weights[..256],
-                    1 => &dct16_weights[256..512],
-                    _ => &dct16_weights[512..768],
-                };
-                let dm_mul = match c {
-                    0 => x_dm_multiplier,
-                    1 => 1.0,
-                    _ => b_dm_multiplier,
-                };
-                let chan_weight = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
-                for k in 1..256 {
-                    let dw = dw_base[k] * dm_mul;
-                    if dw.abs() < 1e-10 { continue; }
-                    let q = (all_coeffs[c][k] * scale / dw).round();
-                    e16 += (q.abs()).sqrt() * chan_weight;
-                }
-            }
-            e16 *= entropy_mul_16;
-
-            // DCT16 wins if estimated entropy is lower.
-            // DCT16 wins if estimated entropy is lower.
             if e16 < e8_sum {
                 map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
                 map[by * bw + bx + 1] = DCT16_TRANSFORM_ID;
                 map[(by + 1) * bw + bx] = DCT16_TRANSFORM_ID;
                 map[(by + 1) * bw + bx + 1] = DCT16_TRANSFORM_ID;
+            }
+        }
+    }
+
+    // Phase 2: DCT32x32 merge (2x2 groups of DCT16 blocks = 4x4 of 8x8).
+    if allow_square_solver && bw >= 4 && bh >= 4 {
+        let dct32_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(5);
+        let h4 = bh / 4;
+        let w4 = bw / 4;
+        for by4 in 0..h4 {
+            for bx4 in 0..w4 {
+                let bx = bx4 * 4;
+                let by = by4 * 4;
+
+                // Check: all 4 constituent DCT16 blocks must already be DCT16.
+                let all_dct16 = (0..2).all(|dy| (0..2).all(|dx| {
+                    let idx = (by + dy * 2) * bw + (bx + dx * 2);
+                    map[idx] & 0x3F == DCT16_TRANSFORM_ID
+                        && map[idx] & TRANSFORM_FIRST_BLOCK_FLAG != 0
+                }));
+                if !all_dct16 { continue; }
+
+                // Sum of 4x DCT16 entropies.
+                let mut e16_sum = 0.0f32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let bx16 = bx + dx * 2;
+                        let by16 = by + dy * 2;
+                        let coeffs = compute_forward_transform_coeffs(
+                            DCT16_TRANSFORM_ID,
+                            pixel_x, pixel_y, pixel_b,
+                            width, height, bx16, by16, 16, 16,
+                        );
+                        let rq: u32 = (0..2).flat_map(|ddy| (0..2).map(move |ddx|
+                            raw_quant_map[(by16 + ddy) * bw + (bx16 + ddx)] as u32
+                        )).max().unwrap();
+                        e16_sum += estimate_transform_entropy(
+                            &coeffs, dct16_weights, 256,
+                            global_scale, rq, x_dm_multiplier, b_dm_multiplier,
+                        );
+                    }
+                }
+
+                let rq: u32 = (0..4).flat_map(|dy| (0..4).map(move |dx|
+                    raw_quant_map[(by + dy) * bw + (bx + dx)] as u32
+                )).max().unwrap();
+
+                let coeffs = compute_forward_transform_coeffs(
+                    DCT32_TRANSFORM_ID,
+                    pixel_x, pixel_y, pixel_b,
+                    width, height, bx, by, 32, 32,
+                );
+                let e32 = estimate_transform_entropy(
+                    &coeffs, dct32_weights, 1024,
+                    global_scale, rq, x_dm_multiplier, b_dm_multiplier,
+                ) * entropy_mul_32;
+
+                if e32 < e16_sum {
+                    // Set all 16 blocks to DCT32.
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let idx = (by + dy) * bw + (bx + dx);
+                            if dy == 0 && dx == 0 {
+                                map[idx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT32_TRANSFORM_ID;
+                            } else {
+                                map[idx] = DCT32_TRANSFORM_ID;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
