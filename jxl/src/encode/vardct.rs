@@ -356,8 +356,15 @@ pub fn encode_vardct_u8_rgb_codestream(
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
 
-    // Compute per-tile CfL ytob map
-    let ytob_map = compute_ytob_map(&dct_y, &dct_b, bw, bh);
+    // Compute per-tile CfL maps (ytox and ytob).
+    // Skip CfL optimization at near-lossless distances where the factor quantization
+    // (1/84 granularity) would dominate error.
+    let (ytox_map, ytob_map) = if config.distance >= 0.5 {
+        compute_cfl_maps(&dct_x, &dct_y, &dct_b, bw, bh)
+    } else {
+        let cr_size = bw.div_ceil(8) * bh.div_ceil(8);
+        (vec![0i32; cr_size], vec![0i32; cr_size])
+    };
 
     // Evaluate candidates by exact encoded frame size.
     // Budget: limit total encode evaluations to avoid combinatorial blowup.
@@ -377,6 +384,7 @@ pub fn encode_vardct_u8_rgb_codestream(
             x_dm_multiplier,
             b_dm_multiplier,
             bw,
+            &ytox_map,
             &ytob_map,
         );
         let transform_map_candidates = build_transform_map_candidates_from_quantized_ac(
@@ -416,6 +424,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                 &ac_b_zero,
                 raw_quant_map,
                 &transform_map,
+                &ytox_map,
                 &ytob_map,
             )?;
 
@@ -462,6 +471,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                     &ac_b_for_map,
                     raw_quant_map,
                     &transform_map,
+                    &ytox_map,
                     &ytob_map,
                 )?;
 
@@ -520,24 +530,26 @@ struct QuantizedVardct {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Compute per-tile ytob_map via least-squares regression.
-/// Returns the int8 b_factor per tile (cr_w * cr_h values).
-/// The actual CfL factor is: base_correlation_b + b_factor / kColorFactor = 1.0 + b_factor / 84.
-fn compute_ytob_map(
+/// Compute per-tile CfL maps (ytox_map and ytob_map) via least-squares regression.
+/// Returns (ytox_map, ytob_map), each cr_w * cr_h values.
+/// Actual factors: base_correlation_x + x_factor/84 for X, base_correlation_b + b_factor/84 for B.
+fn compute_cfl_maps(
+    dct_x: &[f32],
     dct_y: &[f32],
     dct_b: &[f32],
     bw: usize,
     bh: usize,
-) -> Vec<i32> {
+) -> (Vec<i32>, Vec<i32>) {
     const K_COLOR_FACTOR: f32 = 84.0;
     let cr_w = bw.div_ceil(8);
     let cr_h = bh.div_ceil(8);
+    let mut ytox_map = vec![0i32; cr_w * cr_h];
     let mut ytob_map = vec![0i32; cr_w * cr_h];
 
     for ty in 0..cr_h {
         for tx in 0..cr_w {
-            // Gather all AC coefficients in this 8x8-block tile
             let mut sum_yy = 0.0f64;
+            let mut sum_yx = 0.0f64;
             let mut sum_yb = 0.0f64;
 
             for by in (ty * 8)..((ty + 1) * 8).min(bh) {
@@ -545,26 +557,30 @@ fn compute_ytob_map(
                     let blk = by * bw + bx;
                     for k in 1..64 {
                         let y = dct_y[blk * 64 + k] as f64;
+                        let x = dct_x[blk * 64 + k] as f64;
                         let b = dct_b[blk * 64 + k] as f64;
                         sum_yy += y * y;
+                        sum_yx += y * x;
                         sum_yb += y * b;
                     }
                 }
             }
 
-            // Optimal factor = sum(y*b)/sum(y*y), clamped to reasonable range
             if sum_yy > 1e-10 {
-                let optimal_factor = sum_yb / sum_yy;
-                // b_factor = round((optimal_factor - base_correlation_b) * kColorFactor)
-                // base_correlation_b = 1.0
-                let b_factor = ((optimal_factor - 1.0) * K_COLOR_FACTOR as f64).round() as i32;
-                // Clamp to reasonable range (int8, but keep small to avoid overhead)
+                // X channel: base_correlation_x = 0, so x_factor = round(optimal_factor * 84)
+                let optimal_x = sum_yx / sum_yy;
+                let x_factor = (optimal_x * K_COLOR_FACTOR as f64).round() as i32;
+                ytox_map[ty * cr_w + tx] = x_factor.clamp(-127, 127);
+
+                // B channel: base_correlation_b = 1.0
+                let optimal_b = sum_yb / sum_yy;
+                let b_factor = ((optimal_b - 1.0) * K_COLOR_FACTOR as f64).round() as i32;
                 ytob_map[ty * cr_w + tx] = b_factor.clamp(-127, 127);
             }
         }
     }
 
-    ytob_map
+    (ytox_map, ytob_map)
 }
 
 fn quantize_vardct_blocks(
@@ -579,6 +595,7 @@ fn quantize_vardct_blocks(
     x_dm_multiplier: f32,
     b_dm_multiplier: f32,
     bw: usize,
+    ytox_map: &[i32],
     ytob_map: &[i32],
 ) -> QuantizedVardct {
     const K_COLOR_FACTOR: f32 = 84.0;
@@ -597,7 +614,9 @@ fn quantize_vardct_blocks(
         let by = blk / bw;
         let tx = bx / 8;
         let ty = by / 8;
+        let x_factor = ytox_map[ty * cr_w + tx];
         let b_factor = ytob_map[ty * cr_w + tx];
+        let ytox_ratio = x_factor as f32 / K_COLOR_FACTOR;
         let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
 
         // DC: apply CfL decorrelation and proper DC quantization.
@@ -612,13 +631,13 @@ fn quantize_vardct_blocks(
         dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
         dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
 
-        // AC: apply CfL decorrelation with per-tile ytob factor.
+        // AC: apply CfL decorrelation with per-tile ytox and ytob factors.
         for k in 1..64 {
             let dw_x = dequant_weights[k] * x_dm_multiplier;
             let dw_y = dequant_weights[64 + k];
             let dw_b = dequant_weights[128 + k] * b_dm_multiplier;
 
-            let ac_x = dct_x[blk * 64 + k];
+            let ac_x = dct_x[blk * 64 + k] - ytox_ratio * dct_y[blk * 64 + k];
             let ac_y = dct_y[blk * 64 + k];
             let ac_b = dct_b[blk * 64 + k] - ytob_ratio * dct_y[blk * 64 + k];
 
@@ -2661,6 +2680,7 @@ fn encode_vardct_frame(
     ac_b: &[i32],
     raw_quant_map: &[u8],
     transform_map: &[u8],
+    ytox_map: &[i32],
     ytob_map: &[i32],
 ) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
@@ -2698,6 +2718,7 @@ fn encode_vardct_frame(
             ac_b,
             raw_quant_map,
             transform_map,
+            ytox_map,
             ytob_map,
         )?;
 
@@ -2794,6 +2815,7 @@ fn encode_vardct_frame(
                 dc_b,
                 raw_quant_map,
                 transform_map,
+                ytox_map,
                 ytob_map,
             )?);
         }
@@ -3606,6 +3628,7 @@ fn encode_single_group_section(
     ac_b: &[i32],
     raw_quant_map: &[u8],
     transform_map: &[u8],
+    ytox_map: &[i32],
     ytob_map: &[i32],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
@@ -3678,7 +3701,10 @@ fn encode_single_group_section(
     let total = ch0_size + ch1_size + ch2_size + ch3_size;
 
     let mut hf_meta = vec![0i32; total];
-    // ch0 (ytox): all 0
+    // ch0 (ytox): copy from ytox_map
+    for i in 0..ch0_size {
+        hf_meta[i] = ytox_map[i];
+    }
     // ch1 (ytob): copy from ytob_map
     for i in 0..ch1_size {
         hf_meta[ch0_size + i] = ytob_map[i];
@@ -3782,6 +3808,7 @@ fn encode_lf_group_section(
     dc_b: &[i32],
     raw_quant_map: &[u8],
     transform_map: &[u8],
+    ytox_map: &[i32],
     ytob_map: &[i32],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
@@ -3840,13 +3867,14 @@ fn encode_lf_group_section(
     let ch1_size = cr_w * cr_h;
     let total = ch0_size + ch1_size + count * 2 + gw * gh;
     let mut hf_meta_data = vec![0i32; total];
-    // ch1 (ytob): copy from global ytob_map for this group's tile range
+    // ch0 (ytox) and ch1 (ytob): copy from global maps for this group's tile range
     let tile_x0 = x0 / 8;
     let tile_y0 = y0 / 8;
     for ty in 0..cr_h {
         for tx in 0..cr_w {
-            hf_meta_data[ch0_size + ty * cr_w + tx] =
-                ytob_map[(tile_y0 + ty) * global_cr_w + (tile_x0 + tx)];
+            let global_idx = (tile_y0 + ty) * global_cr_w + (tile_x0 + tx);
+            hf_meta_data[ty * cr_w + tx] = ytox_map[global_idx];
+            hf_meta_data[ch0_size + ty * cr_w + tx] = ytob_map[global_idx];
         }
     }
     let ch2_off = ch0_size + ch1_size;
@@ -6345,7 +6373,9 @@ mod tests {
 
             let (global_scale, quant_lf) = distance_to_quant_params(2.5);
             let raw_quant_map = vec![1u8; bw * bh];
-            let ytob_map = vec![0i32; bw.div_ceil(8) * bh.div_ceil(8)];
+            let cr_size = bw.div_ceil(8) * bh.div_ceil(8);
+            let ytox_map = vec![0i32; cr_size];
+            let ytob_map = vec![0i32; cr_size];
             let quantized = quantize_vardct_blocks(
                 &dct_x,
                 &dct_y,
@@ -6358,6 +6388,7 @@ mod tests {
                 0.8,
                 1.0,
                 bw,
+                &ytox_map,
                 &ytob_map,
             );
 
@@ -6409,6 +6440,7 @@ mod tests {
                 &ac_b,
                 &raw_quant_map,
                 &transform_map,
+                &ytox_map,
                 &ytob_map,
             )
             .unwrap();
