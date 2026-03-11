@@ -958,23 +958,7 @@ fn apply_per_block_modulations(
     }
 }
 
-/// Build the adaptive raw_quant map using libjxl's full adaptive quantization pipeline.
-/// Takes XYB pixel channels + distance, returns per-block raw_quant values.
-fn build_adaptive_raw_quant_map(
-    _dct_x: &[f32], _dct_y: &[f32], _dct_b: &[f32],
-    xyb_y: &[f32], img_w: usize, img_h: usize,
-    bw: usize, bh: usize, distance: f32, base_quant: u8,
-) -> Vec<u8> {
-    let num_blocks = bw * bh;
-    if distance < 1.0 || num_blocks < 64 {
-        return vec![base_quant; num_blocks];
-    }
-    // We need all 3 XYB channels for the full pipeline
-    // but only xyb_y is passed. Use base_quant as fallback for the simple path.
-    vec![base_quant; num_blocks]
-}
-
-/// Full adaptive quant requiring all 3 XYB channels.
+/// Build per-block adaptive quant map using libjxl's full pipeline.
 fn build_adaptive_raw_quant_map_full(
     xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
     img_w: usize, img_h: usize,
@@ -1011,20 +995,7 @@ fn build_adaptive_raw_quant_map_full(
     raw_quant_map
 }
 
-fn build_adaptive_raw_quant_map_candidates(
-    _dct_x: &[f32], _dct_y: &[f32], _dct_b: &[f32],
-    xyb_y: &[f32], img_w: usize, img_h: usize,
-    bw: usize, bh: usize, distance: f32, base_quant: u8,
-) -> Vec<Vec<u8>> {
-    // The full pipeline returns a single optimal map -- no need for multiple candidates.
-    // We still include the uniform base_quant as a candidate for the byte-size selector.
-    let num_blocks = bw * bh;
-    let uniform = vec![base_quant; num_blocks];
-    if distance < 1.0 || num_blocks < 64 {
-        return vec![uniform];
-    }
-    vec![uniform] // placeholder -- will be replaced with full map in caller
-}
+
 
 fn build_default_transform_map(bw: usize, bh: usize) -> Vec<u8> {
     vec![DCT8_TRANSFORM_ID | TRANSFORM_FIRST_BLOCK_FLAG; bw * bh]
