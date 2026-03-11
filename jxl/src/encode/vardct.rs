@@ -356,6 +356,9 @@ pub fn encode_vardct_u8_rgb_codestream(
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
 
+    // Compute per-tile CfL ytob map
+    let ytob_map = compute_ytob_map(&dct_y, &dct_b, bw, bh);
+
     // Evaluate candidates by exact encoded frame size.
     // Budget: limit total encode evaluations to avoid combinatorial blowup.
     const MAX_TOTAL_ENCODES: usize = 32;
@@ -373,6 +376,8 @@ pub fn encode_vardct_u8_rgb_codestream(
             &dequant_weights,
             x_dm_multiplier,
             b_dm_multiplier,
+            bw,
+            &ytob_map,
         );
         let transform_map_candidates = build_transform_map_candidates_from_quantized_ac(
             &quantized.ac_x,
@@ -411,6 +416,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                 &ac_b_zero,
                 raw_quant_map,
                 &transform_map,
+                &ytob_map,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -456,6 +462,7 @@ pub fn encode_vardct_u8_rgb_codestream(
                     &ac_b_for_map,
                     raw_quant_map,
                     &transform_map,
+                    &ytob_map,
                 )?;
 
                 total_encodes += 1;
@@ -513,6 +520,53 @@ struct QuantizedVardct {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Compute per-tile ytob_map via least-squares regression.
+/// Returns the int8 b_factor per tile (cr_w * cr_h values).
+/// The actual CfL factor is: base_correlation_b + b_factor / kColorFactor = 1.0 + b_factor / 84.
+fn compute_ytob_map(
+    dct_y: &[f32],
+    dct_b: &[f32],
+    bw: usize,
+    bh: usize,
+) -> Vec<i32> {
+    const K_COLOR_FACTOR: f32 = 84.0;
+    let cr_w = bw.div_ceil(8);
+    let cr_h = bh.div_ceil(8);
+    let mut ytob_map = vec![0i32; cr_w * cr_h];
+
+    for ty in 0..cr_h {
+        for tx in 0..cr_w {
+            // Gather all AC coefficients in this 8x8-block tile
+            let mut sum_yy = 0.0f64;
+            let mut sum_yb = 0.0f64;
+
+            for by in (ty * 8)..((ty + 1) * 8).min(bh) {
+                for bx in (tx * 8)..((tx + 1) * 8).min(bw) {
+                    let blk = by * bw + bx;
+                    for k in 1..64 {
+                        let y = dct_y[blk * 64 + k] as f64;
+                        let b = dct_b[blk * 64 + k] as f64;
+                        sum_yy += y * y;
+                        sum_yb += y * b;
+                    }
+                }
+            }
+
+            // Optimal factor = sum(y*b)/sum(y*y), clamped to reasonable range
+            if sum_yy > 1e-10 {
+                let optimal_factor = sum_yb / sum_yy;
+                // b_factor = round((optimal_factor - base_correlation_b) * kColorFactor)
+                // base_correlation_b = 1.0
+                let b_factor = ((optimal_factor - 1.0) * K_COLOR_FACTOR as f64).round() as i32;
+                // Clamp to reasonable range (int8, but keep small to avoid overhead)
+                ytob_map[ty * cr_w + tx] = b_factor.clamp(-127, 127);
+            }
+        }
+    }
+
+    ytob_map
+}
+
 fn quantize_vardct_blocks(
     dct_x: &[f32],
     dct_y: &[f32],
@@ -524,8 +578,12 @@ fn quantize_vardct_blocks(
     dequant_weights: &[f32],
     x_dm_multiplier: f32,
     b_dm_multiplier: f32,
+    bw: usize,
+    ytob_map: &[i32],
 ) -> QuantizedVardct {
+    const K_COLOR_FACTOR: f32 = 84.0;
     let num_blocks = raw_quant_map.len();
+    let cr_w = bw.div_ceil(8);
     let mut dc_x = vec![0i32; num_blocks];
     let mut dc_y = vec![0i32; num_blocks];
     let mut dc_b = vec![0i32; num_blocks];
@@ -535,6 +593,12 @@ fn quantize_vardct_blocks(
 
     for blk in 0..num_blocks {
         let raw_quant = raw_quant_map[blk] as u32;
+        let bx = blk % bw;
+        let by = blk / bw;
+        let tx = bx / 8;
+        let ty = by / 8;
+        let b_factor = ytob_map[ty * cr_w + tx];
+        let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
 
         // DC: apply CfL decorrelation and proper DC quantization.
         let raw_dc_x = dct_x[blk * 64];
@@ -548,7 +612,7 @@ fn quantize_vardct_blocks(
         dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
         dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
 
-        // AC: apply CfL decorrelation and quantize using dequant matrix weights.
+        // AC: apply CfL decorrelation with per-tile ytob factor.
         for k in 1..64 {
             let dw_x = dequant_weights[k] * x_dm_multiplier;
             let dw_y = dequant_weights[64 + k];
@@ -556,7 +620,7 @@ fn quantize_vardct_blocks(
 
             let ac_x = dct_x[blk * 64 + k];
             let ac_y = dct_y[blk * 64 + k];
-            let ac_b = dct_b[blk * 64 + k] - dct_y[blk * 64 + k];
+            let ac_b = dct_b[blk * 64 + k] - ytob_ratio * dct_y[blk * 64 + k];
 
             qx[blk * 64 + k] =
                 quantize_ac(ac_x, global_scale, raw_quant, dw_x, AC_DEAD_ZONE);
@@ -2597,6 +2661,7 @@ fn encode_vardct_frame(
     ac_b: &[i32],
     raw_quant_map: &[u8],
     transform_map: &[u8],
+    ytob_map: &[i32],
 ) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
 
@@ -2633,6 +2698,7 @@ fn encode_vardct_frame(
             ac_b,
             raw_quant_map,
             transform_map,
+            ytob_map,
         )?;
 
         write_toc(&mut writer, &[section.len() as u32])?;
@@ -2728,6 +2794,7 @@ fn encode_vardct_frame(
                 dc_b,
                 raw_quant_map,
                 transform_map,
+                ytob_map,
             )?);
         }
 
@@ -3539,6 +3606,7 @@ fn encode_single_group_section(
     ac_b: &[i32],
     raw_quant_map: &[u8],
     transform_map: &[u8],
+    ytob_map: &[i32],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
@@ -3611,7 +3679,10 @@ fn encode_single_group_section(
 
     let mut hf_meta = vec![0i32; total];
     // ch0 (ytox): all 0
-    // ch1 (ytob): all 0
+    // ch1 (ytob): copy from ytob_map
+    for i in 0..ch1_size {
+        hf_meta[ch0_size + i] = ytob_map[i];
+    }
     // ch2 (transform_image):
     //   row 0: transform type ids
     //   row 1: raw_quant - 1
@@ -3711,6 +3782,7 @@ fn encode_lf_group_section(
     dc_b: &[i32],
     raw_quant_map: &[u8],
     transform_map: &[u8],
+    ytob_map: &[i32],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -3763,12 +3835,20 @@ fn encode_lf_group_section(
 
     let cr_w = gw.div_ceil(8);
     let cr_h = gh.div_ceil(8);
-    // ytox / ytob / epf are zero, transform row0 stores transform type,
-    // row1 stores raw_quant - 1 for each transform entry.
+    let global_cr_w = bw.div_ceil(8);
     let ch0_size = cr_w * cr_h;
     let ch1_size = cr_w * cr_h;
     let total = ch0_size + ch1_size + count * 2 + gw * gh;
     let mut hf_meta_data = vec![0i32; total];
+    // ch1 (ytob): copy from global ytob_map for this group's tile range
+    let tile_x0 = x0 / 8;
+    let tile_y0 = y0 / 8;
+    for ty in 0..cr_h {
+        for tx in 0..cr_w {
+            hf_meta_data[ch0_size + ty * cr_w + tx] =
+                ytob_map[(tile_y0 + ty) * global_cr_w + (tile_x0 + tx)];
+        }
+    }
     let ch2_off = ch0_size + ch1_size;
     for (i, (transform_id, raw_quant)) in transform_entries.iter().copied().enumerate() {
         hf_meta_data[ch2_off + i] = transform_id as i32;
@@ -6265,6 +6345,7 @@ mod tests {
 
             let (global_scale, quant_lf) = distance_to_quant_params(2.5);
             let raw_quant_map = vec![1u8; bw * bh];
+            let ytob_map = vec![0i32; bw.div_ceil(8) * bh.div_ceil(8)];
             let quantized = quantize_vardct_blocks(
                 &dct_x,
                 &dct_y,
@@ -6276,6 +6357,8 @@ mod tests {
                 default_dct8x8_dequant_weights(),
                 0.8,
                 1.0,
+                bw,
+                &ytob_map,
             );
 
             let mut transform_map = build_default_transform_map(bw, bh);
@@ -6326,6 +6409,7 @@ mod tests {
                 &ac_b,
                 &raw_quant_map,
                 &transform_map,
+                &ytob_map,
             )
             .unwrap();
 
