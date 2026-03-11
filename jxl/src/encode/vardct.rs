@@ -778,8 +778,10 @@ fn build_adaptive_raw_quant_map_with_profile(
         0.0
     };
 
-    // Modulation range: how many raw_quant steps from base
-    let max_mod = if distance < 1.5 { 2.0f32 } else if distance < 2.5 { 3.0 } else { 4.0 };
+    // Modulation range: how many raw_quant steps from base.
+    // Wider range lets smooth areas save significantly more bytes while
+    // preserving detail in textured/edge areas with finer quantization.
+    let max_mod = if distance < 1.5 { 4.0f32 } else if distance < 2.5 { 5.0 } else { 6.0 };
     let mod_range = max_mod * dampen;
 
     let bq = base_quant as f32;
