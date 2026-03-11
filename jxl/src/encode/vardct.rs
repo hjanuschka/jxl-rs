@@ -336,11 +336,10 @@ pub fn encode_vardct_u8_rgb_codestream(
     // 1. Compute AQ map on ORIGINAL opsin (before inverse gaborish).
     //    kAcQuant = 0.765 for AdaptiveQuantizationMap scale.
     //    global_scale from ComputeGlobalScaleAndQuant(quant_dc, 0.39/d, 0).
-    // Scale quant_ac by 1.12 to reduce quantization aggressiveness.
-    // Our AQ map distributes bits less optimally than libjxl's, leading to
-    // ~0.7 dB PSNR gap. Scaling up compensates uniformly, closing the gap
-    // from -0.73 to -0.15 dB on kodim08 at the cost of ~5% larger files.
-    let quant_ac = (0.765f32 * 1.12) / config.distance;
+    // Scale quant_ac by 1.15 to reduce quantization aggressiveness.
+    // Our AQ map distributes bits less optimally than libjxl's. Scaling up
+    // compensates uniformly, closing PSNR gaps at the cost of ~5% larger files.
+    let quant_ac = (0.765f32 * 1.15) / config.distance;
     let (adaptive_map, global_scale, quant_lf, aq_float_map) = build_adaptive_raw_quant_map_full(
         &x_chan, &y_chan, &b_chan,
         width, height, bw, bh, config.distance, quant_ac,
