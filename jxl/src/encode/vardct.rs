@@ -11,16 +11,126 @@
 use crate::encode::bit_writer::BitWriter;
 use crate::encode::container::wrap_codestream;
 use crate::encode::encodings::write_u32;
+use crate::encode::entropy::huffman_encode::build_huffman_code;
 use crate::encode::headers::write_file_header;
 use crate::encode::toc::write_toc;
 use crate::encode::xyb::srgb_u8_to_xyb;
 use crate::error::Result;
-use crate::frame::block_context_map::{
-    self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT,
-};
-use crate::encode::entropy::huffman_encode::build_huffman_code;
+use crate::frame::block_context_map::{self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT};
 use crate::headers::encodings::{U32, U32Coder};
-use jxl_transforms::dct2d_8_scalar;
+use jxl_transforms::{
+    dct2d_8_scalar,
+    transform::transform_to_pixels,
+    transform_map::{HfTransformType, block_shape_id, covered_blocks_x, covered_blocks_y},
+};
+
+// If true, evaluate both ANS and Huffman AC entropy paths and choose the smaller payload.
+// If false, restrict to Huffman only.
+const USE_ANS_AC_ENTROPY: bool = true;
+const TRANSFORM_FIRST_BLOCK_FLAG: u8 = 0x80;
+const DCT8_TRANSFORM_ID: u8 = 0;
+const IDENTITY_TRANSFORM_ID: u8 = 1;
+const DCT2X2_TRANSFORM_ID: u8 = 2;
+const DCT4X4_TRANSFORM_ID: u8 = 3;
+const DCT16_TRANSFORM_ID: u8 = 4;
+const DCT32_TRANSFORM_ID: u8 = 5;
+const DCT16X8_TRANSFORM_ID: u8 = 6;
+const DCT8X16_TRANSFORM_ID: u8 = 7;
+const DCT32X8_TRANSFORM_ID: u8 = 8;
+const DCT8X32_TRANSFORM_ID: u8 = 9;
+const DCT32X16_TRANSFORM_ID: u8 = 10;
+const DCT16X32_TRANSFORM_ID: u8 = 11;
+const DCT4X8_TRANSFORM_ID: u8 = 12;
+const DCT8X4_TRANSFORM_ID: u8 = 13;
+const AFV0_TRANSFORM_ID: u8 = 14;
+const AFV1_TRANSFORM_ID: u8 = 15;
+const AFV2_TRANSFORM_ID: u8 = 16;
+const AFV3_TRANSFORM_ID: u8 = 17;
+const DCT64_TRANSFORM_ID: u8 = 18;
+const DCT64X32_TRANSFORM_ID: u8 = 19;
+const DCT32X64_TRANSFORM_ID: u8 = 20;
+const DCT128_TRANSFORM_ID: u8 = 21;
+const DCT128X64_TRANSFORM_ID: u8 = 22;
+const DCT64X128_TRANSFORM_ID: u8 = 23;
+const DCT256_TRANSFORM_ID: u8 = 24;
+const DCT256X128_TRANSFORM_ID: u8 = 25;
+const DCT128X256_TRANSFORM_ID: u8 = 26;
+
+fn is_supported_nonzero_transform_id(transform_id: u8) -> bool {
+    matches!(
+        transform_id,
+        IDENTITY_TRANSFORM_ID
+            | DCT2X2_TRANSFORM_ID
+            | DCT4X4_TRANSFORM_ID
+            | DCT16_TRANSFORM_ID
+            | DCT32_TRANSFORM_ID
+            | DCT16X8_TRANSFORM_ID
+            | DCT8X16_TRANSFORM_ID
+            | DCT32X8_TRANSFORM_ID
+            | DCT8X32_TRANSFORM_ID
+            | DCT32X16_TRANSFORM_ID
+            | DCT16X32_TRANSFORM_ID
+            | DCT4X8_TRANSFORM_ID
+            | DCT8X4_TRANSFORM_ID
+            | AFV0_TRANSFORM_ID
+            | AFV1_TRANSFORM_ID
+            | AFV2_TRANSFORM_ID
+            | AFV3_TRANSFORM_ID
+            | DCT64_TRANSFORM_ID
+            | DCT64X32_TRANSFORM_ID
+            | DCT32X64_TRANSFORM_ID
+            | DCT128_TRANSFORM_ID
+            | DCT128X64_TRANSFORM_ID
+            | DCT64X128_TRANSFORM_ID
+            | DCT256_TRANSFORM_ID
+            | DCT256X128_TRANSFORM_ID
+            | DCT128X256_TRANSFORM_ID
+    )
+}
+
+fn canonical_transform_for_shape_id(shape_id: usize) -> Option<HfTransformType> {
+    Some(match shape_id {
+        0 => HfTransformType::DCT,
+        1 => HfTransformType::AFV0,
+        2 => HfTransformType::DCT16X16,
+        3 => HfTransformType::DCT32X32,
+        4 => HfTransformType::DCT8X16,
+        5 => HfTransformType::DCT8X32,
+        6 => HfTransformType::DCT16X32,
+        7 => HfTransformType::DCT64X64,
+        8 => HfTransformType::DCT32X64,
+        9 => HfTransformType::DCT128X128,
+        10 => HfTransformType::DCT64X128,
+        11 => HfTransformType::DCT256X256,
+        12 => HfTransformType::DCT128X256,
+        _ => return None,
+    })
+}
+
+static TOKEN_SHAPE_ORDERS: [std::sync::OnceLock<Vec<usize>>; 13] = [
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+];
+
+fn token_shape_order(shape_id: usize) -> Option<&'static [usize]> {
+    let canonical = canonical_transform_for_shape_id(shape_id)?;
+    Some(
+        TOKEN_SHAPE_ORDERS[shape_id]
+            .get_or_init(|| natural_coeff_order_for_transform(canonical))
+            .as_slice(),
+    )
+}
 
 /// VarDCT encoder configuration.
 pub struct VarDctConfig {
@@ -35,11 +145,138 @@ impl Default for VarDctConfig {
 }
 
 /// Map distance parameter to (global_scale, quant_lf).
+/// Compute (global_scale, quant_lf) from butteraugli distance.
+#[cfg(test)]
 fn distance_to_quant_params(distance: f32) -> (u32, u32) {
-    let global_scale = (16384.0 / distance).round() as u32;
-    let global_scale = global_scale.clamp(1, 65535);
-    let quant_lf = 16u32;
-    (global_scale, quant_lf)
+    let (gs, ql, _) = distance_to_full_quant_params(distance);
+    (gs, ql)
+}
+
+/// Compute (global_scale, quant_lf, base_raw_quant) from butteraugli distance.
+///
+/// Mirrors libjxl's Quantizer::ComputeGlobalScaleAndQuant + InitialQuantDC:
+///   quant_ac = 0.79 / distance             (AC quant field value, fast mode)
+///   quant_dc = min(kDcQuant / dc_target, 50)
+///   global_scale = kGlobalScaleDenom * quant_ac / kQuantFieldTarget
+///   quant_lf = round(quant_dc * inv_global_scale + 0.5)
+///   base_raw_quant = ClampVal(quant_ac * inv_global_scale + 0.5)
+fn distance_to_full_quant_params(distance: f32) -> (u32, u32, u8) {
+    const K_AC_QUANT_FAST: f32 = 0.79;
+    const K_DC_QUANT: f32 = 1.095_924;
+    const K_DC_QUANT_POW: f32 = 0.83;
+    const K_DC_MUL: f32 = 0.3;
+    const K_GLOBAL_SCALE_DENOM: f32 = 65536.0;
+    const K_QUANT_FIELD_TARGET: f32 = 5.0;
+    const K_GLOBAL_SCALE_NUMERATOR: f32 = 4096.0;
+
+    let quant_ac = K_AC_QUANT_FAST / distance;
+
+    // DC quant with non-linearity for low distances.
+    let dc_target_raw = distance;
+    let dc_target = (0.5 * dc_target_raw).max(
+        (K_DC_MUL * ((1.0 / K_DC_MUL) * dc_target_raw).powf(K_DC_QUANT_POW)).min(dc_target_raw),
+    );
+    let quant_dc = (K_DC_QUANT / dc_target).min(50.0);
+
+    // global_scale = kGlobalScaleDenom * quant_ac / kQuantFieldTarget
+    let mut global_scale = (K_GLOBAL_SCALE_DENOM * quant_ac / K_QUANT_FIELD_TARGET).round() as i32;
+    // Clamp so quant_dc won't be too small.
+    let scaled_quant_dc = (quant_dc * K_GLOBAL_SCALE_NUMERATOR * 1.6) as i32;
+    if global_scale > scaled_quant_dc {
+        global_scale = scaled_quant_dc;
+    }
+    let global_scale = (global_scale.max(1) as u32).min(1 << 15);
+
+    let inv_global_scale = K_GLOBAL_SCALE_DENOM / global_scale as f32;
+    let quant_lf = ((quant_dc * inv_global_scale + 0.5).min(65536.0) as u32).max(1);
+    let base_raw_quant = ((quant_ac * inv_global_scale + 0.5) as u8).clamp(1, 255);
+
+    (global_scale, quant_lf, base_raw_quant)
+}
+
+#[allow(dead_code)]
+/// Apply inverse Gaborish (5x5 symmetric sharpening filter) to XYB pixel data.
+///
+/// Mirrors libjxl's `GaborishInverse` from enc_gaborish.cc.
+/// The decoder applies forward Gaborish (3x3 smoothing) when gab=true.
+/// The encoder compensates by applying this approximate inverse BEFORE the DCT.
+fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: usize) {
+    // libjxl inverse Gaborish kernel (symmetric 5x5).
+    const K: [f32; 5] = [
+        -0.094_958_16,
+        -0.041_031_725,
+        0.013_710_005,
+        0.006_510_206,
+        -0.001_478_906_4,
+    ];
+
+    // mul[c] = 1.0 for all channels (default).
+    let mul = 1.0f32;
+    let sum = 1.0 + mul * 4.0 * (K[0] + K[1] + K[2] + K[4] + 2.0 * K[3]);
+    let normalize = 1.0 / sum;
+    let nm = mul * normalize;
+
+    // WeightsSymmetric5 layout: [center, ring1_cardinal, ring1_diagonal,
+    //                            ring2_cardinal, ring2_diagonal, ring2_corner]
+    // In libjxl: {normalize, nm*K[0], nm*K[2], nm*K[1], nm*K[4], nm*K[3]}
+    // The 5x5 symmetric kernel:
+    //   K[3]  K[4]  K[1]  K[4]  K[3]
+    //   K[4]  K[2]  K[0]  K[2]  K[4]
+    //   K[1]  K[0]  1.0   K[0]  K[1]
+    //   K[4]  K[2]  K[0]  K[2]  K[4]
+    //   K[3]  K[4]  K[1]  K[4]  K[3]
+    let w_center = normalize;
+    let w_card1 = nm * K[0]; // distance 1, cardinal (up/down/left/right)
+    let w_diag1 = nm * K[2]; // distance 1, diagonal
+    let w_card2 = nm * K[1]; // distance 2, cardinal
+    let w_corner = nm * K[3]; // distance 2, corner (2,2)
+    let w_diag2 = nm * K[4]; // distance 2, knight-move (1,2)/(2,1)
+
+    for chan in channels.iter_mut() {
+        let input = chan.to_vec();
+        let get = |x: isize, y: isize| -> f32 {
+            let cx = x.clamp(0, width as isize - 1) as usize;
+            let cy = y.clamp(0, height as isize - 1) as usize;
+            input[cy * width + cx]
+        };
+
+        for y in 0..height {
+            let iy = y as isize;
+            for x in 0..width {
+                let ix = x as isize;
+                let mut v = get(ix, iy) * w_center;
+                // Ring 1: cardinal
+                v += (get(ix - 1, iy) + get(ix + 1, iy) + get(ix, iy - 1) + get(ix, iy + 1))
+                    * w_card1;
+                // Ring 1: diagonal
+                v += (get(ix - 1, iy - 1)
+                    + get(ix + 1, iy - 1)
+                    + get(ix - 1, iy + 1)
+                    + get(ix + 1, iy + 1))
+                    * w_diag1;
+                // Ring 2: cardinal
+                v += (get(ix - 2, iy) + get(ix + 2, iy) + get(ix, iy - 2) + get(ix, iy + 2))
+                    * w_card2;
+                // Ring 2: diagonal/knight
+                v += (get(ix - 1, iy - 2)
+                    + get(ix + 1, iy - 2)
+                    + get(ix - 1, iy + 2)
+                    + get(ix + 1, iy + 2)
+                    + get(ix - 2, iy - 1)
+                    + get(ix + 2, iy - 1)
+                    + get(ix - 2, iy + 1)
+                    + get(ix + 2, iy + 1))
+                    * w_diag2;
+                // Ring 2: corners
+                v += (get(ix - 2, iy - 2)
+                    + get(ix + 2, iy - 2)
+                    + get(ix - 2, iy + 2)
+                    + get(ix + 2, iy + 2))
+                    * w_corner;
+                chan[y * width + x] = v;
+            }
+        }
+    }
 }
 
 /// Encode an sRGB u8 RGB image as a VarDCT JXL file (container-wrapped).
@@ -69,9 +306,15 @@ pub fn encode_vardct_u8_rgb_codestream(
     let mut b_chan = vec![0.0f32; npixels];
     srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
 
+    // TODO: Apply inverse Gaborish before DCT when gab=true in frame header.
+    // Currently disabled; needs quantization recalibration to work well with Gaborish.
+
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
     let num_blocks = bw * bh;
+
+    // CfL input for B channel in HF coding: in_b = b - y.
+    let b_minus_y_chan: Vec<f32> = b_chan.iter().zip(&y_chan).map(|(&b, &y)| b - y).collect();
 
     // Forward DCT per channel
     let mut dct_x = vec![0.0f32; num_blocks * 64];
@@ -82,7 +325,7 @@ pub fn encode_vardct_u8_rgb_codestream(
     forward_dct_channel(&b_chan, width, height, bw, bh, &mut dct_b);
 
     // Quantize
-    let (global_scale, quant_lf) = distance_to_quant_params(config.distance);
+    let (global_scale, quant_lf, base_raw_quant) = distance_to_full_quant_params(config.distance);
 
     // INV_LF_QUANT from the spec/decoder: [4096.0, 512.0, 256.0] for channels [X, Y, B]
     let inv_lf_quant = [4096.0f32, 512.0, 256.0];
@@ -98,35 +341,212 @@ pub fn encode_vardct_u8_rgb_codestream(
     // For encoding: in_y = dc_y, in_x = dc_x, in_b = dc_b - dc_y
     // The channels in dct arrays are in XYB order.
 
-    // Separate DC and AC, quantize differently
+    let raw_quant_map_candidates = build_adaptive_raw_quant_map_candidates(
+        &dct_x,
+        &dct_y,
+        &dct_b,
+        bw,
+        bh,
+        config.distance,
+        base_raw_quant,
+    );
+
+    // Cache forward transformed non-8x8 blocks across candidate evaluation.
+    let mut forward_transform_cache = ForwardTransformCoeffCache::new();
+
+    // Evaluate candidates by exact encoded frame size.
+    // Budget: limit total encode evaluations to avoid combinatorial blowup.
+    const MAX_TOTAL_ENCODES: usize = 32;
+    let mut total_encodes = 0usize;
+    let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());
+    for raw_quant_map in &raw_quant_map_candidates {
+        let quantized = quantize_vardct_blocks(
+            &dct_x,
+            &dct_y,
+            &dct_b,
+            global_scale,
+            quant_lf,
+            raw_quant_map,
+            &inv_lf_quant,
+            &dequant_weights,
+            x_dm_multiplier,
+            b_dm_multiplier,
+        );
+        let transform_map_candidates = build_transform_map_candidates_from_quantized_ac(
+            &quantized.ac_x,
+            &quantized.ac_y,
+            &quantized.ac_b,
+            bw,
+            bh,
+            config.distance,
+        );
+
+        let mut best_frame = None;
+        let mut best_size = usize::MAX;
+        for transform_map in transform_map_candidates {
+            if total_encodes >= MAX_TOTAL_ENCODES {
+                break;
+            }
+            // Candidate A: legacy bootstrap behavior for non-8x8 transforms (all-zero AC).
+            let mut ac_x_zero = quantized.ac_x.clone();
+            let mut ac_y_zero = quantized.ac_y.clone();
+            let mut ac_b_zero = quantized.ac_b.clone();
+            zero_non_dct8_ac_coeffs(&mut ac_x_zero, &transform_map, bw, bh)?;
+            zero_non_dct8_ac_coeffs(&mut ac_y_zero, &transform_map, bw, bh)?;
+            zero_non_dct8_ac_coeffs(&mut ac_b_zero, &transform_map, bw, bh)?;
+            let frame_zero = encode_vardct_frame(
+                width,
+                height,
+                bw,
+                bh,
+                global_scale,
+                quant_lf,
+                &quantized.dc_y,
+                &quantized.dc_x,
+                &quantized.dc_b,
+                &ac_x_zero,
+                &ac_y_zero,
+                &ac_b_zero,
+                raw_quant_map,
+                &transform_map,
+            )?;
+
+            let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
+                (t & TRANSFORM_FIRST_BLOCK_FLAG) != 0
+                    && is_supported_nonzero_transform_id(t & !TRANSFORM_FIRST_BLOCK_FLAG)
+            });
+
+            total_encodes += 1;
+
+            let frame = if has_supported_nonzero_transform && total_encodes < MAX_TOTAL_ENCODES {
+                // Candidate B: non-zero coefficient path for supported larger transforms.
+                let (ac_x_for_map, ac_y_for_map, ac_b_for_map) =
+                    prepare_ac_for_transform_map_with_cache(
+                        &quantized.ac_x,
+                        &quantized.ac_y,
+                        &quantized.ac_b,
+                        &x_chan,
+                        &y_chan,
+                        &b_minus_y_chan,
+                        width,
+                        height,
+                        bw,
+                        bh,
+                        global_scale,
+                        raw_quant_map,
+                        &transform_map,
+                        Some(&mut forward_transform_cache),
+                        x_dm_multiplier,
+                        b_dm_multiplier,
+                    )?;
+                let frame_nonzero = encode_vardct_frame(
+                    width,
+                    height,
+                    bw,
+                    bh,
+                    global_scale,
+                    quant_lf,
+                    &quantized.dc_y,
+                    &quantized.dc_x,
+                    &quantized.dc_b,
+                    &ac_x_for_map,
+                    &ac_y_for_map,
+                    &ac_b_for_map,
+                    raw_quant_map,
+                    &transform_map,
+                )?;
+
+                total_encodes += 1;
+                if frame_nonzero.len() < frame_zero.len() {
+                    frame_nonzero
+                } else {
+                    frame_zero
+                }
+            } else {
+                frame_zero
+            };
+            if frame.len() < best_size {
+                best_size = frame.len();
+                best_frame = Some(frame);
+            }
+        }
+        if let Some(frame) = best_frame {
+            candidate_frames.push(frame);
+        }
+        if total_encodes >= MAX_TOTAL_ENCODES {
+            break;
+        }
+    }
+
+    if candidate_frames.is_empty() {
+        return Err(crate::error::Error::InvalidVarDCTTransformMap);
+    }
+    // Candidate 0 is always uniform raw_quant=base.
+    let uniform_size = candidate_frames[0].len();
+    let mut best_idx = 0usize;
+    let mut best_size = uniform_size;
+    for (idx, frame) in candidate_frames.iter().enumerate().skip(1) {
+        if frame.len() < best_size {
+            best_size = frame.len();
+            best_idx = idx;
+        }
+    }
+
+    // Regression-safe threshold: keep adaptive map only with a clear byte gain.
+    const ADAPTIVE_RAW_QUANT_MIN_GAIN_BYTES: usize = 0;
+    if best_idx > 0 && best_size + ADAPTIVE_RAW_QUANT_MIN_GAIN_BYTES < uniform_size {
+        Ok(candidate_frames.swap_remove(best_idx))
+    } else {
+        Ok(candidate_frames.swap_remove(0))
+    }
+}
+
+struct QuantizedVardct {
+    dc_x: Vec<i32>,
+    dc_y: Vec<i32>,
+    dc_b: Vec<i32>,
+    ac_x: Vec<i32>,
+    ac_y: Vec<i32>,
+    ac_b: Vec<i32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantize_vardct_blocks(
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    global_scale: u32,
+    quant_lf: u32,
+    raw_quant_map: &[u8],
+    inv_lf_quant: &[f32; 3],
+    dequant_weights: &[f32],
+    x_dm_multiplier: f32,
+    b_dm_multiplier: f32,
+) -> QuantizedVardct {
+    let num_blocks = raw_quant_map.len();
     let mut dc_x = vec![0i32; num_blocks];
     let mut dc_y = vec![0i32; num_blocks];
     let mut dc_b = vec![0i32; num_blocks];
     let mut qx = vec![0i32; num_blocks * 64];
     let mut qy = vec![0i32; num_blocks * 64];
     let mut qb = vec![0i32; num_blocks * 64];
-    let raw_quant = 1u32; // uniform quant field
 
     for blk in 0..num_blocks {
-        // DC: apply CfL decorrelation and proper DC quantization
+        let raw_quant = raw_quant_map[blk] as u32;
+
+        // DC: apply CfL decorrelation and proper DC quantization.
         let raw_dc_x = dct_x[blk * 64];
         let raw_dc_y = dct_y[blk * 64];
         let raw_dc_b = dct_b[blk * 64];
-
-        // Forward CfL: decoder does dec_b = in_y * 1.0 + in_b
-        // So in_b = dec_b - in_y, in_x = dec_x, in_y = dec_y
-        let cfl_dc_x = raw_dc_x;         // in_x = dc_x (y_to_x_lf=0)
-        let cfl_dc_y = raw_dc_y;         // in_y = dc_y
+        let cfl_dc_x = raw_dc_x; // in_x = dc_x (y_to_x_lf=0)
+        let cfl_dc_y = raw_dc_y; // in_y = dc_y
         let cfl_dc_b = raw_dc_b - raw_dc_y; // in_b = dc_b - dc_y (y_to_b_lf=1.0)
 
         dc_x[blk] = quantize_dc(cfl_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
         dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
         dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
 
-        // AC: apply CfL decorrelation and quantize using dequant matrix weights
-        // Decoder CfL: final_x = x_cc_mul * y + x, final_b = b_cc_mul * y + b
-        // With defaults: x_cc_mul=0, b_cc_mul=1.0
-        // Encoding: enc_x = dct_x, enc_y = dct_y, enc_b = dct_b - dct_y
+        // AC: apply CfL decorrelation and quantize using dequant matrix weights.
         for k in 1..64 {
             let dw_x = dequant_weights[k] * x_dm_multiplier;
             let dw_y = dequant_weights[64 + k];
@@ -134,21 +554,1942 @@ pub fn encode_vardct_u8_rgb_codestream(
 
             let ac_x = dct_x[blk * 64 + k];
             let ac_y = dct_y[blk * 64 + k];
-            let ac_b = dct_b[blk * 64 + k] - dct_y[blk * 64 + k]; // CfL decorrelation
+            let ac_b = dct_b[blk * 64 + k] - dct_y[blk * 64 + k];
 
             qx[blk * 64 + k] = quantize_ac(ac_x, global_scale, raw_quant, dw_x);
             qy[blk * 64 + k] = quantize_ac(ac_y, global_scale, raw_quant, dw_y);
             qb[blk * 64 + k] = quantize_ac(ac_b, global_scale, raw_quant, dw_b);
         }
-        // DC position in AC array is always 0 (DC is separate)
     }
 
-    // Build the frame
-    encode_vardct_frame(
-        width, height, bw, bh, global_scale, quant_lf,
-        &dc_y, &dc_x, &dc_b, // Note: Y, X, B order for DC
-        &qx, &qy, &qb,
+    QuantizedVardct {
+        dc_x,
+        dc_y,
+        dc_b,
+        ac_x: qx,
+        ac_y: qy,
+        ac_b: qb,
+    }
+}
+
+fn build_adaptive_raw_quant_map(
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+    base_quant: u8,
+) -> Vec<u8> {
+    build_adaptive_raw_quant_map_with_profile(
+        dct_x, dct_y, dct_b, bw, bh, distance, base_quant, 0.0, true,
     )
+}
+
+fn build_adaptive_raw_quant_map_with_profile(
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+    base_quant: u8,
+    percentile_shift: f32,
+    regularize: bool,
+) -> Vec<u8> {
+    let num_blocks = bw * bh;
+    let mut raw_quant_map = vec![base_quant; num_blocks];
+
+    // Preserve high-quality behavior and avoid overhead on tiny images.
+    if distance < 1.0 || num_blocks < 64 {
+        return raw_quant_map;
+    }
+
+    // Activity estimate from AC magnitudes.
+    let mut activity = vec![0.0f32; num_blocks];
+    for blk in 0..num_blocks {
+        let mut sum = 0.0f32;
+        let base = blk * 64;
+        for k in 1..64 {
+            let x = dct_x[base + k].abs();
+            let y = dct_y[base + k].abs();
+            let b = dct_b[base + k].abs();
+            sum += y + 0.35 * (x + b);
+        }
+        activity[blk] = sum / 63.0;
+    }
+
+    // Light spatial smoothing to reduce map entropy.
+    let mut smoothed = vec![0.0f32; num_blocks];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let idx = by * bw + bx;
+            let mut acc = activity[idx] * 2.0;
+            let mut w = 2.0;
+            if bx > 0 {
+                acc += activity[idx - 1];
+                w += 1.0;
+            }
+            if bx + 1 < bw {
+                acc += activity[idx + 1];
+                w += 1.0;
+            }
+            if by > 0 {
+                acc += activity[idx - bw];
+                w += 1.0;
+            }
+            if by + 1 < bh {
+                acc += activity[idx + bw];
+                w += 1.0;
+            }
+            smoothed[idx] = acc / w;
+        }
+    }
+
+    let mut sorted = smoothed.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let percentile = |p: f32| {
+        let p = p.clamp(0.01, 0.99);
+        let idx = ((sorted.len().saturating_sub(1)) as f32 * p).round() as usize;
+        sorted[idx.min(sorted.len().saturating_sub(1))]
+    };
+    let p = |base: f32| base + percentile_shift;
+
+    // Adaptive raw_quant values centered around base_quant.
+    // Low-activity blocks get higher raw_quant (coarser quantization, fewer bits).
+    // High-activity blocks get lower raw_quant (finer quantization, preserves detail).
+    let bq = base_quant as i16;
+    let cq = |offset: i16| (bq + offset).clamp(1, 255) as u8;
+    let (thresholds, quant_levels, num_levels): ([f32; 3], [u8; 4], usize) = if distance < 1.5 {
+        // At low distance: narrow range base +/- 1
+        ([percentile(p(0.40)), 0.0, 0.0], [cq(1), cq(-1), 0, 0], 2)
+    } else if distance < 2.5 {
+        // Medium distance: base +/- 2
+        (
+            [percentile(p(0.30)), percentile(p(0.60)), 0.0],
+            [cq(2), cq(0), cq(-2), 0],
+            3,
+        )
+    } else {
+        // High distance: base +/- 3
+        (
+            [
+                percentile(p(0.20)),
+                percentile(p(0.45)),
+                percentile(p(0.70)),
+            ],
+            [cq(3), cq(1), cq(-1), cq(-2)],
+            4,
+        )
+    };
+
+    for (idx, &a) in smoothed.iter().enumerate() {
+        let mut q = quant_levels[num_levels - 1];
+        for i in 0..(num_levels - 1) {
+            if a <= thresholds[i] {
+                q = quant_levels[i];
+                break;
+            }
+        }
+        raw_quant_map[idx] = q;
+    }
+
+    if regularize {
+        // One regularization pass: gently favor locally dominant raw_quant values.
+        let prev = raw_quant_map.clone();
+        for by in 0..bh {
+            for bx in 0..bw {
+                let idx = by * bw + bx;
+                let mut hist = [0u8; 9];
+                let mut add = |q: u8| hist[q as usize] = hist[q as usize].saturating_add(1);
+
+                add(prev[idx]);
+                if bx > 0 {
+                    add(prev[idx - 1]);
+                }
+                if bx + 1 < bw {
+                    add(prev[idx + 1]);
+                }
+                if by > 0 {
+                    add(prev[idx - bw]);
+                }
+                if by + 1 < bh {
+                    add(prev[idx + bw]);
+                }
+
+                let mut best_q = prev[idx];
+                let mut best_count = hist[best_q as usize];
+                for q in 1..hist.len() {
+                    if hist[q] > best_count {
+                        best_q = q as u8;
+                        best_count = hist[q];
+                    }
+                }
+                if best_count >= 3 {
+                    raw_quant_map[idx] = best_q;
+                }
+            }
+        }
+    }
+
+    raw_quant_map
+}
+
+fn build_adaptive_raw_quant_map_candidates(
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+    base_quant: u8,
+) -> Vec<Vec<u8>> {
+    let num_blocks = bw * bh;
+    let mut candidates = vec![vec![base_quant; num_blocks]];
+    if distance < 1.0 || num_blocks < 64 {
+        return candidates;
+    }
+
+    let profiles: &[(f32, bool)] = if num_blocks > 8192 {
+        if distance < 1.5 {
+            &[(0.0, true), (0.15, true)]
+        } else if distance < 2.5 {
+            &[(-0.05, true), (0.10, true), (0.0, false)]
+        } else {
+            &[(-0.05, true), (0.0, false)]
+        }
+    } else if distance < 1.5 {
+        &[(-0.15, true), (0.0, true), (0.15, true), (0.0, false)]
+    } else if distance < 2.5 {
+        &[
+            (-0.15, true),
+            (0.0, true),
+            (0.15, true),
+            (0.30, true),
+            (0.0, false),
+        ]
+    } else {
+        &[
+            (-0.20, true),
+            (-0.05, true),
+            (0.10, true),
+            (0.25, true),
+            (0.0, false),
+        ]
+    };
+
+    for (shift, regularize) in profiles {
+        let map = if *shift == 0.0 && *regularize {
+            build_adaptive_raw_quant_map(dct_x, dct_y, dct_b, bw, bh, distance, base_quant)
+        } else {
+            build_adaptive_raw_quant_map_with_profile(
+                dct_x,
+                dct_y,
+                dct_b,
+                bw,
+                bh,
+                distance,
+                base_quant,
+                *shift,
+                *regularize,
+            )
+        };
+        candidates.push(map);
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.iter().any(|u: &Vec<u8>| *u == candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn build_default_transform_map(bw: usize, bh: usize) -> Vec<u8> {
+    vec![DCT8_TRANSFORM_ID | TRANSFORM_FIRST_BLOCK_FLAG; bw * bh]
+}
+
+fn quantized_block_ac_all_zero(ac: &[i32], block_idx: usize) -> bool {
+    ac[block_idx * 64 + 1..block_idx * 64 + 64]
+        .iter()
+        .all(|&v| v == 0)
+}
+
+fn quantized_transform_region_ac_all_zero(
+    ac: &[i32],
+    bw: usize,
+    bx: usize,
+    by: usize,
+    cx: usize,
+    cy: usize,
+) -> bool {
+    for iy in 0..cy {
+        for ix in 0..cx {
+            let block_idx = (by + iy) * bw + (bx + ix);
+            if !quantized_block_ac_all_zero(ac, block_idx) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn build_zero_merge_transform_map(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    transform_priority: &[u8],
+) -> Vec<u8> {
+    let mut transform_map = build_default_transform_map(bw, bh);
+    let mut covered = vec![false; bw * bh];
+
+    let fits_hf_group = |bx: usize, by: usize, cx: usize, cy: usize| {
+        bx / 32 == (bx + cx - 1) / 32 && by / 32 == (by + cy - 1) / 32
+    };
+
+    for &transform_id in transform_priority {
+        let Some(transform_type) = HfTransformType::from_usize(transform_id as usize) else {
+            continue;
+        };
+        let cx = covered_blocks_x(transform_type) as usize;
+        let cy = covered_blocks_y(transform_type) as usize;
+        if cx == 1 && cy == 1 {
+            continue;
+        }
+
+        for by in 0..bh {
+            for bx in 0..bw {
+                if bx + cx > bw || by + cy > bh || !fits_hf_group(bx, by, cx, cy) {
+                    continue;
+                }
+
+                let mut free = true;
+                'free_check: for iy in 0..cy {
+                    for ix in 0..cx {
+                        if covered[(by + iy) * bw + (bx + ix)] {
+                            free = false;
+                            break 'free_check;
+                        }
+                    }
+                }
+                if !free {
+                    continue;
+                }
+
+                let all_zero = quantized_transform_region_ac_all_zero(ac_x, bw, bx, by, cx, cy)
+                    && quantized_transform_region_ac_all_zero(ac_y, bw, bx, by, cx, cy)
+                    && quantized_transform_region_ac_all_zero(ac_b, bw, bx, by, cx, cy);
+                if !all_zero {
+                    continue;
+                }
+
+                for iy in 0..cy {
+                    for ix in 0..cx {
+                        let idx = (by + iy) * bw + (bx + ix);
+                        transform_map[idx] = if ix == 0 && iy == 0 {
+                            TRANSFORM_FIRST_BLOCK_FLAG | transform_id
+                        } else {
+                            transform_id
+                        };
+                        covered[idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    transform_map
+}
+
+fn quantized_transform_region_abs_sum(
+    ac: &[i32],
+    bw: usize,
+    bx: usize,
+    by: usize,
+    cx: usize,
+    cy: usize,
+) -> u64 {
+    let mut sum = 0u64;
+    for iy in 0..cy {
+        for ix in 0..cx {
+            let block_idx = (by + iy) * bw + (bx + ix);
+            let base = block_idx * 64;
+            for &v in &ac[base + 1..base + 64] {
+                sum += v.unsigned_abs() as u64;
+            }
+        }
+    }
+    sum
+}
+
+fn build_low_energy_merge_transform_map(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    transform_priority: &[u8],
+    max_abs_sum_per_block: u64,
+) -> Vec<u8> {
+    let mut transform_map = build_default_transform_map(bw, bh);
+    let mut covered = vec![false; bw * bh];
+
+    let fits_hf_group = |bx: usize, by: usize, cx: usize, cy: usize| {
+        bx / 32 == (bx + cx - 1) / 32 && by / 32 == (by + cy - 1) / 32
+    };
+
+    for &transform_id in transform_priority {
+        let Some(transform_type) = HfTransformType::from_usize(transform_id as usize) else {
+            continue;
+        };
+        let cx = covered_blocks_x(transform_type) as usize;
+        let cy = covered_blocks_y(transform_type) as usize;
+        if cx == 1 && cy == 1 {
+            continue;
+        }
+
+        let region_budget = max_abs_sum_per_block * (cx * cy) as u64;
+        for by in 0..bh {
+            for bx in 0..bw {
+                if bx + cx > bw || by + cy > bh || !fits_hf_group(bx, by, cx, cy) {
+                    continue;
+                }
+
+                let mut free = true;
+                'free_check: for iy in 0..cy {
+                    for ix in 0..cx {
+                        if covered[(by + iy) * bw + (bx + ix)] {
+                            free = false;
+                            break 'free_check;
+                        }
+                    }
+                }
+                if !free {
+                    continue;
+                }
+
+                let energy = quantized_transform_region_abs_sum(ac_x, bw, bx, by, cx, cy)
+                    + quantized_transform_region_abs_sum(ac_y, bw, bx, by, cx, cy)
+                    + quantized_transform_region_abs_sum(ac_b, bw, bx, by, cx, cy);
+                if energy > region_budget {
+                    continue;
+                }
+
+                for iy in 0..cy {
+                    for ix in 0..cx {
+                        let idx = (by + iy) * bw + (bx + ix);
+                        transform_map[idx] = if ix == 0 && iy == 0 {
+                            TRANSFORM_FIRST_BLOCK_FLAG | transform_id
+                        } else {
+                            transform_id
+                        };
+                        covered[idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    transform_map
+}
+
+// NOTE: this is intentionally scalar for now.
+// SIMD forward-transform acceleration is deferred until algorithmic parity work
+// (transform selection + quant modeling + entropy contexting) stabilizes.
+fn forward_dct_1d_scalar(input: &[f32], output: &mut [f32]) {
+    assert_eq!(input.len(), output.len());
+    let n = input.len();
+    let inv_n = 1.0f32 / n as f32;
+    for (k, out) in output.iter_mut().enumerate() {
+        let scale = if k == 0 {
+            inv_n
+        } else {
+            std::f32::consts::SQRT_2 * inv_n
+        };
+        let mut sum = 0.0f32;
+        for (i, &v) in input.iter().enumerate() {
+            let angle = std::f32::consts::PI * ((2 * i + 1) * k) as f32 / (2.0 * n as f32);
+            sum += v * angle.cos();
+        }
+        *out = sum * scale;
+    }
+}
+
+fn forward_dct2d_scalar(block: &mut [f32], width: usize, height: usize) {
+    assert_eq!(block.len(), width * height);
+
+    if width == height {
+        // Match the layout convention used by jxl_transforms IDCT implementations:
+        // row transform -> transpose -> row transform (no final transpose).
+        let n = width;
+        let mut src = vec![0.0f32; n];
+        let mut dst = vec![0.0f32; n];
+
+        for row in 0..n {
+            let start = row * n;
+            src.copy_from_slice(&block[start..start + n]);
+            forward_dct_1d_scalar(&src, &mut dst);
+            block[start..start + n].copy_from_slice(&dst);
+        }
+
+        for i in 0..n {
+            for j in i + 1..n {
+                block.swap(i * n + j, j * n + i);
+            }
+        }
+
+        for row in 0..n {
+            let start = row * n;
+            src.copy_from_slice(&block[start..start + n]);
+            forward_dct_1d_scalar(&src, &mut dst);
+            block[start..start + n].copy_from_slice(&dst);
+        }
+        return;
+    }
+
+    // Rectangular fallback: row pass + column pass.
+    let mut row_src = vec![0.0f32; width];
+    let mut row_dst = vec![0.0f32; width];
+    let mut tmp = vec![0.0f32; width * height];
+    for y in 0..height {
+        let start = y * width;
+        row_src.copy_from_slice(&block[start..start + width]);
+        forward_dct_1d_scalar(&row_src, &mut row_dst);
+        tmp[start..start + width].copy_from_slice(&row_dst);
+    }
+
+    let mut col_src = vec![0.0f32; height];
+    let mut col_dst = vec![0.0f32; height];
+    for x in 0..width {
+        for y in 0..height {
+            col_src[y] = tmp[y * width + x];
+        }
+        forward_dct_1d_scalar(&col_src, &mut col_dst);
+        for y in 0..height {
+            block[y * width + x] = col_dst[y];
+        }
+    }
+}
+
+fn gather_clamped_block(
+    chan: &[f32],
+    width: usize,
+    height: usize,
+    px0: usize,
+    py0: usize,
+    block_w: usize,
+    block_h: usize,
+) -> Vec<f32> {
+    let mut block = vec![0.0f32; block_w * block_h];
+    for y in 0..block_h {
+        for x in 0..block_w {
+            let sx = (px0 + x).min(width - 1);
+            let sy = (py0 + y).min(height - 1);
+            block[y * block_w + x] = chan[sy * width + sx];
+        }
+    }
+    block
+}
+
+fn transform_coeff_index_to_block_storage(
+    full_bw: usize,
+    bx: usize,
+    by: usize,
+    cx: usize,
+    coeff_index: usize,
+) -> usize {
+    let xsize = cx * 8;
+    let x = coeff_index % xsize;
+    let y = coeff_index / xsize;
+
+    let block_x = x / 8;
+    let block_y = y / 8;
+    let inner_x = x % 8;
+    let inner_y = y % 8;
+
+    let global_block_idx = (by + block_y) * full_bw + (bx + block_x);
+    global_block_idx * 64 + inner_y * 8 + inner_x
+}
+
+fn zero_transform_region_ac(
+    ac: &mut [i32],
+    full_bw: usize,
+    bx: usize,
+    by: usize,
+    cx: usize,
+    cy: usize,
+) {
+    for iy in 0..cy {
+        for ix in 0..cx {
+            let bidx = (by + iy) * full_bw + (bx + ix);
+            let base = bidx * 64;
+            for coeff in &mut ac[base + 1..base + 64] {
+                *coeff = 0;
+            }
+        }
+    }
+}
+
+fn zero_non_dct8_ac_coeffs(
+    ac: &mut [i32],
+    transform_map: &[u8],
+    bw: usize,
+    bh: usize,
+) -> Result<()> {
+    for by in 0..bh {
+        for bx in 0..bw {
+            let idx = by * bw + bx;
+            let raw_transform = transform_map[idx];
+            if raw_transform & TRANSFORM_FIRST_BLOCK_FLAG == 0 {
+                continue;
+            }
+
+            let transform_id = raw_transform & !TRANSFORM_FIRST_BLOCK_FLAG;
+            if transform_id == DCT8_TRANSFORM_ID {
+                continue;
+            }
+
+            let transform_type = HfTransformType::from_usize(transform_id as usize).ok_or(
+                crate::error::Error::InvalidVarDCTTransform(transform_id as usize),
+            )?;
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            if bx + cx > bw || by + cy > bh {
+                return Err(crate::error::Error::HFBlockOutOfBounds);
+            }
+
+            zero_transform_region_ac(ac, bw, bx, by, cx, cy);
+        }
+    }
+    Ok(())
+}
+
+type ForwardTransformCoeffCache = std::collections::HashMap<(u8, usize, usize), [Vec<f32>; 3]>;
+
+static SPECIAL_8X8_FORWARD_INVERSE_MATRICES: [std::sync::OnceLock<Vec<f32>>; 9] = [
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+];
+
+fn special_8x8_transform_index(transform_id: u8) -> Option<(usize, HfTransformType)> {
+    Some(match transform_id {
+        IDENTITY_TRANSFORM_ID => (0usize, HfTransformType::IDENTITY),
+        DCT2X2_TRANSFORM_ID => (1usize, HfTransformType::DCT2X2),
+        DCT4X4_TRANSFORM_ID => (2usize, HfTransformType::DCT4X4),
+        DCT4X8_TRANSFORM_ID => (3usize, HfTransformType::DCT4X8),
+        DCT8X4_TRANSFORM_ID => (4usize, HfTransformType::DCT8X4),
+        AFV0_TRANSFORM_ID => (5usize, HfTransformType::AFV0),
+        AFV1_TRANSFORM_ID => (6usize, HfTransformType::AFV1),
+        AFV2_TRANSFORM_ID => (7usize, HfTransformType::AFV2),
+        AFV3_TRANSFORM_ID => (8usize, HfTransformType::AFV3),
+        _ => return None,
+    })
+}
+
+fn is_special_8x8_transform_id(transform_id: u8) -> bool {
+    special_8x8_transform_index(transform_id).is_some()
+}
+
+#[cfg(test)]
+fn forward_dct4x8_from_8x8(block: &[f32]) -> Vec<f32> {
+    forward_special_8x8_from_8x8(block, DCT4X8_TRANSFORM_ID)
+}
+
+#[cfg(test)]
+fn forward_dct8x4_from_8x8(block: &[f32]) -> Vec<f32> {
+    forward_special_8x8_from_8x8(block, DCT8X4_TRANSFORM_ID)
+}
+
+#[cfg(test)]
+fn forward_dct2x2_from_8x8(block: &[f32]) -> Vec<f32> {
+    forward_special_8x8_from_8x8(block, DCT2X2_TRANSFORM_ID)
+}
+
+#[cfg(test)]
+fn forward_dct4x4_from_8x8(block: &[f32]) -> Vec<f32> {
+    forward_special_8x8_from_8x8(block, DCT4X4_TRANSFORM_ID)
+}
+
+#[cfg(test)]
+fn forward_identity_from_8x8(block: &[f32]) -> Vec<f32> {
+    forward_special_8x8_from_8x8(block, IDENTITY_TRANSFORM_ID)
+}
+
+fn invert_square_matrix_f64(a: &[f64], n: usize) -> Option<Vec<f64>> {
+    debug_assert_eq!(a.len(), n * n);
+    let mut aug = vec![0.0f64; n * 2 * n];
+    for r in 0..n {
+        for c in 0..n {
+            aug[r * 2 * n + c] = a[r * n + c];
+        }
+        aug[r * 2 * n + n + r] = 1.0;
+    }
+
+    for col in 0..n {
+        let mut pivot_row = col;
+        let mut pivot_abs = aug[col * 2 * n + col].abs();
+        for r in col + 1..n {
+            let v = aug[r * 2 * n + col].abs();
+            if v > pivot_abs {
+                pivot_abs = v;
+                pivot_row = r;
+            }
+        }
+        if pivot_abs < 1e-12 {
+            return None;
+        }
+
+        if pivot_row != col {
+            for c in 0..2 * n {
+                aug.swap(col * 2 * n + c, pivot_row * 2 * n + c);
+            }
+        }
+
+        let pivot = aug[col * 2 * n + col];
+        for c in 0..2 * n {
+            aug[col * 2 * n + c] /= pivot;
+        }
+
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let factor = aug[r * 2 * n + col];
+            if factor == 0.0 {
+                continue;
+            }
+            for c in 0..2 * n {
+                aug[r * 2 * n + c] -= factor * aug[col * 2 * n + c];
+            }
+        }
+    }
+
+    let mut inv = vec![0.0f64; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            inv[r * n + c] = aug[r * 2 * n + n + c];
+        }
+    }
+    Some(inv)
+}
+
+fn build_forward_inverse_matrix(transform: HfTransformType) -> Vec<f32> {
+    let mut matrix = vec![0.0f64; 64 * 64];
+
+    for j in 0..64 {
+        let mut lf = vec![0.0f32; 1];
+        let mut coeffs = vec![0.0f32; 64];
+        if j == 0 {
+            lf[0] = 1.0;
+        } else {
+            coeffs[j] = 1.0;
+        }
+        transform_to_pixels(transform, &mut lf, &mut coeffs);
+        for i in 0..64 {
+            matrix[i * 64 + j] = coeffs[i] as f64;
+        }
+    }
+
+    let inv = invert_square_matrix_f64(&matrix, 64)
+        .expect("forward matrix should be invertible for supported 8x8 block transforms");
+    inv.into_iter().map(|v| v as f32).collect()
+}
+
+fn special_8x8_forward_inverse_matrix(transform_id: u8) -> &'static [f32] {
+    let (idx, transform) = special_8x8_transform_index(transform_id)
+        .expect("special_8x8_forward_inverse_matrix called for non-special transform id");
+    SPECIAL_8X8_FORWARD_INVERSE_MATRICES[idx]
+        .get_or_init(|| build_forward_inverse_matrix(transform))
+        .as_slice()
+}
+
+fn forward_special_8x8_from_8x8(block: &[f32], transform_id: u8) -> Vec<f32> {
+    debug_assert_eq!(block.len(), 64);
+    let inv = special_8x8_forward_inverse_matrix(transform_id);
+    let mut coeffs = vec![0.0f32; 64];
+    for r in 0..64 {
+        let mut sum = 0.0f32;
+        for c in 0..64 {
+            sum += inv[r * 64 + c] * block[c];
+        }
+        coeffs[r] = sum;
+    }
+    coeffs
+}
+
+#[cfg(test)]
+fn forward_afv_from_8x8(block: &[f32], transform_id: u8) -> Vec<f32> {
+    forward_special_8x8_from_8x8(block, transform_id)
+}
+
+struct TransformLinearForwardSolver {
+    coeff_count: usize,
+    lf_count: usize,
+    hf_coeff_indices: Vec<usize>,
+    inverse: Vec<f32>,
+}
+
+const RECTANGULAR_SOLVER_MAX_BLOCKS: usize = 1024;
+const SQUARE_SOLVER_MAX_BLOCKS: usize = 1024;
+
+static SQUARE_FORWARD_SOLVERS: [std::sync::OnceLock<TransformLinearForwardSolver>; 2] =
+    [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+
+static RECTANGULAR_FORWARD_SOLVERS: [std::sync::OnceLock<TransformLinearForwardSolver>; 6] = [
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+    std::sync::OnceLock::new(),
+];
+
+fn square_transform_index(transform_id: u8) -> Option<(usize, HfTransformType)> {
+    Some(match transform_id {
+        DCT16_TRANSFORM_ID => (0usize, HfTransformType::DCT16X16),
+        DCT32_TRANSFORM_ID => (1usize, HfTransformType::DCT32X32),
+        _ => return None,
+    })
+}
+
+fn rectangular_transform_index(transform_id: u8) -> Option<(usize, HfTransformType)> {
+    Some(match transform_id {
+        DCT16X8_TRANSFORM_ID => (0usize, HfTransformType::DCT16X8),
+        DCT8X16_TRANSFORM_ID => (1usize, HfTransformType::DCT8X16),
+        DCT32X8_TRANSFORM_ID => (2usize, HfTransformType::DCT32X8),
+        DCT8X32_TRANSFORM_ID => (3usize, HfTransformType::DCT8X32),
+        DCT32X16_TRANSFORM_ID => (4usize, HfTransformType::DCT32X16),
+        DCT16X32_TRANSFORM_ID => (5usize, HfTransformType::DCT16X32),
+        _ => return None,
+    })
+}
+
+fn build_linear_forward_solver(transform: HfTransformType) -> TransformLinearForwardSolver {
+    let cx = covered_blocks_x(transform) as usize;
+    let cy = covered_blocks_y(transform) as usize;
+    let coeff_count = cx * cy * 64;
+    let lf_count = cx * cy;
+
+    // Identify the LF-overwritten coefficient indices by canonical shape order.
+    let shape_id = block_shape_id(transform) as usize;
+    let canonical = canonical_transform_for_shape_id(shape_id)
+        .expect("missing canonical transform mapping for shape id");
+    let mut lowfreq_indices = natural_coeff_order_for_transform(canonical)[..lf_count].to_vec();
+    lowfreq_indices.sort_unstable();
+
+    let mut is_lowfreq = vec![false; coeff_count];
+    for idx in lowfreq_indices {
+        is_lowfreq[idx] = true;
+    }
+    let hf_coeff_indices: Vec<usize> = (0..coeff_count).filter(|&i| !is_lowfreq[i]).collect();
+
+    let mut matrix = vec![0.0f64; coeff_count * coeff_count];
+    for j in 0..coeff_count {
+        let mut lf = vec![0.0f32; lf_count];
+        let mut coeffs = vec![0.0f32; coeff_count];
+        if j < lf_count {
+            lf[j] = 1.0;
+        } else {
+            coeffs[hf_coeff_indices[j - lf_count]] = 1.0;
+        }
+        transform_to_pixels(transform, &mut lf, &mut coeffs);
+        for i in 0..coeff_count {
+            matrix[i * coeff_count + j] = coeffs[i] as f64;
+        }
+    }
+
+    let inv = invert_square_matrix_f64(&matrix, coeff_count)
+        .expect("forward matrix should be invertible for linear transform solver")
+        .into_iter()
+        .map(|v| v as f32)
+        .collect();
+
+    TransformLinearForwardSolver {
+        coeff_count,
+        lf_count,
+        hf_coeff_indices,
+        inverse: inv,
+    }
+}
+
+fn square_forward_solver(transform_id: u8) -> Option<&'static TransformLinearForwardSolver> {
+    let (idx, transform) = square_transform_index(transform_id)?;
+    Some(SQUARE_FORWARD_SOLVERS[idx].get_or_init(|| build_linear_forward_solver(transform)))
+}
+
+fn rectangular_forward_solver(transform_id: u8) -> Option<&'static TransformLinearForwardSolver> {
+    let (idx, transform) = rectangular_transform_index(transform_id)?;
+    Some(RECTANGULAR_FORWARD_SOLVERS[idx].get_or_init(|| build_linear_forward_solver(transform)))
+}
+
+fn forward_with_linear_solver(block: &[f32], solver: &TransformLinearForwardSolver) -> Vec<f32> {
+    debug_assert_eq!(block.len(), solver.coeff_count);
+    let n = solver.coeff_count;
+
+    let mut solved = vec![0.0f32; n];
+    for r in 0..n {
+        let mut sum = 0.0f32;
+        for c in 0..n {
+            sum += solver.inverse[r * n + c] * block[c];
+        }
+        solved[r] = sum;
+    }
+
+    let mut coeffs = vec![0.0f32; n];
+    for (i, &coeff_index) in solver.hf_coeff_indices.iter().enumerate() {
+        coeffs[coeff_index] = solved[solver.lf_count + i];
+    }
+    coeffs
+}
+
+fn compute_forward_transform_coeffs(
+    transform_id: u8,
+    x_chan: &[f32],
+    y_chan: &[f32],
+    b_minus_y_chan: &[f32],
+    width: usize,
+    height: usize,
+    bx: usize,
+    by: usize,
+    block_w: usize,
+    block_h: usize,
+) -> [Vec<f32>; 3] {
+    if is_special_8x8_transform_id(transform_id) {
+        let block_x = gather_clamped_block(x_chan, width, height, bx * 8, by * 8, 8, 8);
+        let block_y = gather_clamped_block(y_chan, width, height, bx * 8, by * 8, 8, 8);
+        let block_b = gather_clamped_block(b_minus_y_chan, width, height, bx * 8, by * 8, 8, 8);
+
+        let synth = |block: &[f32]| forward_special_8x8_from_8x8(block, transform_id);
+
+        return [synth(&block_x), synth(&block_y), synth(&block_b)];
+    }
+
+    let bw = width.div_ceil(8);
+    let bh = height.div_ceil(8);
+
+    let allow_expensive_square_solver = bw * bh <= SQUARE_SOLVER_MAX_BLOCKS;
+    let use_square_solver = if transform_id == DCT32_TRANSFORM_ID {
+        allow_expensive_square_solver
+    } else {
+        transform_id == DCT16_TRANSFORM_ID
+    };
+    if use_square_solver {
+        if let Some(solver) = square_forward_solver(transform_id) {
+            let block_x =
+                gather_clamped_block(x_chan, width, height, bx * 8, by * 8, block_w, block_h);
+            let block_y =
+                gather_clamped_block(y_chan, width, height, bx * 8, by * 8, block_w, block_h);
+            let block_b = gather_clamped_block(
+                b_minus_y_chan,
+                width,
+                height,
+                bx * 8,
+                by * 8,
+                block_w,
+                block_h,
+            );
+            debug_assert_eq!(block_w * block_h, solver.coeff_count);
+            let synth = |block: &[f32]| forward_with_linear_solver(block, solver);
+            return [synth(&block_x), synth(&block_y), synth(&block_b)];
+        }
+    }
+
+    let allow_expensive_rect_solver = bw * bh <= RECTANGULAR_SOLVER_MAX_BLOCKS;
+    let use_rect_solver = if matches!(transform_id, DCT32X16_TRANSFORM_ID | DCT16X32_TRANSFORM_ID) {
+        allow_expensive_rect_solver
+    } else {
+        true
+    };
+
+    if use_rect_solver {
+        if let Some(solver) = rectangular_forward_solver(transform_id) {
+            let block_x =
+                gather_clamped_block(x_chan, width, height, bx * 8, by * 8, block_w, block_h);
+            let block_y =
+                gather_clamped_block(y_chan, width, height, bx * 8, by * 8, block_w, block_h);
+            let block_b = gather_clamped_block(
+                b_minus_y_chan,
+                width,
+                height,
+                bx * 8,
+                by * 8,
+                block_w,
+                block_h,
+            );
+            debug_assert_eq!(block_w * block_h, solver.coeff_count);
+            let synth = |block: &[f32]| forward_with_linear_solver(block, solver);
+            return [synth(&block_x), synth(&block_y), synth(&block_b)];
+        }
+    }
+
+    let mut block_x = gather_clamped_block(x_chan, width, height, bx * 8, by * 8, block_w, block_h);
+    let mut block_y = gather_clamped_block(y_chan, width, height, bx * 8, by * 8, block_w, block_h);
+    let mut block_b = gather_clamped_block(
+        b_minus_y_chan,
+        width,
+        height,
+        bx * 8,
+        by * 8,
+        block_w,
+        block_h,
+    );
+
+    forward_dct2d_scalar(&mut block_x, block_w, block_h);
+    forward_dct2d_scalar(&mut block_y, block_w, block_h);
+    forward_dct2d_scalar(&mut block_b, block_w, block_h);
+
+    [block_x, block_y, block_b]
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn prepare_ac_for_transform_map(
+    ac_x_base: &[i32],
+    ac_y_base: &[i32],
+    ac_b_base: &[i32],
+    x_chan: &[f32],
+    y_chan: &[f32],
+    b_minus_y_chan: &[f32],
+    width: usize,
+    height: usize,
+    bw: usize,
+    bh: usize,
+    global_scale: u32,
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
+    x_dm_multiplier: f32,
+    b_dm_multiplier: f32,
+) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    prepare_ac_for_transform_map_with_cache(
+        ac_x_base,
+        ac_y_base,
+        ac_b_base,
+        x_chan,
+        y_chan,
+        b_minus_y_chan,
+        width,
+        height,
+        bw,
+        bh,
+        global_scale,
+        raw_quant_map,
+        transform_map,
+        None,
+        x_dm_multiplier,
+        b_dm_multiplier,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_ac_for_transform_map_with_cache(
+    ac_x_base: &[i32],
+    ac_y_base: &[i32],
+    ac_b_base: &[i32],
+    x_chan: &[f32],
+    y_chan: &[f32],
+    b_minus_y_chan: &[f32],
+    width: usize,
+    height: usize,
+    bw: usize,
+    bh: usize,
+    global_scale: u32,
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
+    forward_cache: Option<&mut ForwardTransformCoeffCache>,
+    x_dm_multiplier: f32,
+    b_dm_multiplier: f32,
+) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    assert_eq!(ac_x_base.len(), bw * bh * 64);
+    assert_eq!(ac_y_base.len(), bw * bh * 64);
+    assert_eq!(ac_b_base.len(), bw * bh * 64);
+    assert_eq!(raw_quant_map.len(), bw * bh);
+    assert_eq!(transform_map.len(), bw * bh);
+
+    let mut ac_x = ac_x_base.to_vec();
+    let mut ac_y = ac_y_base.to_vec();
+    let mut ac_b = ac_b_base.to_vec();
+    let mut forward_cache = forward_cache;
+
+    let identity_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(1);
+    let dct2_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(2);
+    let dct4_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(3);
+    let dct16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(4);
+    let dct32_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(5);
+    let dct8x16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(6);
+    let dct8x32_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(7);
+    let dct16x32_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(8);
+    let dct4x8_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(9);
+    let afv_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(10);
+    let dct64_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(11);
+    let dct32x64_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(12);
+    let dct128_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(13);
+    let dct64x128_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(14);
+    let dct256_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(15);
+    let dct128x256_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(16);
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let idx = by * bw + bx;
+            let raw_transform = transform_map[idx];
+            if raw_transform & TRANSFORM_FIRST_BLOCK_FLAG == 0 {
+                continue;
+            }
+
+            let transform_id = raw_transform & !TRANSFORM_FIRST_BLOCK_FLAG;
+            if transform_id == DCT8_TRANSFORM_ID {
+                continue;
+            }
+
+            let transform_type = HfTransformType::from_usize(transform_id as usize).ok_or(
+                crate::error::Error::InvalidVarDCTTransform(transform_id as usize),
+            )?;
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            if bx + cx > bw || by + cy > bh {
+                return Err(crate::error::Error::HFBlockOutOfBounds);
+            }
+
+            let (block_w, block_h, coeff_count, weights) = match transform_id {
+                IDENTITY_TRANSFORM_ID => (8usize, 8usize, 64usize, identity_weights),
+                DCT2X2_TRANSFORM_ID => (8usize, 8usize, 64usize, dct2_weights),
+                DCT4X4_TRANSFORM_ID => (8usize, 8usize, 64usize, dct4_weights),
+                DCT16_TRANSFORM_ID => (16usize, 16usize, 256usize, dct16_weights),
+                DCT32_TRANSFORM_ID => (32usize, 32usize, 1024usize, dct32_weights),
+                DCT16X8_TRANSFORM_ID => (8usize, 16usize, 128usize, dct8x16_weights),
+                DCT8X16_TRANSFORM_ID => (16usize, 8usize, 128usize, dct8x16_weights),
+                DCT32X8_TRANSFORM_ID => (8usize, 32usize, 256usize, dct8x32_weights),
+                DCT8X32_TRANSFORM_ID => (32usize, 8usize, 256usize, dct8x32_weights),
+                DCT32X16_TRANSFORM_ID => (16usize, 32usize, 512usize, dct16x32_weights),
+                DCT16X32_TRANSFORM_ID => (32usize, 16usize, 512usize, dct16x32_weights),
+                DCT4X8_TRANSFORM_ID => (8usize, 8usize, 64usize, dct4x8_weights),
+                DCT8X4_TRANSFORM_ID => (8usize, 8usize, 64usize, dct4x8_weights),
+                AFV0_TRANSFORM_ID => (8usize, 8usize, 64usize, afv_weights),
+                AFV1_TRANSFORM_ID => (8usize, 8usize, 64usize, afv_weights),
+                AFV2_TRANSFORM_ID => (8usize, 8usize, 64usize, afv_weights),
+                AFV3_TRANSFORM_ID => (8usize, 8usize, 64usize, afv_weights),
+                DCT64_TRANSFORM_ID => (64usize, 64usize, 4096usize, dct64_weights),
+                DCT64X32_TRANSFORM_ID => (32usize, 64usize, 2048usize, dct32x64_weights),
+                DCT32X64_TRANSFORM_ID => (64usize, 32usize, 2048usize, dct32x64_weights),
+                DCT128_TRANSFORM_ID => (128usize, 128usize, 16384usize, dct128_weights),
+                DCT128X64_TRANSFORM_ID => (64usize, 128usize, 8192usize, dct64x128_weights),
+                DCT64X128_TRANSFORM_ID => (128usize, 64usize, 8192usize, dct64x128_weights),
+                DCT256_TRANSFORM_ID => (256usize, 256usize, 65536usize, dct256_weights),
+                DCT256X128_TRANSFORM_ID => (128usize, 256usize, 32768usize, dct128x256_weights),
+                DCT128X256_TRANSFORM_ID => (256usize, 128usize, 32768usize, dct128x256_weights),
+                _ => {
+                    return Err(crate::error::Error::InvalidVarDCTTransform(
+                        transform_id as usize,
+                    ));
+                }
+            };
+
+            let wx = &weights[..coeff_count];
+            let wy = &weights[coeff_count..2 * coeff_count];
+            let wb = &weights[2 * coeff_count..3 * coeff_count];
+
+            let raw_quant = raw_quant_map[idx].max(1) as u32;
+
+            let coeffs_owned;
+            let coeffs = if let Some(cache) = forward_cache.as_mut() {
+                let key = (transform_id, bx, by);
+                if !cache.contains_key(&key) {
+                    cache.insert(
+                        key,
+                        compute_forward_transform_coeffs(
+                            transform_id,
+                            x_chan,
+                            y_chan,
+                            b_minus_y_chan,
+                            width,
+                            height,
+                            bx,
+                            by,
+                            block_w,
+                            block_h,
+                        ),
+                    );
+                }
+                cache.get(&key).unwrap()
+            } else {
+                coeffs_owned = compute_forward_transform_coeffs(
+                    transform_id,
+                    x_chan,
+                    y_chan,
+                    b_minus_y_chan,
+                    width,
+                    height,
+                    bx,
+                    by,
+                    block_w,
+                    block_h,
+                );
+                &coeffs_owned
+            };
+
+            for coeff_index in 0..coeff_count {
+                let storage_index =
+                    transform_coeff_index_to_block_storage(bw, bx, by, cx, coeff_index);
+                ac_x[storage_index] = quantize_ac(
+                    coeffs[0][coeff_index],
+                    global_scale,
+                    raw_quant,
+                    wx[coeff_index] * x_dm_multiplier,
+                );
+                ac_y[storage_index] = quantize_ac(
+                    coeffs[1][coeff_index],
+                    global_scale,
+                    raw_quant,
+                    wy[coeff_index],
+                );
+                ac_b[storage_index] = quantize_ac(
+                    coeffs[2][coeff_index],
+                    global_scale,
+                    raw_quant,
+                    wb[coeff_index] * b_dm_multiplier,
+                );
+            }
+        }
+    }
+
+    Ok((ac_x, ac_y, ac_b))
+}
+
+fn build_transform_map_from_quantized_ac(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    if distance < 1.5 {
+        return build_default_transform_map(bw, bh);
+    }
+
+    // Conservative first strategy: only DCT16x16 zero-region merging.
+    build_zero_merge_transform_map(ac_x, ac_y, ac_b, bw, bh, &[DCT16_TRANSFORM_ID])
+}
+
+fn build_afv_transform_map_from_quantized_ac(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    let mut map = build_default_transform_map(bw, bh);
+    if distance < 2.5 {
+        return map;
+    }
+
+    let num_blocks = bw * bh;
+    let max_afv_blocks = (num_blocks / 64).clamp(1, 64);
+    let mut scored = Vec::<(i64, usize, u8)>::new();
+
+    for blk in 0..num_blocks {
+        let base = blk * 64;
+        let mut total = 0i64;
+        let mut low = 0i64;
+        let mut high = 0i64;
+
+        for k in 1..64 {
+            let u = k & 7;
+            let v = k >> 3;
+            let y = ac_y[base + k].abs() as i64;
+            let xb = (ac_x[base + k].abs() + ac_b[base + k].abs()) as i64;
+            let mag = y * 2 + xb / 2;
+            total += mag;
+            if u < 3 && v < 3 {
+                low += mag;
+            }
+            if u >= 3 && v >= 3 {
+                high += mag;
+            }
+        }
+
+        // Keep AFV sparse and only for blocks with pronounced high-frequency content.
+        if total < 40 || high * 2 < low {
+            continue;
+        }
+
+        let horiz = (ac_y[base + 1].abs() + ac_y[base + 2].abs() + ac_y[base + 3].abs()) as i64;
+        let vert = (ac_y[base + 8].abs() + ac_y[base + 16].abs() + ac_y[base + 24].abs()) as i64;
+        let anis = (horiz - vert).abs();
+        if anis < 4 {
+            continue;
+        }
+
+        let sx = ac_y[base + 1] + ac_x[base + 1] - ac_b[base + 1];
+        let sy = ac_y[base + 8] + ac_x[base + 8] - ac_b[base + 8];
+        let afv = match (sx < 0, sy < 0) {
+            (false, false) => AFV0_TRANSFORM_ID,
+            (true, false) => AFV1_TRANSFORM_ID,
+            (false, true) => AFV2_TRANSFORM_ID,
+            (true, true) => AFV3_TRANSFORM_ID,
+        };
+
+        let score = high + anis * 3 - low;
+        if score > 0 {
+            scored.push((score, blk, afv));
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    for &(_score, blk, afv) in scored.iter().take(max_afv_blocks) {
+        map[blk] = TRANSFORM_FIRST_BLOCK_FLAG | afv;
+    }
+
+    map
+}
+
+fn build_directional_special_transform_map_from_quantized_ac(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    let mut map = build_default_transform_map(bw, bh);
+    if distance < 3.0 {
+        return map;
+    }
+
+    let num_blocks = bw * bh;
+    let max_directional_blocks = (num_blocks / 96).clamp(1, 48);
+    let mut scored = Vec::<(i64, usize, u8)>::new();
+
+    for blk in 0..num_blocks {
+        let base = blk * 64;
+        let mut total = 0i64;
+        let mut high = 0i64;
+
+        for k in 1..64 {
+            let u = k & 7;
+            let v = k >> 3;
+            let y = ac_y[base + k].abs() as i64;
+            let xb = (ac_x[base + k].abs() + ac_b[base + k].abs()) as i64;
+            let mag = y * 2 + xb / 2;
+            total += mag;
+            if u >= 2 || v >= 2 {
+                high += mag;
+            }
+        }
+
+        if total < 48 || high * 3 < total {
+            continue;
+        }
+
+        let horiz = (ac_y[base + 1].abs()
+            + ac_y[base + 2].abs()
+            + ac_y[base + 3].abs()
+            + ac_x[base + 1].abs()
+            + ac_b[base + 1].abs()) as i64;
+        let vert = (ac_y[base + 8].abs()
+            + ac_y[base + 16].abs()
+            + ac_y[base + 24].abs()
+            + ac_x[base + 8].abs()
+            + ac_b[base + 8].abs()) as i64;
+        let anis = (horiz - vert).abs();
+        if anis < 10 {
+            continue;
+        }
+
+        let transform = if horiz >= vert {
+            DCT4X8_TRANSFORM_ID
+        } else {
+            DCT8X4_TRANSFORM_ID
+        };
+        let score = anis * 4 + high - total / 2;
+        if score > 0 {
+            scored.push((score, blk, transform));
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    for &(_score, blk, transform) in scored.iter().take(max_directional_blocks) {
+        map[blk] = TRANSFORM_FIRST_BLOCK_FLAG | transform;
+    }
+
+    map
+}
+
+fn build_compact_special_transform_map_from_quantized_ac(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    let mut map = build_default_transform_map(bw, bh);
+    if distance < 3.0 {
+        return map;
+    }
+
+    let num_blocks = bw * bh;
+    let max_compact_blocks = (num_blocks / 128).clamp(1, 32);
+    let mut scored = Vec::<(i64, usize, u8)>::new();
+
+    for blk in 0..num_blocks {
+        let base = blk * 64;
+        let mut total = 0i64;
+        let mut low = 0i64;
+        let mut high = 0i64;
+        let mut peak = 0i64;
+
+        for k in 1..64 {
+            let u = k & 7;
+            let v = k >> 3;
+            let y = ac_y[base + k].abs() as i64;
+            let xb = (ac_x[base + k].abs() + ac_b[base + k].abs()) as i64;
+            let mag = y * 2 + xb / 2;
+            total += mag;
+            peak = peak.max(mag);
+            if u < 2 && v < 2 {
+                low += mag;
+            }
+            if u >= 3 || v >= 3 {
+                high += mag;
+            }
+        }
+
+        if total < 4 {
+            continue;
+        }
+
+        let (transform, score) = if total <= 28 && high <= 6 {
+            (
+                DCT2X2_TRANSFORM_ID,
+                40i64 - total + (low - high).clamp(0, i64::MAX),
+            )
+        } else if total <= 64 && high * 3 <= low * 2 {
+            (
+                DCT4X4_TRANSFORM_ID,
+                80i64 - total + (low - high / 2).clamp(0, i64::MAX),
+            )
+        } else if peak >= 36 && peak * 3 > total * 2 && total <= 160 {
+            (IDENTITY_TRANSFORM_ID, peak * 2 - total)
+        } else {
+            continue;
+        };
+
+        if score > 0 {
+            scored.push((score, blk, transform));
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    for &(_score, blk, transform) in scored.iter().take(max_compact_blocks) {
+        map[blk] = TRANSFORM_FIRST_BLOCK_FLAG | transform;
+    }
+
+    map
+}
+
+fn build_mixed_special_transform_map_from_quantized_ac(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    let mut map = build_default_transform_map(bw, bh);
+    if distance < 3.0 {
+        return map;
+    }
+
+    let num_blocks = bw * bh;
+    let max_special_blocks = (num_blocks / 16).clamp(1, 64);
+    let mut scored = Vec::<(i64, usize, u8)>::new();
+
+    for blk in 0..num_blocks {
+        let base = blk * 64;
+        let mut total = 0i64;
+        let mut low2 = 0i64;
+        let mut low3 = 0i64;
+        let mut high3 = 0i64;
+        let mut high2 = 0i64;
+        let mut peak = 0i64;
+
+        for k in 1..64 {
+            let u = k & 7;
+            let v = k >> 3;
+            let y = ac_y[base + k].abs() as i64;
+            let xb = (ac_x[base + k].abs() + ac_b[base + k].abs()) as i64;
+            let mag = y * 2 + xb / 2;
+            total += mag;
+            peak = peak.max(mag);
+            if u < 2 && v < 2 {
+                low2 += mag;
+            }
+            if u < 3 && v < 3 {
+                low3 += mag;
+            }
+            if u >= 3 && v >= 3 {
+                high3 += mag;
+            }
+            if u >= 2 || v >= 2 {
+                high2 += mag;
+            }
+        }
+
+        if total < 4 {
+            continue;
+        }
+
+        let mut best_score = 0i64;
+        let mut best_transform = DCT8_TRANSFORM_ID;
+
+        // Compact/smooth/sparse special transform preference.
+        if total <= 28 && high3 <= 6 {
+            let score = 40i64 - total + (low2 - high3).clamp(0, i64::MAX);
+            if score > best_score {
+                best_score = score;
+                best_transform = DCT2X2_TRANSFORM_ID;
+            }
+        } else if total <= 64 && high3 * 3 <= low2 * 2 {
+            let score = 80i64 - total + (low2 - high3 / 2).clamp(0, i64::MAX);
+            if score > best_score {
+                best_score = score;
+                best_transform = DCT4X4_TRANSFORM_ID;
+            }
+        } else if peak >= 36 && peak * 3 > total * 2 && total <= 160 {
+            let score = peak * 2 - total;
+            if score > best_score {
+                best_score = score;
+                best_transform = IDENTITY_TRANSFORM_ID;
+            }
+        }
+
+        // Directional small transforms.
+        let horiz_dir = (ac_y[base + 1].abs()
+            + ac_y[base + 2].abs()
+            + ac_y[base + 3].abs()
+            + ac_x[base + 1].abs()
+            + ac_b[base + 1].abs()) as i64;
+        let vert_dir = (ac_y[base + 8].abs()
+            + ac_y[base + 16].abs()
+            + ac_y[base + 24].abs()
+            + ac_x[base + 8].abs()
+            + ac_b[base + 8].abs()) as i64;
+        let anis_dir = (horiz_dir - vert_dir).abs();
+        if total >= 48 && high2 * 3 >= total && anis_dir >= 10 {
+            let transform = if horiz_dir >= vert_dir {
+                DCT4X8_TRANSFORM_ID
+            } else {
+                DCT8X4_TRANSFORM_ID
+            };
+            let score = anis_dir * 4 + high2 - total / 2;
+            if score > best_score {
+                best_score = score;
+                best_transform = transform;
+            }
+        }
+
+        // AFV: pronounced high frequency plus direction/sign variants.
+        let horiz_afv = (ac_y[base + 1].abs() + ac_y[base + 2].abs() + ac_y[base + 3].abs()) as i64;
+        let vert_afv =
+            (ac_y[base + 8].abs() + ac_y[base + 16].abs() + ac_y[base + 24].abs()) as i64;
+        let anis_afv = (horiz_afv - vert_afv).abs();
+        if total >= 40 && high3 * 2 >= low3 && anis_afv >= 4 {
+            let sx = ac_y[base + 1] + ac_x[base + 1] - ac_b[base + 1];
+            let sy = ac_y[base + 8] + ac_x[base + 8] - ac_b[base + 8];
+            let transform = match (sx < 0, sy < 0) {
+                (false, false) => AFV0_TRANSFORM_ID,
+                (true, false) => AFV1_TRANSFORM_ID,
+                (false, true) => AFV2_TRANSFORM_ID,
+                (true, true) => AFV3_TRANSFORM_ID,
+            };
+            let score = high3 + anis_afv * 3 - low3;
+            if score > best_score {
+                best_score = score;
+                best_transform = transform;
+            }
+        }
+
+        if best_score > 0 && best_transform != DCT8_TRANSFORM_ID {
+            scored.push((best_score, blk, best_transform));
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    for &(_score, blk, transform) in scored.iter().take(max_special_blocks) {
+        map[blk] = TRANSFORM_FIRST_BLOCK_FLAG | transform;
+    }
+
+    map
+}
+
+fn build_transform_map_candidates_from_quantized_ac(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<Vec<u8>> {
+    let default_map = build_default_transform_map(bw, bh);
+    if distance < 1.5 {
+        return vec![default_map];
+    }
+
+    if bw * bh > 8192 {
+        let mut candidates = vec![default_map.clone()];
+        candidates.push(build_transform_map_from_quantized_ac(
+            ac_x, ac_y, ac_b, bw, bh, distance,
+        ));
+        candidates.push(build_zero_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[DCT32_TRANSFORM_ID, DCT16_TRANSFORM_ID],
+        ));
+        candidates.push(build_zero_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[
+                DCT32_TRANSFORM_ID,
+                DCT16X32_TRANSFORM_ID,
+                DCT32X16_TRANSFORM_ID,
+                DCT8X32_TRANSFORM_ID,
+                DCT32X8_TRANSFORM_ID,
+                DCT8X16_TRANSFORM_ID,
+                DCT16X8_TRANSFORM_ID,
+                DCT16_TRANSFORM_ID,
+            ],
+        ));
+        if distance >= 2.0 {
+            candidates.push(build_low_energy_merge_transform_map(
+                ac_x,
+                ac_y,
+                ac_b,
+                bw,
+                bh,
+                &[
+                    DCT16X32_TRANSFORM_ID,
+                    DCT32X16_TRANSFORM_ID,
+                    DCT8X32_TRANSFORM_ID,
+                    DCT32X8_TRANSFORM_ID,
+                    DCT8X16_TRANSFORM_ID,
+                    DCT16X8_TRANSFORM_ID,
+                    DCT16_TRANSFORM_ID,
+                ],
+                3,
+            ));
+        }
+        if distance >= 2.5 {
+            candidates.push(build_low_energy_merge_transform_map(
+                ac_x,
+                ac_y,
+                ac_b,
+                bw,
+                bh,
+                &[
+                    DCT32_TRANSFORM_ID,
+                    DCT16X32_TRANSFORM_ID,
+                    DCT32X16_TRANSFORM_ID,
+                    DCT8X32_TRANSFORM_ID,
+                    DCT32X8_TRANSFORM_ID,
+                    DCT8X16_TRANSFORM_ID,
+                    DCT16X8_TRANSFORM_ID,
+                    DCT16_TRANSFORM_ID,
+                ],
+                if distance >= 3.0 { 8 } else { 5 },
+            ));
+        }
+
+        let mut unique = Vec::new();
+        for candidate in candidates {
+            if !unique.iter().any(|u: &Vec<u8>| *u == candidate) {
+                unique.push(candidate);
+            }
+        }
+        return unique;
+    }
+
+    let mut candidates = vec![default_map];
+    candidates.push(build_transform_map_from_quantized_ac(
+        ac_x, ac_y, ac_b, bw, bh, distance,
+    ));
+    candidates.push(build_zero_merge_transform_map(
+        ac_x,
+        ac_y,
+        ac_b,
+        bw,
+        bh,
+        &[DCT32_TRANSFORM_ID, DCT16_TRANSFORM_ID],
+    ));
+    candidates.push(build_zero_merge_transform_map(
+        ac_x,
+        ac_y,
+        ac_b,
+        bw,
+        bh,
+        &[
+            DCT32_TRANSFORM_ID,
+            DCT16X32_TRANSFORM_ID,
+            DCT32X16_TRANSFORM_ID,
+            DCT8X32_TRANSFORM_ID,
+            DCT32X8_TRANSFORM_ID,
+            DCT8X16_TRANSFORM_ID,
+            DCT16X8_TRANSFORM_ID,
+            DCT16_TRANSFORM_ID,
+        ],
+    ));
+
+    if distance >= 1.8 {
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[DCT16_TRANSFORM_ID],
+            3,
+        ));
+    }
+    if distance >= 2.0 {
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[DCT16_TRANSFORM_ID],
+            2,
+        ));
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[
+                DCT16X32_TRANSFORM_ID,
+                DCT32X16_TRANSFORM_ID,
+                DCT8X32_TRANSFORM_ID,
+                DCT32X8_TRANSFORM_ID,
+                DCT16_TRANSFORM_ID,
+            ],
+            3,
+        ));
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[
+                DCT16X32_TRANSFORM_ID,
+                DCT32X16_TRANSFORM_ID,
+                DCT8X32_TRANSFORM_ID,
+                DCT32X8_TRANSFORM_ID,
+                DCT8X16_TRANSFORM_ID,
+                DCT16X8_TRANSFORM_ID,
+                DCT16_TRANSFORM_ID,
+            ],
+            3,
+        ));
+    }
+    if distance >= 2.5 {
+        if bw * bh <= 4096 {
+            candidates.push(build_afv_transform_map_from_quantized_ac(
+                ac_x, ac_y, ac_b, bw, bh, distance,
+            ));
+        }
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[DCT32_TRANSFORM_ID, DCT16_TRANSFORM_ID],
+            4,
+        ));
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[
+                DCT32_TRANSFORM_ID,
+                DCT16X32_TRANSFORM_ID,
+                DCT32X16_TRANSFORM_ID,
+                DCT8X32_TRANSFORM_ID,
+                DCT32X8_TRANSFORM_ID,
+                DCT8X16_TRANSFORM_ID,
+                DCT16X8_TRANSFORM_ID,
+                DCT16_TRANSFORM_ID,
+            ],
+            5,
+        ));
+        if bw * bh <= 4096 {
+            candidates.push(build_low_energy_merge_transform_map(
+                ac_x,
+                ac_y,
+                ac_b,
+                bw,
+                bh,
+                &[
+                    DCT64_TRANSFORM_ID,
+                    DCT32X64_TRANSFORM_ID,
+                    DCT64X32_TRANSFORM_ID,
+                    DCT32_TRANSFORM_ID,
+                    DCT16X32_TRANSFORM_ID,
+                    DCT32X16_TRANSFORM_ID,
+                    DCT16_TRANSFORM_ID,
+                ],
+                6,
+            ));
+        }
+    }
+    if distance >= 3.0 {
+        if bw * bh <= 4096 {
+            candidates.push(build_directional_special_transform_map_from_quantized_ac(
+                ac_x, ac_y, ac_b, bw, bh, distance,
+            ));
+            candidates.push(build_compact_special_transform_map_from_quantized_ac(
+                ac_x, ac_y, ac_b, bw, bh, distance,
+            ));
+            candidates.push(build_mixed_special_transform_map_from_quantized_ac(
+                ac_x, ac_y, ac_b, bw, bh, distance,
+            ));
+        }
+        candidates.push(build_low_energy_merge_transform_map(
+            ac_x,
+            ac_y,
+            ac_b,
+            bw,
+            bh,
+            &[
+                DCT32_TRANSFORM_ID,
+                DCT16X32_TRANSFORM_ID,
+                DCT32X16_TRANSFORM_ID,
+                DCT8X32_TRANSFORM_ID,
+                DCT32X8_TRANSFORM_ID,
+                DCT8X16_TRANSFORM_ID,
+                DCT16X8_TRANSFORM_ID,
+                DCT16_TRANSFORM_ID,
+            ],
+            8,
+        ));
+        if bw * bh <= 4096 {
+            candidates.push(build_low_energy_merge_transform_map(
+                ac_x,
+                ac_y,
+                ac_b,
+                bw,
+                bh,
+                &[
+                    DCT64_TRANSFORM_ID,
+                    DCT32X64_TRANSFORM_ID,
+                    DCT64X32_TRANSFORM_ID,
+                    DCT32_TRANSFORM_ID,
+                    DCT16X32_TRANSFORM_ID,
+                    DCT32X16_TRANSFORM_ID,
+                    DCT8X32_TRANSFORM_ID,
+                    DCT32X8_TRANSFORM_ID,
+                    DCT16_TRANSFORM_ID,
+                ],
+                10,
+            ));
+            if bw >= 16 && bh >= 16 {
+                candidates.push(build_low_energy_merge_transform_map(
+                    ac_x,
+                    ac_y,
+                    ac_b,
+                    bw,
+                    bh,
+                    &[
+                        DCT128_TRANSFORM_ID,
+                        DCT64X128_TRANSFORM_ID,
+                        DCT128X64_TRANSFORM_ID,
+                        DCT64_TRANSFORM_ID,
+                        DCT32X64_TRANSFORM_ID,
+                        DCT64X32_TRANSFORM_ID,
+                        DCT32_TRANSFORM_ID,
+                        DCT16X32_TRANSFORM_ID,
+                        DCT32X16_TRANSFORM_ID,
+                        DCT16_TRANSFORM_ID,
+                    ],
+                    14,
+                ));
+            }
+            if bw * bh <= 2048 && bw >= 32 && bh >= 32 {
+                candidates.push(build_low_energy_merge_transform_map(
+                    ac_x,
+                    ac_y,
+                    ac_b,
+                    bw,
+                    bh,
+                    &[
+                        DCT256_TRANSFORM_ID,
+                        DCT128X256_TRANSFORM_ID,
+                        DCT256X128_TRANSFORM_ID,
+                        DCT128_TRANSFORM_ID,
+                        DCT64X128_TRANSFORM_ID,
+                        DCT128X64_TRANSFORM_ID,
+                        DCT64_TRANSFORM_ID,
+                        DCT32X64_TRANSFORM_ID,
+                        DCT64X32_TRANSFORM_ID,
+                        DCT32_TRANSFORM_ID,
+                        DCT16_TRANSFORM_ID,
+                    ],
+                    18,
+                ));
+            }
+        }
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.iter().any(|u: &Vec<u8>| *u == candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn collect_transform_entries_for_rect(
+    transform_map: &[u8],
+    raw_quant_map: &[u8],
+    bw: usize,
+    x0: usize,
+    y0: usize,
+    rw: usize,
+    rh: usize,
+) -> Vec<(u8, u8)> {
+    let mut entries = Vec::new();
+    for y in 0..rh {
+        for x in 0..rw {
+            let idx = (y0 + y) * bw + (x0 + x);
+            let transform = transform_map[idx];
+            if transform & TRANSFORM_FIRST_BLOCK_FLAG == 0 {
+                continue;
+            }
+            let transform_id = transform & !TRANSFORM_FIRST_BLOCK_FLAG;
+            entries.push((transform_id, raw_quant_map[idx]));
+        }
+    }
+    entries
 }
 
 /// Apply forward DCT8x8 to a channel with edge-clamp padding.
@@ -230,6 +2571,8 @@ fn encode_vardct_frame(
     ac_x: &[i32],
     ac_y: &[i32],
     ac_b: &[i32],
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
 ) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
 
@@ -248,11 +2591,24 @@ fn encode_vardct_frame(
     let num_groups_y = bh.div_ceil(group_dim_blocks);
     let num_groups = num_groups_x * num_groups_y;
 
+    assert_eq!(raw_quant_map.len(), bw * bh);
+    assert_eq!(transform_map.len(), bw * bh);
+
     if num_groups == 1 {
         // Single-group image: 1 TOC entry, everything in one section.
         let section = encode_single_group_section(
-            bw, bh, global_scale, quant_lf,
-            dc_y, dc_x, dc_b, ac_x, ac_y, ac_b,
+            bw,
+            bh,
+            global_scale,
+            quant_lf,
+            dc_y,
+            dc_x,
+            dc_b,
+            ac_x,
+            ac_y,
+            ac_b,
+            raw_quant_map,
+            transform_map,
         )?;
 
         write_toc(&mut writer, &[section.len() as u32])?;
@@ -281,8 +2637,6 @@ fn encode_vardct_frame(
         // --- Phase 1: Tokenize ALL HF groups' AC data to build global histogram ---
         let num_contexts = 15; // default BlockContextMap
         let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
-        let ac_channels = [ac_y, ac_x, ac_b]; // order Y,X,B matching decoder's [1,0,2]
-        let channel_indices = [1usize, 0, 2];
 
         // Per-HF-group token lists
         let mut group_tokens: Vec<Vec<AcToken>> = Vec::with_capacity(num_groups);
@@ -295,51 +2649,40 @@ fn encode_vardct_frame(
             let gw = (x0 + group_dim_blocks).min(bw) - x0;
             let gh = (y0 + group_dim_blocks).min(bh) - y0;
 
-            let mut tokens: Vec<AcToken> = Vec::new();
-            let mut num_nzeros: Vec<Vec<u32>> = vec![vec![0u32; gw]; gh];
-
-            for by in 0..gh {
-                for bx in 0..gw {
-                    let global_blk = (y0 + by) * bw + (x0 + bx);
-                    for (ci, &c) in channel_indices.iter().enumerate() {
-                        let ac = ac_channels[ci];
-                        let blk_coeffs = &ac[global_blk * 64..(global_blk + 1) * 64];
-                        let block_ctx = default_block_context(c, 0);
-                        let left_nz = if bx > 0 { num_nzeros[by][bx - 1] } else { 0 };
-                        let top_nz = if by > 0 { num_nzeros[by - 1][bx] } else { 0 };
-                        let predicted = predict_num_nonzeros_simple(left_nz, top_nz);
-                        let nz = tokenize_block_8x8(
-                            blk_coeffs, c, block_ctx, num_contexts,
-                            0, predicted, &mut tokens,
-                        );
-                        num_nzeros[by][bx] = nz as u32;
-                    }
-                }
-            }
+            let tokens = tokenize_hf_region(
+                ac_x,
+                ac_y,
+                ac_b,
+                transform_map,
+                bw,
+                x0,
+                y0,
+                gw,
+                gh,
+                num_contexts,
+                0,
+                None, // TODO: add custom orders for multi-group
+            )?;
             group_tokens.push(tokens);
         }
 
-        // Build global Huffman code from all groups' tokens
+        // Build global token frequencies from all groups.
         let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
-        let all_encoded: Vec<Vec<_>> = group_tokens.iter().map(|tokens| {
-            tokens.iter().map(|t| uint_config.encode(t.value)).collect::<Vec<_>>()
-        }).collect();
-        let max_token = all_encoded.iter()
+        let all_encoded: Vec<Vec<_>> = group_tokens
+            .iter()
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|t| uint_config.encode(t.value))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let max_token = all_encoded
+            .iter()
             .flat_map(|enc| enc.iter().map(|e| e.token))
-            .max().unwrap_or(0);
+            .max()
+            .unwrap_or(0);
         let alphabet_size = (max_token as usize + 1).max(1);
-        let mut frequencies = vec![0u64; alphabet_size];
-        for enc_group in &all_encoded {
-            for enc in enc_group {
-                frequencies[enc.token as usize] += 1;
-            }
-        }
-
-        let global_code = if frequencies.iter().all(|&f| f == 0) {
-            build_huffman_code(&[1]).ok_or(crate::error::Error::InvalidHuffman)?
-        } else {
-            build_huffman_code(&frequencies).ok_or(crate::error::Error::InvalidHuffman)?
-        };
 
         // --- Phase 2: Write sections ---
 
@@ -351,21 +2694,116 @@ fn encode_vardct_frame(
             let gx = g % num_lf_groups_x;
             let gy = g / num_lf_groups_x;
             sections.push(encode_lf_group_section(
-                gx, gy, bw, bh, lf_group_dim_blocks, dc_y, dc_x, dc_b,
+                gx,
+                gy,
+                bw,
+                bh,
+                lf_group_dim_blocks,
+                dc_y,
+                dc_x,
+                dc_b,
+                raw_quant_map,
+                transform_map,
             )?);
         }
 
-        // HfGlobal: DequantMatrices + histograms (no token data)
-        sections.push(encode_hf_global_section_with_code(
-            num_groups, num_ac_contexts, &uint_config, &global_code,
-        )?);
-
-        // HfGroups: token data only (use HF group dimensions)
-        for g in 0..num_groups {
-            sections.push(encode_hf_group_tokens(
-                num_groups, &group_tokens[g], &all_encoded[g], &global_code,
-            )?);
+        let mut context_counts = vec![0u64; num_ac_contexts];
+        for tokens in &group_tokens {
+            for token in tokens {
+                context_counts[token.context] += 1;
+            }
         }
+
+        // Build context map candidates: preset heuristics + data-driven greedy clustering.
+        let mut context_map_candidates =
+            build_ac_context_map_candidates(num_ac_contexts, &context_counts);
+        {
+            // Build combined tokens+encoded for greedy clustering.
+            let all_tokens_flat: Vec<AcToken> = group_tokens
+                .iter()
+                .flat_map(|t| t.iter().copied())
+                .collect();
+            let all_encoded_flat: Vec<crate::encode::entropy::HybridUintEncoded> =
+                all_encoded.iter().flat_map(|e| e.iter().copied()).collect();
+            for max_c in [2, 4, 8, 16, 32] {
+                if max_c <= num_ac_contexts {
+                    let greedy_map = build_greedy_clustered_context_map(
+                        num_ac_contexts,
+                        alphabet_size,
+                        &all_tokens_flat,
+                        &all_encoded_flat,
+                        max_c,
+                    );
+                    if !context_map_candidates.iter().any(|m| *m == greedy_map) {
+                        context_map_candidates.push(greedy_map);
+                    }
+                }
+            }
+        }
+
+        // Evaluate entropy candidates by exact encoded section size and keep the best.
+        let mut best_bits = usize::MAX;
+        let mut best_hf_global = None;
+        let mut best_hf_groups: Vec<Vec<u8>> = Vec::new();
+
+        for context_map in context_map_candidates {
+            let cluster_frequencies = build_cluster_frequencies_for_groups(
+                &context_map,
+                alphabet_size,
+                &group_tokens,
+                &all_encoded,
+            )?;
+
+            if USE_ANS_AC_ENTROPY {
+                let distributions = build_ans_distributions(&cluster_frequencies);
+                let hf_global = encode_hf_global_section_with_ans(
+                    num_groups,
+                    &context_map,
+                    &uint_config,
+                    &distributions,
+                )?;
+                let mut hf_groups = Vec::with_capacity(num_groups);
+                for g in 0..num_groups {
+                    hf_groups.push(encode_hf_group_tokens_ans(
+                        num_groups,
+                        &group_tokens[g],
+                        &all_encoded[g],
+                        &context_map,
+                        &distributions,
+                    )?);
+                }
+                let bits =
+                    hf_global.len() * 8 + hf_groups.iter().map(|s| s.len() * 8).sum::<usize>();
+                if bits < best_bits {
+                    best_bits = bits;
+                    best_hf_global = Some(hf_global);
+                    best_hf_groups = hf_groups;
+                }
+            }
+
+            let codes = build_huffman_codes_from_frequencies(&cluster_frequencies)?;
+            let hf_global =
+                encode_hf_global_section_with_code(num_groups, &context_map, &uint_config, &codes)?;
+            let mut hf_groups = Vec::with_capacity(num_groups);
+            for g in 0..num_groups {
+                hf_groups.push(encode_hf_group_tokens(
+                    num_groups,
+                    &group_tokens[g],
+                    &all_encoded[g],
+                    &context_map,
+                    &codes,
+                )?);
+            }
+            let bits = hf_global.len() * 8 + hf_groups.iter().map(|s| s.len() * 8).sum::<usize>();
+            if bits < best_bits {
+                best_bits = bits;
+                best_hf_global = Some(hf_global);
+                best_hf_groups = hf_groups;
+            }
+        }
+
+        sections.push(best_hf_global.ok_or(crate::error::Error::InvalidHuffman)?);
+        sections.extend(best_hf_groups);
 
         let section_sizes: Vec<u32> = sections.iter().map(|s| s.len() as u32).collect();
         write_toc(&mut writer, &section_sizes)?;
@@ -387,64 +2825,197 @@ fn encode_vardct_frame(
 ///   2: transform_image (count x 2)
 ///   3: epf_map (bw x bh)
 ///
-/// All values are 0 for our minimal encoder (no chroma correlation,
-/// DCT8x8 transform, quant=1, no EPF).
+/// Values are currently simple (zero chroma-correlation/EPF and DCT8x8 transform type),
+/// with per-block `raw_quant - 1` carried in transform_image row 1.
 fn encode_hf_metadata_modular(
     w: &mut BitWriter,
-    _cr_w: usize,
-    _cr_h: usize,
-    _count: usize,
-    _bw: usize,
-    _bh: usize,
-    _data: &[i32],
+    cr_w: usize,
+    cr_h: usize,
+    count: usize,
+    bw: usize,
+    bh: usize,
+    data: &[i32],
 ) -> Result<()> {
-    // All 4 channels contain only zeros.
-    // Write a modular subbitstream that decodes to all-zero channels.
-    //
-    // GroupHeader: use_global_tree=false, wp_all_default=true, nb_transforms=0
-    crate::encode::modular::write_minimal_group_header(w, false)?;
+    // Channels:
+    //   ch0: ytox_map         (cr_w * cr_h)
+    //   ch1: ytob_map         (cr_w * cr_h)
+    //   ch2: transform_image  (count * 2)
+    //   ch3: epf_map          (bw * bh)
+    let total = cr_w * cr_h + cr_w * cr_h + count * 2 + bw * bh;
+    assert_eq!(data.len(), total);
 
-    // Local tree: single leaf node with predictor=0 (Zero), offset=0
-    // This produces residual 0 for each pixel, which matches our all-zero data.
-    // Tree tokens: property=-1, value=0, predictor=0, offset=0, multiplier=0
-    let tree_stream = crate::encode::modular_encode::build_tree_tokens_zero()?;
-    let tree_context_map = [0u8; 6];
-    crate::encode::entropy::huffman_encode::write_huffman_histograms(
-        w,
-        &tree_context_map,
-        &[tree_stream.uint_config],
-        &[tree_stream.code.clone()],
-    )?;
-    crate::encode::modular_encode::write_tree_token_stream(w, &tree_stream)?;
-
-    // Residual histograms: single symbol 0 (all residuals are 0)
-    let zero_code = crate::encode::entropy::huffman_encode::build_huffman_code(&[1])
-        .ok_or(crate::error::Error::InvalidHuffman)?;
+    // Encode as a regular modular section with a single zero-predictor tree.
+    // The residual stream is channel-concatenated in decode order.
     let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
-    crate::encode::entropy::huffman_encode::write_huffman_histograms(
+    crate::encode::modular_encode::write_modular_section_huffman(
         w,
-        &[0u8],
-        &[uint_config],
-        &[zero_code],
-    )?;
-
-    // No residual tokens to write (all symbols are 0, encoded as 0 bits each).
-    // The SymbolReader will read 0 bits per symbol from the single-symbol table.
-    // But we still need the check_final_state which verifies the ans state.
-    // For Huffman with single symbol, no bits are consumed, so nothing to write.
-
-    Ok(())
+        0, // offset
+        0, // predictor = Zero
+        data,
+        uint_config,
+        false, // use_global_tree
+    )
 }
 
 // ==================== AC coefficient tokenization ====================
 
 /// A token in the AC coefficient stream, with its context.
+#[derive(Clone, Copy)]
 struct AcToken {
     /// Context index for this token (used for multi-histogram routing).
     #[allow(dead_code)]
     context: usize,
     /// The unsigned value to encode (via HybridUint).
     value: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tokenize_hf_region(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    transform_map: &[u8],
+    full_bw: usize,
+    x0: usize,
+    y0: usize,
+    rw: usize,
+    rh: usize,
+    num_contexts: usize,
+    context_offset: usize,
+    custom_orders_8x8: Option<&[[usize; 64]; 3]>,
+) -> Result<Vec<AcToken>> {
+    let mut tokens = Vec::new();
+    let mut num_nzeros = [
+        vec![0u32; rw * rh],
+        vec![0u32; rw * rh],
+        vec![0u32; rw * rh],
+    ];
+
+    // Decoder order is Y, X, B (channel indices 1,0,2).
+    let ac_channels = [ac_y, ac_x, ac_b];
+    let channel_indices = [1usize, 0, 2];
+
+    for by in 0..rh {
+        for bx in 0..rw {
+            let global_idx = (y0 + by) * full_bw + (x0 + bx);
+            let raw_transform = transform_map[global_idx];
+            if raw_transform & TRANSFORM_FIRST_BLOCK_FLAG == 0 {
+                continue;
+            }
+
+            let transform_id = raw_transform & !TRANSFORM_FIRST_BLOCK_FLAG;
+            let transform_type = HfTransformType::from_usize(transform_id as usize).ok_or(
+                crate::error::Error::InvalidVarDCTTransform(transform_id as usize),
+            )?;
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            if bx + cx > rw || by + cy > rh {
+                return Err(crate::error::Error::HFBlockOutOfBounds);
+            }
+            let shape_id = block_shape_id(transform_type) as usize;
+
+            for (ci, &c) in channel_indices.iter().enumerate() {
+                let ac = ac_channels[ci];
+                let block_ctx = default_block_context(c, shape_id, 0);
+                let predicted = predict_num_nonzeros(&num_nzeros[c], rw, bx, by);
+
+                if transform_id == DCT8_TRANSFORM_ID {
+                    let blk_coeffs = &ac[global_idx * 64..(global_idx + 1) * 64];
+                    // Map channel index to order index:
+                    // ci=0->Y (order[0]), ci=1->X (order[1]), ci=2->B (order[2])
+                    let order_for_chan =
+                        custom_orders_8x8.map(|orders| &orders[ci]);
+                    let nz = tokenize_block_8x8(
+                        blk_coeffs,
+                        c,
+                        block_ctx,
+                        num_contexts,
+                        context_offset,
+                        predicted,
+                        &mut tokens,
+                        order_for_chan,
+                    );
+                    num_nzeros[c][by * rw + bx] = nz as u32;
+                    continue;
+                }
+
+                if is_supported_nonzero_transform_id(transform_id) {
+                    let num_blocks = cx * cy;
+                    let num_coeffs = num_blocks * 64;
+                    let log_num_blocks = num_blocks.ilog2() as usize;
+                    let order = token_shape_order(shape_id).ok_or(
+                        crate::error::Error::InvalidVarDCTTransform(transform_id as usize),
+                    )?;
+
+                    let coeff_at = |k: usize| {
+                        let coeff_index = order[k] as usize;
+                        let storage_index = transform_coeff_index_to_block_storage(
+                            full_bw,
+                            x0 + bx,
+                            y0 + by,
+                            cx,
+                            coeff_index,
+                        );
+                        ac[storage_index]
+                    };
+
+                    let mut nonzeros = 0usize;
+                    for k in num_blocks..num_coeffs {
+                        if coeff_at(k) != 0 {
+                            nonzeros += 1;
+                        }
+                    }
+
+                    let nz_context = nonzero_context(predicted as usize, block_ctx, num_contexts)
+                        + context_offset;
+                    tokens.push(AcToken {
+                        context: nz_context,
+                        value: nonzeros as u32,
+                    });
+
+                    let histo_offset =
+                        zero_density_context_offset(block_ctx, num_contexts) + context_offset;
+                    let mut nz_left = nonzeros;
+                    let mut prev: usize = if nonzeros > num_coeffs / 16 { 0 } else { 1 };
+                    for k in num_blocks..num_coeffs {
+                        if nz_left == 0 {
+                            break;
+                        }
+                        let ctx = histo_offset
+                            + block_context_map::zero_density_context(
+                                nz_left,
+                                k,
+                                log_num_blocks,
+                                prev,
+                            );
+                        let coeff = coeff_at(k);
+                        tokens.push(AcToken {
+                            context: ctx,
+                            value: pack_signed(coeff),
+                        });
+                        prev = if coeff != 0 { 1 } else { 0 };
+                        if coeff != 0 {
+                            nz_left -= 1;
+                        }
+                    }
+
+                    let per_block_nz = nonzeros.div_ceil(num_blocks) as u32;
+                    for iy in 0..cy {
+                        for ix in 0..cx {
+                            num_nzeros[c][(by + iy) * rw + (bx + ix)] = per_block_nz;
+                        }
+                    }
+                    continue;
+                }
+
+                return Err(crate::error::Error::InvalidVarDCTTransform(
+                    transform_id as usize,
+                ));
+            }
+        }
+    }
+
+    Ok(tokens)
 }
 
 /// Pack a signed integer into an unsigned value for HybridUint encoding.
@@ -457,32 +3028,297 @@ fn pack_signed(x: i32) -> u32 {
     }
 }
 
+fn natural_coeff_order_from_dims(cx: usize, cy: usize) -> Vec<usize> {
+    if cx < cy {
+        // Build order for the transposed shape and transpose indices back.
+        let transposed = natural_coeff_order_from_dims(cy, cx);
+        let xsize = cx * 8;
+        let transposed_xsize = cy * 8;
+        return transposed
+            .into_iter()
+            .map(|idx| {
+                let tx = idx % transposed_xsize;
+                let ty = idx / transposed_xsize;
+                tx * xsize + ty
+            })
+            .collect();
+    }
+
+    let xsize = cx * 8;
+    let xs = cx / cy;
+    let xsm = xs - 1;
+    let xss = xs.ilog2() as usize;
+
+    let mut out = vec![0usize; cx * cy * 64];
+    let mut cur = cx * cy;
+
+    for i in 0..xsize {
+        for j in 0..=i {
+            let mut x = j;
+            let mut y = i - j;
+            if i % 2 != 0 {
+                std::mem::swap(&mut x, &mut y);
+            }
+            if (y & xsm) != 0 {
+                continue;
+            }
+            y >>= xss;
+            let val = if x < cx && y < cy {
+                y * cx + x
+            } else {
+                let v = cur;
+                cur += 1;
+                v
+            };
+            out[val] = y * xsize + x;
+        }
+    }
+
+    for ir in 1..xsize {
+        let ip = xsize - ir;
+        let i = ip - 1;
+        for j in 0..=i {
+            let mut x = xsize - 1 - (i - j);
+            let mut y = xsize - 1 - j;
+            if i % 2 != 0 {
+                std::mem::swap(&mut x, &mut y);
+            }
+            if (y & xsm) != 0 {
+                continue;
+            }
+            y >>= xss;
+            out[cur] = y * xsize + x;
+            cur += 1;
+        }
+    }
+
+    out
+}
+
+fn natural_coeff_order_for_transform(transform: HfTransformType) -> Vec<usize> {
+    let cx = covered_blocks_x(transform) as usize;
+    let cy = covered_blocks_y(transform) as usize;
+    natural_coeff_order_from_dims(cx, cy)
+}
+
 /// Natural (zigzag) coefficient order for DCT8x8.
 /// Maps scan position k (0..64) to coefficient index in the 8x8 block.
 fn natural_coeff_order_8x8() -> [usize; 64] {
     // Standard JPEG/JXL zigzag order
     let order: [usize; 64] = [
-        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
-        12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
-        35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
+        20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
         58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
     ];
     order
+}
+
+/// Compute optimal coefficient order for 8x8 DCT by counting non-zero frequencies.
+///
+/// Returns 3 custom orders (Y, X, B channels) based on zero density analysis.
+/// Positions with more non-zero coefficients are scanned first, improving entropy coding.
+fn compute_optimal_coeff_orders_8x8(
+    ac_y: &[i32],
+    ac_x: &[i32],
+    ac_b: &[i32],
+    transform_map: &[u8],
+    full_bw: usize,
+    x0: usize,
+    y0: usize,
+    rw: usize,
+    rh: usize,
+) -> [[usize; 64]; 3] {
+    let natural = natural_coeff_order_8x8();
+    let ac_channels = [ac_y, ac_x, ac_b];
+    let mut result = [natural; 3];
+
+    for (ci, ac) in ac_channels.iter().enumerate() {
+        // Count non-zeros at each of the 64 coefficient positions
+        let mut nonzero_count = [0u64; 64];
+        let mut total_blocks = 0u64;
+
+        for by in 0..rh {
+            for bx in 0..rw {
+                let global_idx = (y0 + by) * full_bw + (x0 + bx);
+                let raw_transform = transform_map[global_idx];
+                if raw_transform & TRANSFORM_FIRST_BLOCK_FLAG == 0 {
+                    continue;
+                }
+                let transform_id = raw_transform & !TRANSFORM_FIRST_BLOCK_FLAG;
+                if transform_id != DCT8_TRANSFORM_ID {
+                    continue;
+                }
+                total_blocks += 1;
+                for k in 1..64 {
+                    if ac[global_idx * 64 + natural[k]] != 0 {
+                        nonzero_count[k] += 1;
+                    }
+                }
+            }
+        }
+
+        if total_blocks == 0 {
+            continue;
+        }
+
+        // Sort scan positions 1..64 by non-zero count DESCENDING (most non-zeros first).
+        // Position 0 (DC) stays fixed.
+        let mut positions: Vec<(usize, u64, usize)> = (1..64)
+            .map(|k| (k, nonzero_count[k], k)) // (scan_pos, count, original_idx for stability)
+            .collect();
+        // Sort descending by count, then by original position for stability
+        positions.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+
+        // Build the optimized order: scan position k maps to coefficient natural[positions[k-1].0]
+        result[ci][0] = natural[0]; // DC stays at position 0
+        for (new_k, &(old_k, _, _)) in positions.iter().enumerate() {
+            result[ci][new_k + 1] = natural[old_k];
+        }
+    }
+
+    result
+}
+
+/// Compute Lehmer code for a permutation relative to natural order.
+///
+/// Given a custom coefficient order `custom` and the `natural` order,
+/// computes the Lehmer code representation that the decoder needs to reconstruct
+/// the custom order from the natural order.
+///
+/// `skip` is the number of leading elements to skip (LF coefficients, typically 1 for 8x8).
+///
+/// Returns (lehmer_codes, end) where end is the length of meaningful codes.
+fn compute_lehmer_code(custom: &[usize], natural: &[usize], skip: usize) -> (Vec<u32>, usize) {
+    let n = custom.len();
+    assert_eq!(n, natural.len());
+
+    // The permutation the decoder applies: natural_order[permutation[i]] = custom_order[i]
+    // So we need permutation[i] = natural_inverse[custom[i]]
+    let mut natural_inverse = vec![0usize; 64]; // Assumes max size 64
+    for (i, &v) in natural.iter().enumerate() {
+        natural_inverse[v] = i;
+    }
+    let mut perm: Vec<usize> = custom.iter().map(|&c| natural_inverse[c]).collect();
+
+    // Only consider elements from skip onwards
+    let perm_slice = &mut perm[skip..];
+    let m = perm_slice.len();
+
+    // Compute Lehmer codes using O(n^2) (fine for n=63)
+    let mut lehmer = Vec::with_capacity(m);
+    let mut available: Vec<usize> = (0..m).collect();
+    // Remap perm_slice to be relative to available set
+    // perm_slice values are indices into the full perm; we need to offset by skip
+    let adjusted: Vec<usize> = perm_slice.iter().map(|&v| v - skip).collect();
+
+    for i in 0..m {
+        let val = adjusted[i];
+        // Find rank of val in available
+        let rank = available.iter().position(|&a| a == val).unwrap();
+        lehmer.push(rank as u32);
+        available.remove(rank);
+        // Adjust remaining values (not needed since we track available set)
+    }
+
+    // Find effective end (trim trailing zeros)
+    let end = lehmer
+        .iter()
+        .rposition(|&v| v != 0)
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    (lehmer, end)
+}
+
+/// Encode coefficient order permutations into the bitstream.
+///
+/// Uses Huffman-coded Lehmer code, matching the decoder's `decode_coeff_orders`.
+fn encode_coeff_orders(
+    w: &mut BitWriter,
+    orders: &[[usize; 64]; 3], // Y, X, B channel orders
+) -> Result<()> {
+    let natural = natural_coeff_order_8x8();
+    let natural_slice = natural.as_slice();
+    let skip = 1usize; // 1 LF coefficient for 8x8
+
+    // Collect all Lehmer codes for all 3 channels
+    let mut all_codes: Vec<(Vec<u32>, usize)> = Vec::new();
+    for order in orders {
+        let (codes, end) = compute_lehmer_code(order, natural_slice, skip);
+        all_codes.push((codes, end));
+    }
+
+    // Encode using the permutation entropy coding format:
+    // First: a histogram with NUM_PERMUTATION_CONTEXTS=8 contexts
+    // Then: for each channel, encode (end, lehmer_codes[0..end])
+
+    // Collect all tokens: (context, value) pairs
+    let size = 64u32;
+    let mut tokens: Vec<(usize, u32)> = Vec::new();
+    for (codes, end) in &all_codes {
+        // First token: end value, context = get_context(size)
+        let ctx = permutation_context(size);
+        tokens.push((ctx, *end as u32));
+
+        // Then: lehmer codes with context = get_context(prev_val)
+        let mut prev_val = 0u32;
+        for &code in codes.iter().take(*end) {
+            let ctx = permutation_context(prev_val);
+            tokens.push((ctx, code));
+            prev_val = code;
+        }
+    }
+
+    // Build Huffman code for the permutation tokens (8 contexts, map all to cluster 0)
+    let context_map = [0u8; 8];
+    let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
+
+    let encoded: Vec<_> = tokens.iter().map(|(_, v)| uint_config.encode(*v)).collect();
+    let max_symbol = encoded.iter().map(|e| e.token).max().unwrap_or(0) as usize + 1;
+
+    let mut freqs = vec![0u64; max_symbol.max(1)];
+    for e in &encoded {
+        freqs[e.token as usize] += 1;
+    }
+    let code =
+        build_huffman_code(&freqs).ok_or(crate::error::Error::InvalidHuffman)?;
+
+    use crate::encode::entropy::huffman_encode::{write_huffman_histograms, write_huffman_symbol};
+    write_huffman_histograms(w, &context_map, &[uint_config], &[code.clone()])?;
+
+    for ((ctx, _), enc) in tokens.iter().zip(encoded.iter()) {
+        let cluster = context_map[*ctx] as usize;
+        write_huffman_symbol(w, &code, enc.token as usize)?;
+        if enc.nbits > 0 {
+            w.write(enc.nbits as usize, enc.extra_bits as u64)?;
+        }
+        let _ = cluster; // All mapped to cluster 0
+    }
+
+    Ok(())
+}
+
+/// Context function for permutation encoding, matching decoder's get_context.
+fn permutation_context(x: u32) -> usize {
+    let log2 = if x == 0 { 0 } else { 32 - (x).leading_zeros() };
+    (log2 as usize).min(7)
 }
 
 /// Tokenize AC coefficients for a single block (DCT8x8).
 ///
 /// Produces tokens matching the decoder's reading order in `decode_vardct_group`.
 fn tokenize_block_8x8(
-    coeffs: &[i32],  // 64 coefficients, DC position is 0 (not used)
+    coeffs: &[i32], // 64 coefficients, DC position is 0 (not used)
     _channel: usize,
     block_context: usize,
     num_contexts: usize,
     context_offset: usize,
-    num_nzeros_left: u32,  // predicted nonzeros from neighbors
+    num_nzeros_left: u32, // predicted nonzeros from neighbors
     tokens: &mut Vec<AcToken>,
+    custom_order: Option<&[usize; 64]>,
 ) -> usize {
-    let order = natural_coeff_order_8x8();
+    let default_order = natural_coeff_order_8x8();
+    let order = custom_order.unwrap_or(&default_order);
 
     // Count actual nonzeros (positions 1..64 in scan order)
     let mut nonzeros = 0usize;
@@ -494,13 +3330,15 @@ fn tokenize_block_8x8(
 
     // Emit nonzeros count token
     let predicted = num_nzeros_left;
-    let nz_context = nonzero_context(predicted as usize, block_context, num_contexts)
-        + context_offset;
-    tokens.push(AcToken { context: nz_context, value: nonzeros as u32 });
+    let nz_context =
+        nonzero_context(predicted as usize, block_context, num_contexts) + context_offset;
+    tokens.push(AcToken {
+        context: nz_context,
+        value: nonzeros as u32,
+    });
 
     // Emit coefficient tokens
-    let histo_offset = zero_density_context_offset(block_context, num_contexts)
-        + context_offset;
+    let histo_offset = zero_density_context_offset(block_context, num_contexts) + context_offset;
     let mut nz_left = nonzeros;
     let mut prev: usize = if nonzeros > 64 / 16 { 0 } else { 1 };
 
@@ -511,7 +3349,10 @@ fn tokenize_block_8x8(
         let ctx = histo_offset + block_context_map::zero_density_context(nz_left, k, 0, prev);
         let coeff = coeffs[order[k]];
         let unsigned = pack_signed(coeff);
-        tokens.push(AcToken { context: ctx, value: unsigned });
+        tokens.push(AcToken {
+            context: ctx,
+            value: unsigned,
+        });
         prev = if coeff != 0 { 1 } else { 0 };
         if coeff != 0 {
             nz_left -= 1;
@@ -521,21 +3362,20 @@ fn tokenize_block_8x8(
     nonzeros
 }
 
-/// Compute block context for DCT8x8 using default BlockContextMap.
+/// Compute block context using the default BlockContextMap.
 /// Simplified version of BlockContextMap::block_context for default map.
-fn default_block_context(channel: usize, _quant_lf_idx: usize) -> usize {
+fn default_block_context(channel: usize, shape_id: usize, _quant_lf_idx: usize) -> usize {
     // Default context map has:
     //   no lf thresholds (num_lf_contexts=1), no qf thresholds
     //   context_map indices for (channel, shape, qf, lf) -> block_context
     //
-    // With all defaults: qf_idx=0, lf_idx=0, shape=0 (DCT8x8)
     // idx = channel_remap * NUM_ORDERS + shape
     // idx = idx * (qf_thresholds.len()+1) + qf_idx
     // idx = idx * num_lf_contexts + lf_idx
     // channel_remap: 0->1(Y), 1->0(X), 2->2(B)
     let ch_remap = if channel < 2 { channel ^ 1 } else { 2 };
-    let shape_id = 0; // DCT8x8
     let num_orders = 13; // NUM_ORDERS
+    let shape_id = shape_id.min(num_orders - 1);
     let idx = ch_remap * num_orders + shape_id;
     // Default: no qf thresholds and no lf thresholds -> idx * 1 + 0 = idx
 
@@ -544,9 +3384,8 @@ fn default_block_context(channel: usize, _quant_lf_idx: usize) -> usize {
     //  7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
     //  7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14]
     const DEFAULT_CTX_MAP: [u8; 39] = [
-        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
-        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
-        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, 7,
+        8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
     ];
     DEFAULT_CTX_MAP[idx] as usize
 }
@@ -568,14 +3407,20 @@ fn zero_density_context_offset(block_context: usize, num_contexts: usize) -> usi
     num_contexts * NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT * block_context
 }
 
-/// Predict number of nonzeros for a block based on neighbors.
-/// Matches predict_num_nonzeros from the decoder.
-fn predict_num_nonzeros_simple(left: u32, top: u32) -> u32 {
-    // Simple average of available neighbors
-    if left == 0 && top == 0 {
-        0 // No neighbors yet
+/// Predict number of nonzeros for a block based on already encoded neighbors.
+/// Matches decoder-side `frame::group::predict_num_nonzeros` for DCT8x8 blocks.
+fn predict_num_nonzeros(num_nzeros_map: &[u32], stride: usize, bx: usize, by: usize) -> u32 {
+    if bx == 0 {
+        if by == 0 {
+            32
+        } else {
+            num_nzeros_map[(by - 1) * stride]
+        }
+    } else if by == 0 {
+        num_nzeros_map[by * stride + (bx - 1)]
     } else {
-        (left + top + 1) / 2
+        (num_nzeros_map[(by - 1) * stride + bx] + num_nzeros_map[by * stride + (bx - 1)])
+            .div_ceil(2)
     }
 }
 
@@ -589,7 +3434,12 @@ fn global_scale_coder() -> U32Coder {
 }
 
 fn quant_lf_coder() -> U32Coder {
-    U32Coder::Select(U32::Val(16), U32::BitsOffset { n: 5, off: 1 }, U32::BitsOffset { n: 8, off: 1 }, U32::BitsOffset { n: 16, off: 1 })
+    U32Coder::Select(
+        U32::Val(16),
+        U32::BitsOffset { n: 5, off: 1 },
+        U32::BitsOffset { n: 8, off: 1 },
+        U32::BitsOffset { n: 16, off: 1 },
+    )
 }
 
 /// Write VarDCT frame header.
@@ -639,9 +3489,10 @@ fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32) 
     // 22. save_before_ct: cond false (is_last=true) => NOT WRITTEN
     // 23. name: String, size = 0, u2S(0, Bits(4), Bits(5)+16, Bits(10)+48)
     writer.write(2, 0)?; // selector 00 = Val(0)
-    // 24. restoration_filter: all_default=false, gab=false, epf_iters=0
-    writer.write(1, 0)?; // all_default
-    writer.write(1, 0)?; // gab
+    // 24. restoration_filter: all_default=false, gab=true, epf_iters=0
+    writer.write(1, 0)?; // all_default = false
+    writer.write(1, 1)?; // gab = true
+    writer.write(1, 0)?; // gab_custom = false (default weights)
     writer.write(2, 0)?; // epf_iters = 0, Bits(2)
     // 25. extensions = 0 (u64: selector 00)
     writer.write(2, 0)?;
@@ -660,9 +3511,13 @@ fn encode_single_group_section(
     ac_x: &[i32],
     ac_y: &[i32],
     ac_b: &[i32],
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
+    assert_eq!(raw_quant_map.len(), num_blocks);
+    assert_eq!(transform_map.len(), num_blocks);
 
     // === LfGlobal ===
     // LfQuantFactors: all_default = true
@@ -686,13 +3541,11 @@ fn encode_single_group_section(
     // which for non-subsampled is [Y_chan, X_chan, B_chan]
     let mut dc_data = vec![0i32; num_blocks * 3];
     for i in 0..num_blocks {
-        dc_data[i] = dc_y[i];              // Channel 0: Y
+        dc_data[i] = dc_y[i]; // Channel 0: Y
         dc_data[num_blocks + i] = dc_x[i]; // Channel 1: X
         dc_data[2 * num_blocks + i] = dc_b[i]; // Channel 2: B
     }
-    crate::encode::modular_encode::encode_modular_signed_stream(
-        &mut w, bw, bh, 3, &dc_data,
-    )?;
+    crate::encode::modular_encode::encode_modular_signed_stream(&mut w, bw, bh, 3, &dc_data)?;
 
     // === LfGroup0: ModularLF (empty for 0 extra channels) ===
 
@@ -705,13 +3558,20 @@ fn encode_single_group_section(
     //
     // First: count is read from ceil_log2(bw*bh) bits, value = count-1.
     let upper_bound = bw * bh;
-    let count_num_bits = if upper_bound <= 1 { 0 } else {
+    let count_num_bits = if upper_bound <= 1 {
+        0
+    } else {
         32 - (upper_bound as u32 - 1).leading_zeros()
     };
-    // count = num_blocks (every block gets a transform entry)
-    // Write count-1 in count_num_bits bits
+
+    let transform_entries =
+        collect_transform_entries_for_rect(transform_map, raw_quant_map, bw, 0, 0, bw, bh);
+    let count = transform_entries.len();
+    assert!(count > 0 && count <= upper_bound);
+
+    // Write count-1 in count_num_bits bits.
     if count_num_bits > 0 {
-        w.write(count_num_bits as usize, (num_blocks - 1) as u64)?;
+        w.write(count_num_bits as usize, (count - 1) as u64)?;
     }
 
     // Build modular channels for HF metadata
@@ -719,70 +3579,76 @@ fn encode_single_group_section(
     let cr_h = bh.div_ceil(8);
     let ch0_size = cr_w * cr_h; // ytox
     let ch1_size = cr_w * cr_h; // ytob
-    let ch2_size = num_blocks * 2; // transform (count x 2)
+    let ch2_size = count * 2; // transform (count x 2)
     let ch3_size = bw * bh; // epf
     let total = ch0_size + ch1_size + ch2_size + ch3_size;
 
-    let hf_meta = vec![0i32; total];
+    let mut hf_meta = vec![0i32; total];
     // ch0 (ytox): all 0
     // ch1 (ytob): all 0
     // ch2 (transform_image):
-    //   row 0: transform types (DCT8x8 = 0)
-    //   row 1: raw_quant - 1 (quant=1, so value=0)
-    // All zeros -- which is correct for DCT8x8 with quant=1.
-    // ch3 (epf): all 0 (no EPF sharpness)
+    //   row 0: transform type ids
+    //   row 1: raw_quant - 1
+    let ch2_off = ch0_size + ch1_size;
+    for (i, (transform_id, raw_quant)) in transform_entries.iter().copied().enumerate() {
+        hf_meta[ch2_off + i] = transform_id as i32;
+        hf_meta[ch2_off + count + i] = raw_quant.saturating_sub(1) as i32;
+    }
+    // ch3 (epf): all 0 (epf_iters=0, no EPF applied)
 
-    // The 4 channels have different sizes. We need to encode them
-    // as a multi-channel modular stream where each channel has its own
-    // width and height.
-    // For simplicity, since all values are 0, a single-symbol stream works.
-    encode_hf_metadata_modular(&mut w, cr_w, cr_h, num_blocks, bw, bh, &hf_meta)?;
+    // The 4 channels have different sizes and are encoded as a modular subbitstream.
+    encode_hf_metadata_modular(&mut w, cr_w, cr_h, count, bw, bh, &hf_meta)?;
 
     // === HfGlobal + HfGroup0: AC coefficients ===
+    // Compute optimal coefficient order for 8x8 DCT
+    let custom_orders = compute_optimal_coeff_orders_8x8(
+        ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh,
+    );
+    let use_custom_order = custom_orders != [natural_coeff_order_8x8(); 3];
+
     // Tokenize all blocks' AC coefficients
     let num_contexts = 15; // default BlockContextMap has 15 block contexts
     let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
     let context_offset = 0; // single histogram set
 
-    let mut tokens: Vec<AcToken> = Vec::new();
-    let mut num_nzeros: Vec<Vec<u32>> = vec![vec![0u32; bw]; bh]; // per block
-
-    // Tokenize in block scan order (matching decoder: by, bx, then channels Y,X,B)
-    let ac_channels = [ac_y, ac_x, ac_b]; // channels in order [1,0,2] = Y,X,B
-    let channel_indices = [1usize, 0, 2]; // actual channel indices for context
-
-    for by in 0..bh {
-        for bx in 0..bw {
-            let blk_idx = by * bw + bx;
-            for (ci, &c) in channel_indices.iter().enumerate() {
-                let ac = ac_channels[ci];
-                let blk_coeffs = &ac[blk_idx * 64..(blk_idx + 1) * 64];
-
-                let block_ctx = default_block_context(c, 0);
-
-                // Predict nonzeros from neighbors
-                let left_nz = if bx > 0 { num_nzeros[by][bx - 1] } else { 0 };
-                let top_nz = if by > 0 { num_nzeros[by - 1][bx] } else { 0 };
-                let predicted = predict_num_nonzeros_simple(left_nz, top_nz);
-
-                let nz = tokenize_block_8x8(
-                    blk_coeffs, c, block_ctx, num_contexts,
-                    context_offset, predicted, &mut tokens,
-                );
-                num_nzeros[by][bx] = nz as u32;
-            }
-        }
-    }
+    let tokens = tokenize_hf_region(
+        ac_x,
+        ac_y,
+        ac_b,
+        transform_map,
+        bw,
+        0,
+        0,
+        bw,
+        bh,
+        num_contexts,
+        context_offset,
+        if use_custom_order {
+            Some(&custom_orders)
+        } else {
+            None
+        },
+    )?;
 
     // === HfGlobal ===
     // DequantMatrices: all_default = true
     w.write(1, 1)?;
     // num_histograms: ceil_log2(1) = 0 bits (1 group -> 0 bits)
-    // used_orders: selector 2 = no custom orders (value 0)
-    w.write(2, 2)?;
+    if use_custom_order {
+        // used_orders = 1 (bit 0 = DCT8x8 order customized)
+        // kOrderEnc = U32Enc(Val(0x5F), Val(0x13), Val(0), Bits(13))
+        // value 1 needs Bits(13) = selector 3
+        w.write(2, 3)?; // selector 3 = Bits(13)
+        w.write(13, 1)?; // value = 1 (only DCT8x8)
+        // Encode the permutation for 3 channels
+        encode_coeff_orders(&mut w, &custom_orders)?;
+    } else {
+        // used_orders: selector 2 = no custom orders (value 0)
+        w.write(2, 2)?;
+    }
 
     // Build and write AC entropy histograms
-    write_ac_histograms_and_tokens(&mut w, num_ac_contexts, &tokens)?;
+    write_ac_histograms_and_tokens(&mut w, num_ac_contexts, &tokens, USE_ANS_AC_ENTROPY)?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -817,6 +3683,8 @@ fn encode_lf_group_section(
     dc_y: &[i32],
     dc_x: &[i32],
     dc_b: &[i32],
+    raw_quant_map: &[u8],
+    transform_map: &[u8],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -824,6 +3692,8 @@ fn encode_lf_group_section(
     let y0 = gy * group_dim_blocks;
     let gw = (x0 + group_dim_blocks).min(bw) - x0;
     let gh = (y0 + group_dim_blocks).min(bh) - y0;
+    assert_eq!(raw_quant_map.len(), bw * bh);
+    assert_eq!(transform_map.len(), bw * bh);
 
     // === VarDCT LF: DC coefficients ===
     // extra_precision = 0 (2 bits)
@@ -841,9 +3711,7 @@ fn encode_lf_group_section(
             dc_data[2 * npixels + dst] = dc_b[src];
         }
     }
-    crate::encode::modular_encode::encode_modular_signed_stream(
-        &mut w, gw, gh, 3, &dc_data,
-    )?;
+    crate::encode::modular_encode::encode_modular_signed_stream(&mut w, gw, gh, 3, &dc_data)?;
 
     // === ModularLF: empty (0 extra channels) ===
     // Nothing to write.
@@ -852,34 +3720,485 @@ fn encode_lf_group_section(
     // Same format as single-group: count field + 4-channel modular stream.
     // Channels: ytox_map (cr_w x cr_h), ytob_map, transform_image (count x 2), epf_map (gw x gh)
     let upper_bound = gw * gh;
-    let count_num_bits = if upper_bound <= 1 { 0 } else {
+    let count_num_bits = if upper_bound <= 1 {
+        0
+    } else {
         32 - (upper_bound as u32 - 1).leading_zeros()
     };
-    let count = npixels; // one transform entry per block (all DCT8x8)
+
+    let transform_entries =
+        collect_transform_entries_for_rect(transform_map, raw_quant_map, bw, x0, y0, gw, gh);
+    let count = transform_entries.len();
+    assert!(count > 0 && count <= upper_bound);
+
     if count_num_bits > 0 {
         w.write(count_num_bits as usize, (count - 1) as u64)?;
     }
 
     let cr_w = gw.div_ceil(8);
     let cr_h = gh.div_ceil(8);
-    // All values zero: ytox=0, ytob=0, transform=DCT8x8 with quant-1=0, epf=0
-    let total = cr_w * cr_h + cr_w * cr_h + count * 2 + gw * gh;
-    let hf_meta_data = vec![0i32; total];
+    // ytox / ytob / epf are zero, transform row0 stores transform type,
+    // row1 stores raw_quant - 1 for each transform entry.
+    let ch0_size = cr_w * cr_h;
+    let ch1_size = cr_w * cr_h;
+    let total = ch0_size + ch1_size + count * 2 + gw * gh;
+    let mut hf_meta_data = vec![0i32; total];
+    let ch2_off = ch0_size + ch1_size;
+    for (i, (transform_id, raw_quant)) in transform_entries.iter().copied().enumerate() {
+        hf_meta_data[ch2_off + i] = transform_id as i32;
+        hf_meta_data[ch2_off + count + i] = raw_quant.saturating_sub(1) as i32;
+    }
+    // EPF sharpness = 0 (epf_iters=0, no EPF applied)
     encode_hf_metadata_modular(&mut w, cr_w, cr_h, count, gw, gh, &hf_meta_data)?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
 
-/// Encode the HfGlobal section with pre-computed global Huffman code.
+/// Entropy cost of a histogram (sum of -count * log2(count/total) for each symbol).
+fn histogram_entropy_cost(freqs: &[u64]) -> f64 {
+    let total: u64 = freqs.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let inv = 1.0 / total as f64;
+    let mut cost = 0.0f64;
+    for &f in freqs {
+        if f > 0 {
+            let p = f as f64 * inv;
+            cost -= f as f64 * p.log2();
+        }
+    }
+    cost
+}
+
+/// Build a context map by seed-based clustering of per-context histograms.
+///
+/// Algorithm (mirrors libjxl's FastClusterHistograms):
+/// 1. Build per-context frequency histograms.
+/// 2. Pick seed clusters starting from the most populated context.
+/// 3. Add new seeds while max-min-distance exceeds threshold.
+/// 4. Assign each context to its nearest seed.
+/// Runtime: O(num_used_contexts * max_clusters * alphabet_size).
+fn build_greedy_clustered_context_map(
+    num_contexts: usize,
+    alphabet_size: usize,
+    tokens: &[AcToken],
+    encoded: &[crate::encode::entropy::HybridUintEncoded],
+    max_clusters: usize,
+) -> Vec<u8> {
+    if num_contexts == 0 || max_clusters == 0 {
+        return vec![0u8; num_contexts];
+    }
+
+    // Build per-context histograms and totals.
+    let mut per_ctx = vec![vec![0u64; alphabet_size]; num_contexts];
+    let mut per_ctx_total = vec![0u64; num_contexts];
+    for (token, enc) in tokens.iter().zip(encoded.iter()) {
+        per_ctx[token.context][enc.token as usize] += 1;
+        per_ctx_total[token.context] += 1;
+    }
+
+    let per_ctx_entropy: Vec<f64> = per_ctx.iter().map(|h| histogram_entropy_cost(h)).collect();
+
+    // Collect contexts that have data, sorted by total count descending.
+    let mut used: Vec<usize> = (0..num_contexts)
+        .filter(|&c| per_ctx_total[c] > 0)
+        .collect();
+    used.sort_by_key(|&c| std::cmp::Reverse(per_ctx_total[c]));
+
+    if used.is_empty() {
+        return vec![0u8; num_contexts];
+    }
+
+    let target = max_clusters.min(used.len()).max(1);
+
+    // Merged-histogram distance: entropy(a+b) - entropy(a) - entropy(b).
+    let merged_entropy = |a: &[u64], b: &[u64]| -> f64 {
+        let mut cost = 0.0f64;
+        let mut total = 0u64;
+        for i in 0..alphabet_size {
+            total += a[i] + b[i];
+        }
+        if total == 0 {
+            return 0.0;
+        }
+        let inv = 1.0 / total as f64;
+        for i in 0..alphabet_size {
+            let f = a[i] + b[i];
+            if f > 0 {
+                cost -= f as f64 * (f as f64 * inv).log2();
+            }
+        }
+        cost
+    };
+
+    // Seed selection.
+    let mut seeds: Vec<usize> = vec![used[0]];
+    let mut min_dist = vec![f64::MAX; num_contexts];
+    const MIN_DISTANCE_FOR_DISTINCT: f64 = 48.0;
+
+    while seeds.len() < target {
+        let latest = *seeds.last().unwrap();
+        for &ctx in &used {
+            let d = merged_entropy(&per_ctx[ctx], &per_ctx[latest])
+                - per_ctx_entropy[ctx]
+                - per_ctx_entropy[latest];
+            min_dist[ctx] = min_dist[ctx].min(d);
+        }
+        min_dist[latest] = 0.0;
+
+        let best = used
+            .iter()
+            .copied()
+            .filter(|&c| min_dist[c] > 0.0)
+            .max_by(|&a, &b| {
+                min_dist[a]
+                    .partial_cmp(&min_dist[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        match best {
+            Some(ctx) if min_dist[ctx] >= MIN_DISTANCE_FOR_DISTINCT => {
+                seeds.push(ctx);
+            }
+            _ => break,
+        }
+    }
+
+    // Build seed cluster histograms.
+    let seed_entropy: Vec<f64> = seeds.iter().map(|&s| per_ctx_entropy[s]).collect();
+    let seed_hists: Vec<&[u64]> = seeds.iter().map(|&s| per_ctx[s].as_slice()).collect();
+
+    // Assign each context to nearest seed.
+    let mut context_map = vec![0u8; num_contexts];
+    for &ctx in &used {
+        let mut best_cluster = 0u8;
+        let mut best_dist = f64::MAX;
+        for (ci, &seed_hist) in seed_hists.iter().enumerate() {
+            let d =
+                merged_entropy(&per_ctx[ctx], seed_hist) - per_ctx_entropy[ctx] - seed_entropy[ci];
+            if d < best_dist {
+                best_dist = d;
+                best_cluster = ci as u8;
+            }
+        }
+        context_map[ctx] = best_cluster;
+    }
+
+    context_map
+}
+
+fn build_clustered_ac_context_map(num_ac_contexts: usize) -> Vec<u8> {
+    // Legacy clustered map: keep all nonzero-count contexts in cluster 0,
+    // split coefficient contexts by block-context family.
+    let contexts_per_block = NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT;
+    debug_assert_eq!(num_ac_contexts % contexts_per_block, 0);
+
+    let num_block_contexts = (num_ac_contexts / contexts_per_block).max(1);
+    let nonzero_contexts = num_block_contexts * NON_ZERO_BUCKETS;
+    let coeff_clusters = num_block_contexts.min(4).max(1);
+
+    let mut context_map = vec![0u8; num_ac_contexts];
+    for (ctx, slot) in context_map.iter_mut().enumerate().skip(nonzero_contexts) {
+        let block_context = ((ctx - nonzero_contexts) / ZERO_DENSITY_CONTEXT_COUNT)
+            .min(num_block_contexts.saturating_sub(1));
+        let cluster = 1 + (block_context * coeff_clusters / num_block_contexts);
+        *slot = cluster as u8;
+    }
+    context_map
+}
+
+fn build_split_ac_context_map(
+    num_ac_contexts: usize,
+    nonzero_clusters: usize,
+    coeff_clusters: usize,
+) -> Vec<u8> {
+    let contexts_per_block = NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT;
+    debug_assert_eq!(num_ac_contexts % contexts_per_block, 0);
+
+    let num_block_contexts = (num_ac_contexts / contexts_per_block).max(1);
+    let nonzero_clusters = nonzero_clusters.max(1).min(num_block_contexts);
+    let coeff_clusters = coeff_clusters.max(1).min(num_block_contexts);
+    let nonzero_contexts = num_block_contexts * NON_ZERO_BUCKETS;
+
+    let mut context_map = vec![0u8; num_ac_contexts];
+
+    // Layout for nonzero contexts: bucket-major, then block_context.
+    for (ctx, slot) in context_map.iter_mut().enumerate().take(nonzero_contexts) {
+        let block_context = ctx % num_block_contexts;
+        let cluster = block_context * nonzero_clusters / num_block_contexts;
+        *slot = cluster as u8;
+    }
+
+    // Layout for coefficient contexts: contiguous block_context slabs.
+    for (ctx, slot) in context_map.iter_mut().enumerate().skip(nonzero_contexts) {
+        let block_context = ((ctx - nonzero_contexts) / ZERO_DENSITY_CONTEXT_COUNT)
+            .min(num_block_contexts.saturating_sub(1));
+        let cluster = nonzero_clusters + (block_context * coeff_clusters / num_block_contexts);
+        *slot = cluster as u8;
+    }
+
+    context_map
+}
+
+fn build_popularity_split_ac_context_map(
+    num_ac_contexts: usize,
+    context_counts: &[u64],
+    nonzero_clusters: usize,
+    coeff_clusters: usize,
+) -> Vec<u8> {
+    let contexts_per_block = NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT;
+    debug_assert_eq!(num_ac_contexts % contexts_per_block, 0);
+
+    let num_block_contexts = (num_ac_contexts / contexts_per_block).max(1);
+    let nonzero_clusters = nonzero_clusters.max(1).min(num_block_contexts);
+    let coeff_clusters = coeff_clusters.max(1).min(num_block_contexts);
+    let nonzero_contexts = num_block_contexts * NON_ZERO_BUCKETS;
+
+    let mut nonzero_usage = vec![0u64; num_block_contexts];
+    for (ctx, &count) in context_counts.iter().enumerate().take(nonzero_contexts) {
+        nonzero_usage[ctx % num_block_contexts] += count;
+    }
+
+    let mut coeff_usage = vec![0u64; num_block_contexts];
+    for (ctx, &count) in context_counts.iter().enumerate().skip(nonzero_contexts) {
+        let block_context = ((ctx - nonzero_contexts) / ZERO_DENSITY_CONTEXT_COUNT)
+            .min(num_block_contexts.saturating_sub(1));
+        coeff_usage[block_context] += count;
+    }
+
+    let mut nonzero_order: Vec<usize> = (0..num_block_contexts).collect();
+    nonzero_order.sort_by_key(|&bc| std::cmp::Reverse(nonzero_usage[bc]));
+    let mut coeff_order: Vec<usize> = (0..num_block_contexts).collect();
+    coeff_order.sort_by_key(|&bc| std::cmp::Reverse(coeff_usage[bc]));
+
+    let mut nonzero_cluster_for_bc = vec![0u8; num_block_contexts];
+    for (rank, &bc) in nonzero_order.iter().enumerate() {
+        let cluster = if rank + 1 < nonzero_clusters {
+            rank
+        } else {
+            nonzero_clusters - 1
+        };
+        nonzero_cluster_for_bc[bc] = cluster as u8;
+    }
+
+    let mut coeff_cluster_for_bc = vec![0u8; num_block_contexts];
+    for (rank, &bc) in coeff_order.iter().enumerate() {
+        let cluster = if rank + 1 < coeff_clusters {
+            rank
+        } else {
+            coeff_clusters - 1
+        };
+        coeff_cluster_for_bc[bc] = cluster as u8;
+    }
+
+    let mut context_map = vec![0u8; num_ac_contexts];
+    for (ctx, slot) in context_map.iter_mut().enumerate().take(nonzero_contexts) {
+        let block_context = ctx % num_block_contexts;
+        *slot = nonzero_cluster_for_bc[block_context];
+    }
+    for (ctx, slot) in context_map.iter_mut().enumerate().skip(nonzero_contexts) {
+        let block_context = ((ctx - nonzero_contexts) / ZERO_DENSITY_CONTEXT_COUNT)
+            .min(num_block_contexts.saturating_sub(1));
+        *slot = (nonzero_clusters + coeff_cluster_for_bc[block_context] as usize) as u8;
+    }
+
+    context_map
+}
+
+fn build_ac_context_map_candidates(num_ac_contexts: usize, context_counts: &[u64]) -> Vec<Vec<u8>> {
+    let contexts_per_block = NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT;
+    debug_assert_eq!(num_ac_contexts % contexts_per_block, 0);
+    let num_block_contexts = (num_ac_contexts / contexts_per_block).max(1);
+
+    let mut candidates = vec![
+        vec![0u8; num_ac_contexts],
+        build_clustered_ac_context_map(num_ac_contexts),
+    ];
+
+    // Candidate grid over (nonzero_clusters, coeff_clusters).
+    // These are clamped to the available block-context cardinality.
+    let presets = [
+        (1usize, 1usize),
+        (1, 2),
+        (1, 4),
+        (1, 8),
+        (2, 1),
+        (2, 2),
+        (2, 4),
+        (2, 8),
+        (3, 3),
+        (3, 6),
+        (4, 4),
+        (4, 8),
+    ];
+    for (nz_clusters, coeff_clusters) in presets {
+        candidates.push(build_split_ac_context_map(
+            num_ac_contexts,
+            nz_clusters.min(num_block_contexts),
+            coeff_clusters.min(num_block_contexts),
+        ));
+    }
+
+    // Fully split candidate (one nonzero and one coeff family per block-context).
+    candidates.push(build_split_ac_context_map(
+        num_ac_contexts,
+        num_block_contexts,
+        num_block_contexts,
+    ));
+
+    // Popularity-guided candidates: keep the most used block-context families
+    // in dedicated clusters and merge the tail.
+    let popularity_presets = [(2usize, 4usize), (3, 6), (4, 8), (6, 10)];
+    for (nz_clusters, coeff_clusters) in popularity_presets {
+        candidates.push(build_popularity_split_ac_context_map(
+            num_ac_contexts,
+            context_counts,
+            nz_clusters.min(num_block_contexts),
+            coeff_clusters.min(num_block_contexts),
+        ));
+    }
+
+    // Deduplicate identical maps (small candidate set, O(n^2) is fine).
+    let mut unique = Vec::new();
+    for candidate in candidates.drain(..) {
+        if !unique.iter().any(|u: &Vec<u8>| *u == candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn num_clusters_in_context_map(context_map: &[u8]) -> usize {
+    context_map
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(1)
+}
+
+fn build_cluster_frequencies_for_tokens(
+    context_map: &[u8],
+    alphabet_size: usize,
+    tokens: &[AcToken],
+    encoded: &[crate::encode::entropy::HybridUintEncoded],
+) -> Result<Vec<Vec<u64>>> {
+    let num_clusters = num_clusters_in_context_map(context_map);
+    let mut frequencies = vec![vec![0u64; alphabet_size]; num_clusters];
+    for (token, enc) in tokens.iter().zip(encoded.iter()) {
+        let cluster = *context_map
+            .get(token.context)
+            .ok_or(crate::error::Error::InvalidAnsHistogram)? as usize;
+        frequencies[cluster][enc.token as usize] += 1;
+    }
+    Ok(frequencies)
+}
+
+fn build_cluster_frequencies_for_groups(
+    context_map: &[u8],
+    alphabet_size: usize,
+    group_tokens: &[Vec<AcToken>],
+    all_encoded: &[Vec<crate::encode::entropy::HybridUintEncoded>],
+) -> Result<Vec<Vec<u64>>> {
+    let num_clusters = num_clusters_in_context_map(context_map);
+    let mut frequencies = vec![vec![0u64; alphabet_size]; num_clusters];
+    for (tokens, encoded_group) in group_tokens.iter().zip(all_encoded.iter()) {
+        for (token, enc) in tokens.iter().zip(encoded_group.iter()) {
+            let cluster = *context_map
+                .get(token.context)
+                .ok_or(crate::error::Error::InvalidAnsHistogram)?
+                as usize;
+            frequencies[cluster][enc.token as usize] += 1;
+        }
+    }
+    Ok(frequencies)
+}
+
+fn build_ans_distributions(
+    cluster_frequencies: &[Vec<u64>],
+) -> Vec<crate::encode::entropy::ans::AnsDistribution> {
+    cluster_frequencies
+        .iter()
+        .map(|freqs| {
+            crate::encode::entropy::ans::AnsDistribution::from_frequencies(freqs)
+                .unwrap_or_else(|| crate::encode::entropy::ans::AnsDistribution::single_symbol(0))
+        })
+        .collect()
+}
+
+fn estimate_ans_payload_bits(
+    context_map: &[u8],
+    uint_config: crate::encode::entropy::HybridUintConfig,
+    distributions: &[crate::encode::entropy::ans::AnsDistribution],
+    ans_tokens: &[crate::encode::entropy::ans::AnsToken],
+) -> Result<usize> {
+    let mut w = BitWriter::new();
+    let uint_configs = vec![uint_config; distributions.len()];
+    crate::encode::entropy::ans::write_ans_histograms(
+        &mut w,
+        context_map,
+        &uint_configs,
+        distributions,
+    )?;
+    crate::encode::entropy::ans::write_ans_stream(&mut w, distributions, ans_tokens)?;
+    Ok(w.total_bits_written())
+}
+
+fn build_huffman_codes_from_frequencies(
+    cluster_frequencies: &[Vec<u64>],
+) -> Result<Vec<crate::encode::entropy::huffman_encode::HuffmanCode>> {
+    let mut codes = Vec::with_capacity(cluster_frequencies.len());
+    for freqs in cluster_frequencies {
+        let code = if freqs.iter().all(|&f| f == 0) {
+            build_huffman_code(&[1]).ok_or(crate::error::Error::InvalidHuffman)?
+        } else {
+            build_huffman_code(freqs).ok_or(crate::error::Error::InvalidHuffman)?
+        };
+        codes.push(code);
+    }
+    Ok(codes)
+}
+
+fn estimate_huffman_payload_bits(
+    context_map: &[u8],
+    uint_config: crate::encode::entropy::HybridUintConfig,
+    codes: &[crate::encode::entropy::huffman_encode::HuffmanCode],
+    tokens: &[AcToken],
+    encoded: &[crate::encode::entropy::HybridUintEncoded],
+) -> Result<usize> {
+    use crate::encode::entropy::huffman_encode::write_huffman_symbol;
+
+    let mut w = BitWriter::new();
+    let uint_configs = vec![uint_config; codes.len()];
+    crate::encode::entropy::huffman_encode::write_huffman_histograms(
+        &mut w,
+        context_map,
+        &uint_configs,
+        codes,
+    )?;
+
+    for (token, enc) in tokens.iter().zip(encoded.iter()) {
+        let cluster = context_map[token.context] as usize;
+        write_huffman_symbol(&mut w, &codes[cluster], enc.token as usize)?;
+        if enc.nbits > 0 {
+            w.write(enc.nbits as usize, enc.extra_bits as u64)?;
+        }
+    }
+
+    Ok(w.total_bits_written())
+}
+
+/// Encode the HfGlobal section with pre-computed global Huffman codes.
 ///
 /// Writes: DequantMatrices, num_histograms, used_orders, Huffman histogram header.
 /// The histogram header defines the tables; token data goes in HfGroup sections.
 fn encode_hf_global_section_with_code(
     num_groups: usize,
-    num_ac_contexts: usize,
+    context_map: &[u8],
     uint_config: &crate::encode::entropy::HybridUintConfig,
-    code: &crate::encode::entropy::huffman_encode::HuffmanCode,
+    codes: &[crate::encode::entropy::huffman_encode::HuffmanCode],
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -901,86 +4220,225 @@ fn encode_hf_global_section_with_code(
     w.write(2, 2)?;
 
     // Write Histograms header (tables only, no token data)
-    let context_map = vec![0u8; num_ac_contexts]; // all -> histogram 0
+    let uint_configs = vec![*uint_config; codes.len()];
     crate::encode::entropy::huffman_encode::write_huffman_histograms(
         &mut w,
-        &context_map,
-        &[*uint_config],
-        &[code.clone()],
+        context_map,
+        &uint_configs,
+        codes,
     )?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
 }
 
-/// Write AC entropy stream header (Huffman histograms for AC contexts).
-/// Build and write AC entropy histograms and token data.
+/// Encode the HfGlobal section with pre-computed global ANS distribution.
+fn encode_hf_global_section_with_ans(
+    num_groups: usize,
+    context_map: &[u8],
+    uint_config: &crate::encode::entropy::HybridUintConfig,
+    distributions: &[crate::encode::entropy::ans::AnsDistribution],
+) -> Result<Vec<u8>> {
+    let mut w = BitWriter::new();
+
+    // DequantMatrices: all_default = true
+    w.write(1, 1)?;
+
+    // num_histograms: ceil_log2(num_groups) bits, value = 0 (meaning 1 histogram)
+    let num_histo_bits = if num_groups <= 1 {
+        0
+    } else {
+        32 - (num_groups as u32 - 1).leading_zeros()
+    };
+    if num_histo_bits > 0 {
+        w.write(num_histo_bits as usize, 0)?;
+    }
+
+    // Per-pass data (1 pass): used_orders selector = 2 (natural order)
+    w.write(2, 2)?;
+
+    // Write ANS histograms header (tables only, no token data)
+    let uint_configs = vec![*uint_config; distributions.len()];
+    crate::encode::entropy::ans::write_ans_histograms(
+        &mut w,
+        context_map,
+        &uint_configs,
+        distributions,
+    )?;
+
+    w.byte_align_zero_pad()?;
+    Ok(w.finish())
+}
+
+/// Write AC entropy stream header and token data.
 ///
-/// This encodes the AC coefficients using Huffman coding:
-/// 1. Collect token frequencies per context
-/// 2. Cluster contexts to a single histogram (for simplicity)
-/// 3. Build Huffman codes from frequencies
-/// 4. Write Histograms header (LZ77 + context_map + Huffman tables)
-/// 5. Write token stream (Huffman symbols + HybridUint extra bits)
+/// Supports both Huffman (legacy path) and ANS (new path).
 fn write_ac_histograms_and_tokens(
     w: &mut BitWriter,
     num_ac_contexts: usize,
     tokens: &[AcToken],
+    use_ans: bool,
 ) -> Result<()> {
-    use crate::encode::entropy::huffman_encode::{build_huffman_code, write_huffman_symbol};
+    use crate::encode::entropy::huffman_encode::write_huffman_symbol;
 
-    // HybridUint config for AC: (4, 1, 2) matches libjxl e3 default
-    let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
-
-    // Encode all values through HybridUint to get tokens
-    let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
-
-    // Find max token across all encoded values
-    let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
-    let alphabet_size = (max_token as usize + 1).max(1);
-
-    // Collect frequencies across all contexts (single histogram)
-    let mut frequencies = vec![0u64; alphabet_size];
-    for enc in &encoded {
-        frequencies[enc.token as usize] += 1;
+    enum EntropyChoice {
+        Ans {
+            context_map: Vec<u8>,
+            distributions: Vec<crate::encode::entropy::ans::AnsDistribution>,
+            uint_config: crate::encode::entropy::HybridUintConfig,
+        },
+        Huffman {
+            context_map: Vec<u8>,
+            codes: Vec<crate::encode::entropy::huffman_encode::HuffmanCode>,
+            uint_config: crate::encode::entropy::HybridUintConfig,
+        },
     }
 
-    // Handle empty token stream (all-zero coefficients)
-    if tokens.is_empty() || frequencies.iter().all(|&f| f == 0) {
-        // Write a minimal single-symbol histogram
-        // LZ77 disabled
-        w.write(1, 0)?;
-        // Context map: all -> histogram 0
-        crate::encode::entropy::context_map::write_simple_zero_context_map(w, num_ac_contexts)?;
-        // use_prefix_code = true
-        w.write(1, 1)?;
-        // HybridUint: split_exponent=0
-        let zero_cfg = crate::encode::entropy::HybridUintConfig::new(0, 0, 0);
-        zero_cfg.write(w, 15)?;
-        // varint16(0) = alphabet_size 1
-        w.write(1, 0)?;
-        // Table with al_size=1: no data
-        return Ok(());
+    // HybridUint config candidates for AC. libjxl kFast tries these.
+    let uint_configs_to_try = [
+        crate::encode::entropy::HybridUintConfig::new(4, 2, 0), // default
+        crate::encode::entropy::HybridUintConfig::new(4, 1, 2), // libjxl e3
+        crate::encode::entropy::HybridUintConfig::new(0, 0, 0), // smallest histograms
+        crate::encode::entropy::HybridUintConfig::new(2, 0, 1), // good for ctx map
+    ];
+
+    // Caller byte-aligns right after AC payload in single-group sections.
+    let start_mod8 = w.total_bits_written() % 8;
+    let with_final_alignment =
+        |payload_bits: usize| payload_bits + ((8 - ((start_mod8 + payload_bits) % 8)) % 8);
+
+    let mut best_choice: Option<EntropyChoice> = None;
+    let mut best_effective_bits = usize::MAX;
+
+    let mut context_counts = vec![0u64; num_ac_contexts];
+    for token in tokens {
+        context_counts[token.context] += 1;
     }
 
-    // Build Huffman code
-    let code = build_huffman_code(&frequencies)
-        .ok_or(crate::error::Error::InvalidHuffman)?;
+    for &uint_config in &uint_configs_to_try {
+        // Encode all values through HybridUint to get symbols + extra bits.
+        let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
 
-    // Write the Histograms header
-    let context_map = vec![0u8; num_ac_contexts]; // all -> histogram 0
-    crate::encode::entropy::huffman_encode::write_huffman_histograms(
-        w,
-        &context_map,
-        &[uint_config],
-        &[code.clone()],
-    )?;
+        let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
+        let alphabet_size = (max_token as usize + 1).max(1);
 
-    // Write token data: for each token, write Huffman symbol + extra bits
-    for (_token, enc) in tokens.iter().zip(encoded.iter()) {
-        write_huffman_symbol(w, &code, enc.token as usize)?;
-        if enc.nbits > 0 {
-            w.write(enc.nbits as usize, enc.extra_bits as u64)?;
+        // Build context map candidates: preset heuristics + data-driven greedy clustering.
+        let mut context_map_candidates =
+            build_ac_context_map_candidates(num_ac_contexts, &context_counts);
+        for max_c in [2, 4, 8, 16, 32] {
+            if max_c <= num_ac_contexts {
+                let greedy_map = build_greedy_clustered_context_map(
+                    num_ac_contexts,
+                    alphabet_size,
+                    tokens,
+                    &encoded,
+                    max_c,
+                );
+                if !context_map_candidates.iter().any(|m| *m == greedy_map) {
+                    context_map_candidates.push(greedy_map);
+                }
+            }
+        }
+
+        for context_map in &context_map_candidates {
+            let cluster_frequencies =
+                build_cluster_frequencies_for_tokens(context_map, alphabet_size, tokens, &encoded)?;
+
+            if use_ans {
+                let distributions = build_ans_distributions(&cluster_frequencies);
+                let ans_tokens: Vec<crate::encode::entropy::ans::AnsToken> = tokens
+                    .iter()
+                    .zip(encoded.iter())
+                    .map(|(token, enc)| crate::encode::entropy::ans::AnsToken {
+                        symbol: enc.token,
+                        cluster: context_map[token.context] as usize,
+                        extra_bits: enc.extra_bits,
+                        extra_nbits: enc.nbits as usize,
+                    })
+                    .collect();
+                let ans_bits = with_final_alignment(estimate_ans_payload_bits(
+                    &context_map,
+                    uint_config,
+                    &distributions,
+                    &ans_tokens,
+                )?);
+                if ans_bits < best_effective_bits {
+                    best_effective_bits = ans_bits;
+                    best_choice = Some(EntropyChoice::Ans {
+                        context_map: context_map.clone(),
+                        distributions,
+                        uint_config,
+                    });
+                }
+            }
+
+            let codes = build_huffman_codes_from_frequencies(&cluster_frequencies)?;
+            let huffman_bits = with_final_alignment(estimate_huffman_payload_bits(
+                context_map,
+                uint_config,
+                &codes,
+                tokens,
+                &encoded,
+            )?);
+            if huffman_bits < best_effective_bits || best_choice.is_none() {
+                best_effective_bits = huffman_bits;
+                best_choice = Some(EntropyChoice::Huffman {
+                    context_map: context_map.clone(),
+                    codes,
+                    uint_config,
+                });
+            }
+        }
+    } // end for &uint_config
+
+    match best_choice.ok_or(crate::error::Error::InvalidHuffman)? {
+        EntropyChoice::Ans {
+            context_map,
+            distributions,
+            uint_config,
+        } => {
+            let uint_configs = vec![uint_config; distributions.len()];
+            crate::encode::entropy::ans::write_ans_histograms(
+                w,
+                &context_map,
+                &uint_configs,
+                &distributions,
+            )?;
+
+            let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
+            let ans_tokens: Vec<crate::encode::entropy::ans::AnsToken> = tokens
+                .iter()
+                .zip(encoded.iter())
+                .map(|(token, enc)| crate::encode::entropy::ans::AnsToken {
+                    symbol: enc.token,
+                    cluster: context_map[token.context] as usize,
+                    extra_bits: enc.extra_bits,
+                    extra_nbits: enc.nbits as usize,
+                })
+                .collect();
+            crate::encode::entropy::ans::write_ans_stream(w, &distributions, &ans_tokens)?;
+        }
+        EntropyChoice::Huffman {
+            context_map,
+            codes,
+            uint_config,
+        } => {
+            let uint_configs = vec![uint_config; codes.len()];
+            crate::encode::entropy::huffman_encode::write_huffman_histograms(
+                w,
+                &context_map,
+                &uint_configs,
+                &codes,
+            )?;
+
+            let encoded: Vec<_> = tokens.iter().map(|t| uint_config.encode(t.value)).collect();
+            for (token, enc) in tokens.iter().zip(encoded.iter()) {
+                let cluster = context_map[token.context] as usize;
+                write_huffman_symbol(w, &codes[cluster], enc.token as usize)?;
+                if enc.nbits > 0 {
+                    w.write(enc.nbits as usize, enc.extra_bits as u64)?;
+                }
+            }
         }
     }
 
@@ -988,32 +4446,57 @@ fn write_ac_histograms_and_tokens(
 }
 
 /// Encode an HfGroup section: histogram_index + AC token data.
-///
-/// The Huffman tables were written in HfGlobal; this section writes
-/// the entropy-coded symbols referencing those tables.
 fn encode_hf_group_tokens(
     num_groups: usize,
     tokens: &[AcToken],
     encoded: &[crate::encode::entropy::HybridUintEncoded],
-    code: &crate::encode::entropy::huffman_encode::HuffmanCode,
+    context_map: &[u8],
+    codes: &[crate::encode::entropy::huffman_encode::HuffmanCode],
 ) -> Result<Vec<u8>> {
     use crate::encode::entropy::huffman_encode::write_huffman_symbol;
 
     let mut w = BitWriter::new();
 
-    // histogram_index: 0 (use first histogram set)
-    // Number of bits = ceil_log2(num_histograms) = ceil_log2(1) = 0 bits.
-    // But wait: the decoder reads ceil_log2(num_histograms) bits per HfGroup.
-    // With num_histograms=1, that's 0 bits. Nothing to write.
-    let _ = num_groups; // num_histograms=1, so 0 bits for histogram_index
+    // histogram_index: 0 (num_histograms = 1 -> 0 bits)
+    let _ = num_groups;
 
-    // Write token data: Huffman symbols + extra bits
-    for (_token, enc) in tokens.iter().zip(encoded.iter()) {
-        write_huffman_symbol(&mut w, code, enc.token as usize)?;
+    for (token, enc) in tokens.iter().zip(encoded.iter()) {
+        let cluster = context_map[token.context] as usize;
+        write_huffman_symbol(&mut w, &codes[cluster], enc.token as usize)?;
         if enc.nbits > 0 {
             w.write(enc.nbits as usize, enc.extra_bits as u64)?;
         }
     }
+
+    w.byte_align_zero_pad()?;
+    Ok(w.finish())
+}
+
+/// Encode an HfGroup section using ANS: histogram_index + ANS token stream.
+fn encode_hf_group_tokens_ans(
+    num_groups: usize,
+    tokens: &[AcToken],
+    encoded: &[crate::encode::entropy::HybridUintEncoded],
+    context_map: &[u8],
+    distributions: &[crate::encode::entropy::ans::AnsDistribution],
+) -> Result<Vec<u8>> {
+    let mut w = BitWriter::new();
+
+    // histogram_index: 0 (num_histograms = 1 -> 0 bits)
+    let _ = num_groups;
+
+    let ans_tokens: Vec<crate::encode::entropy::ans::AnsToken> = tokens
+        .iter()
+        .zip(encoded.iter())
+        .map(|(token, enc)| crate::encode::entropy::ans::AnsToken {
+            symbol: enc.token,
+            cluster: context_map[token.context] as usize,
+            extra_bits: enc.extra_bits,
+            extra_nbits: enc.nbits as usize,
+        })
+        .collect();
+
+    crate::encode::entropy::ans::write_ans_stream(&mut w, distributions, &ans_tokens)?;
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -1025,15 +4508,2587 @@ mod tests {
 
     #[test]
     fn test_distance_to_quant_params() {
+        // At d=1.0, libjxl-aligned: global_scale ~ 65536 * 0.765 / 5.0 ~ 10026
         let (gs, ql) = distance_to_quant_params(1.0);
-        assert_eq!(gs, 16384);
-        assert_eq!(ql, 16);
+        assert!(gs > 5000 && gs < 15000, "global_scale at d=1: {gs}");
+        assert!(ql > 0, "quant_lf must be positive: {ql}");
 
-        let (gs, _) = distance_to_quant_params(0.5);
-        assert_eq!(gs, 32768);
+        // Higher distance -> lower global_scale
+        let (gs2, _) = distance_to_quant_params(2.0);
+        assert!(gs2 < gs, "d=2 global_scale ({gs2}) should be < d=1 ({gs})");
 
-        let (gs, _) = distance_to_quant_params(2.0);
-        assert_eq!(gs, 8192);
+        // Lower distance -> higher global_scale
+        let (gs05, _) = distance_to_quant_params(0.5);
+        assert!(
+            gs05 > gs,
+            "d=0.5 global_scale ({gs05}) should be > d=1 ({gs})"
+        );
+    }
+
+    #[test]
+    fn test_predict_num_nonzeros_matches_decoder_behavior() {
+        let stride = 4;
+        let mut map = vec![0u32; stride * stride];
+
+        // Top-left bootstrap value.
+        assert_eq!(predict_num_nonzeros(&map, stride, 0, 0), 32);
+
+        // Top row uses left neighbor.
+        map[0] = 5;
+        assert_eq!(predict_num_nonzeros(&map, stride, 1, 0), 5);
+
+        // Left column uses top neighbor.
+        assert_eq!(predict_num_nonzeros(&map, stride, 0, 1), 5);
+
+        // Interior uses ceil((top + left) / 2).
+        map[1] = 7; // top at (1, 0)
+        map[stride] = 9; // left at (0, 1)
+        assert_eq!(predict_num_nonzeros(&map, stride, 1, 1), 8);
+    }
+
+    #[test]
+    fn test_ac_context_map_candidates_basic() {
+        let num_contexts = 15;
+        let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
+        let context_counts = vec![0u64; num_ac_contexts];
+        let candidates = build_ac_context_map_candidates(num_ac_contexts, &context_counts);
+
+        assert!(
+            candidates.len() >= 4,
+            "expected multiple context-map candidates"
+        );
+        assert!(
+            candidates.iter().any(|m| m.iter().all(|&v| v == 0)),
+            "expected all-zero context map candidate"
+        );
+
+        for map in &candidates {
+            assert_eq!(map.len(), num_ac_contexts);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_raw_quant_map_gating_and_range() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let mut dct_x = vec![0.0f32; num_blocks * 64];
+        let mut dct_y = vec![0.0f32; num_blocks * 64];
+        let mut dct_b = vec![0.0f32; num_blocks * 64];
+
+        // First half smooth, second half textured.
+        for blk in 0..num_blocks {
+            for k in 1..64 {
+                let v = if blk < num_blocks / 2 { 0.01 } else { 8.0 };
+                dct_x[blk * 64 + k] = v * 0.7;
+                dct_y[blk * 64 + k] = v;
+                dct_b[blk * 64 + k] = v * 0.5;
+            }
+        }
+
+        let (_, _, base_low) = distance_to_full_quant_params(0.8);
+        let low_dist_map =
+            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, bw, bh, 0.8, base_low);
+        assert!(
+            low_dist_map.iter().all(|&q| q == base_low),
+            "distance gating should keep raw_quant=base({base_low})"
+        );
+
+        let (_, _, base_high) = distance_to_full_quant_params(2.0);
+        let high_dist_map =
+            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, bw, bh, 2.0, base_high);
+        assert_eq!(high_dist_map.len(), num_blocks);
+        assert!(high_dist_map.iter().all(|&q| q >= 1));
+        assert!(
+            high_dist_map.iter().any(|&q| q != base_high),
+            "expected non-uniform quant map at higher distance"
+        );
+    }
+
+    #[test]
+    fn test_collect_transform_entries_for_rect_scan_order() {
+        let bw = 4;
+        let bh = 2;
+        let mut transform_map = vec![0u8; bw * bh];
+        let raw_quant_map = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+
+        // First blocks at global indices 0, 3, 5.
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID;
+        transform_map[3] = TRANSFORM_FIRST_BLOCK_FLAG | 4; // pretend DCT16x16 id
+        transform_map[5] = TRANSFORM_FIRST_BLOCK_FLAG | 7; // pretend DCT8x16 id
+
+        let entries =
+            collect_transform_entries_for_rect(&transform_map, &raw_quant_map, bw, 0, 0, bw, bh);
+
+        assert_eq!(entries, vec![(0, 1), (4, 4), (7, 6)]);
+    }
+
+    #[test]
+    fn test_supported_nonzero_transform_ids_cover_all_non_dct8_strategies() {
+        for id in 1u8..=26u8 {
+            assert!(
+                is_supported_nonzero_transform_id(id),
+                "transform id {} should be supported in non-zero path",
+                id
+            );
+        }
+        assert!(!is_supported_nonzero_transform_id(DCT8_TRANSFORM_ID));
+    }
+
+    #[test]
+    fn test_canonical_transform_for_shape_id_mapping() {
+        assert_eq!(
+            canonical_transform_for_shape_id(0),
+            Some(HfTransformType::DCT)
+        );
+        assert_eq!(
+            canonical_transform_for_shape_id(1),
+            Some(HfTransformType::AFV0)
+        );
+        assert_eq!(
+            canonical_transform_for_shape_id(4),
+            Some(HfTransformType::DCT8X16)
+        );
+        assert_eq!(
+            canonical_transform_for_shape_id(5),
+            Some(HfTransformType::DCT8X32)
+        );
+        assert_eq!(
+            canonical_transform_for_shape_id(6),
+            Some(HfTransformType::DCT16X32)
+        );
+        assert_eq!(
+            canonical_transform_for_shape_id(12),
+            Some(HfTransformType::DCT128X256)
+        );
+        assert_eq!(canonical_transform_for_shape_id(13), None);
+    }
+
+    #[test]
+    fn test_build_transform_map_from_quantized_ac_places_dct16_for_zero_regions() {
+        let bw = 4;
+        let bh = 4;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        let map = build_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 2.0);
+        assert_eq!(map.len(), num_blocks);
+
+        // Top-left 2x2 should be one DCT16x16 placement.
+        assert_eq!(map[0], TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID);
+        assert_eq!(map[1], DCT16_TRANSFORM_ID);
+        assert_eq!(map[bw], DCT16_TRANSFORM_ID);
+        assert_eq!(map[bw + 1], DCT16_TRANSFORM_ID);
+
+        // At low distance we keep all DCT8.
+        let low_map = build_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 1.0);
+        assert!(
+            low_map
+                .iter()
+                .all(|&t| t == (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID))
+        );
+    }
+
+    #[test]
+    fn test_build_afv_transform_map_from_quantized_ac_selects_sparse_afv() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let mut ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let mut ac_b = vec![0i32; num_blocks * 64];
+
+        // Seed a few strong directional/high-frequency blocks.
+        for blk in 0..4 {
+            let base = blk * 64;
+            ac_y[base + 1] = if blk % 2 == 0 { 20 } else { -20 };
+            ac_y[base + 8] = if blk < 2 { 2 } else { -2 };
+            ac_y[base + 27] = 45; // u=3,v=3 => "high" bucket in heuristic
+            ac_x[base + 27] = 8;
+            ac_b[base + 27] = -6;
+        }
+
+        let map = build_afv_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        let afv_blocks = map
+            .iter()
+            .filter(|&&t| {
+                let id = t & !TRANSFORM_FIRST_BLOCK_FLAG;
+                matches!(
+                    id,
+                    AFV0_TRANSFORM_ID | AFV1_TRANSFORM_ID | AFV2_TRANSFORM_ID | AFV3_TRANSFORM_ID
+                )
+            })
+            .count();
+
+        assert!(afv_blocks >= 1, "expected at least one AFV-marked block");
+        assert!(
+            afv_blocks <= 1,
+            "heuristic should remain sparse on 8x8 blocks"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_can_include_afv_map() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let mut ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let mut ac_b = vec![0i32; num_blocks * 64];
+
+        for blk in 0..4 {
+            let base = blk * 64;
+            ac_y[base + 1] = if blk % 2 == 0 { 20 } else { -20 };
+            ac_y[base + 8] = if blk < 2 { 2 } else { -2 };
+            ac_y[base + 27] = 45;
+            ac_x[base + 27] = 8;
+            ac_b[base + 27] = -6;
+        }
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().any(|map| map.iter().any(|&t| {
+                matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    AFV0_TRANSFORM_ID | AFV1_TRANSFORM_ID | AFV2_TRANSFORM_ID | AFV3_TRANSFORM_ID
+                )
+            })),
+            "expected at least one AFV candidate map"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_skip_afv_when_grid_is_large() {
+        let bw = 65;
+        let bh = 65;
+        let num_blocks = bw * bh;
+        let mut ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let mut ac_b = vec![0i32; num_blocks * 64];
+
+        // Seed many blocks with AFV-like energy, but grid size should disable AFV candidate insertion.
+        for blk in 0..64 {
+            let base = blk * 64;
+            ac_y[base + 1] = 20;
+            ac_y[base + 8] = 2;
+            ac_y[base + 27] = 45;
+            ac_x[base + 27] = 8;
+            ac_b[base + 27] = -6;
+        }
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().all(|map| map.iter().all(|&t| {
+                !matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    AFV0_TRANSFORM_ID | AFV1_TRANSFORM_ID | AFV2_TRANSFORM_ID | AFV3_TRANSFORM_ID
+                )
+            })),
+            "did not expect AFV candidates for large grids"
+        );
+    }
+
+    #[test]
+    fn test_build_directional_special_transform_map_selects_expected_orientation() {
+        let bw = 4;
+        let bh = 4;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        // Strongly horizontal directional energy in block 0.
+        ac_y[1] = 50;
+        ac_y[2] = 40;
+        ac_y[3] = 30;
+        ac_y[8] = 2;
+        ac_y[16] = 1;
+        ac_y[24] = 1;
+
+        let map = build_directional_special_transform_map_from_quantized_ac(
+            &ac_x, &ac_y, &ac_b, bw, bh, 3.0,
+        );
+        assert_eq!(map[0], TRANSFORM_FIRST_BLOCK_FLAG | DCT4X8_TRANSFORM_ID);
+
+        let directional_blocks = map
+            .iter()
+            .filter(|&&t| {
+                matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT4X8_TRANSFORM_ID | DCT8X4_TRANSFORM_ID
+                )
+            })
+            .count();
+        assert_eq!(
+            directional_blocks, 1,
+            "directional map should remain sparse"
+        );
+    }
+
+    #[test]
+    fn test_build_compact_special_transform_map_ignores_zero_blocks() {
+        let bw = 4;
+        let bh = 4;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        let map =
+            build_compact_special_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            map.iter()
+                .all(|&t| t == (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)),
+            "all-zero AC should keep default DCT8 map"
+        );
+    }
+
+    #[test]
+    fn test_build_compact_special_transform_map_selects_dct2x2_for_smooth_block() {
+        let bw = 4;
+        let bh = 4;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        ac_y[1] = 6;
+        ac_y[8] = 4;
+
+        let map =
+            build_compact_special_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert_eq!(map[0], TRANSFORM_FIRST_BLOCK_FLAG | DCT2X2_TRANSFORM_ID);
+    }
+
+    #[test]
+    fn test_build_compact_special_transform_map_selects_identity_for_sparse_peak() {
+        let bw = 4;
+        let bh = 4;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        ac_y[1] = 6;
+        ac_y[27] = 40;
+
+        let map =
+            build_compact_special_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert_eq!(map[0], TRANSFORM_FIRST_BLOCK_FLAG | IDENTITY_TRANSFORM_ID);
+    }
+
+    #[test]
+    fn test_build_mixed_special_transform_map_selects_expected_blocks() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let mut ac_b = vec![0i32; num_blocks * 64];
+
+        // Block 0: smooth/low-energy compact transform candidate.
+        ac_y[1] = 6;
+        ac_y[8] = 4;
+
+        // Block 1: strong horizontal directional content.
+        let b1 = 64;
+        ac_y[b1 + 1] = 35;
+        ac_y[b1 + 2] = 28;
+        ac_y[b1 + 3] = 16;
+        ac_y[b1 + 8] = 2;
+        ac_y[b1 + 16] = 1;
+        ac_y[b1 + 24] = 1;
+
+        // Block 2: AFV-like high-frequency content.
+        let b2 = 128;
+        ac_y[b2 + 1] = 12;
+        ac_y[b2 + 8] = 2;
+        ac_y[b2 + 27] = 45;
+        ac_b[b2 + 27] = -6;
+
+        // Block 3: sparse strong peak for IDENTITY.
+        let b3 = 192;
+        ac_y[b3 + 1] = 2;
+        ac_y[b3 + 27] = 60;
+
+        let map =
+            build_mixed_special_transform_map_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+
+        assert!(matches!(
+            map[0] & !TRANSFORM_FIRST_BLOCK_FLAG,
+            DCT2X2_TRANSFORM_ID | DCT4X4_TRANSFORM_ID
+        ));
+        assert_eq!(map[1], TRANSFORM_FIRST_BLOCK_FLAG | DCT4X8_TRANSFORM_ID);
+        assert_eq!(map[2], TRANSFORM_FIRST_BLOCK_FLAG | AFV0_TRANSFORM_ID);
+        assert_eq!(map[3], TRANSFORM_FIRST_BLOCK_FLAG | IDENTITY_TRANSFORM_ID);
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_can_include_mixed_special_map() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let mut ac_b = vec![0i32; num_blocks * 64];
+
+        ac_y[1] = 6;
+        ac_y[8] = 4;
+
+        let b1 = 64;
+        ac_y[b1 + 1] = 35;
+        ac_y[b1 + 2] = 28;
+        ac_y[b1 + 3] = 16;
+        ac_y[b1 + 8] = 2;
+        ac_y[b1 + 16] = 1;
+        ac_y[b1 + 24] = 1;
+
+        let b2 = 128;
+        ac_y[b2 + 1] = 12;
+        ac_y[b2 + 8] = 2;
+        ac_y[b2 + 27] = 45;
+        ac_b[b2 + 27] = -6;
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().any(|map| {
+                matches!(
+                    map[1] & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT4X8_TRANSFORM_ID | DCT8X4_TRANSFORM_ID
+                ) && matches!(
+                    map[2] & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    AFV0_TRANSFORM_ID | AFV1_TRANSFORM_ID | AFV2_TRANSFORM_ID | AFV3_TRANSFORM_ID
+                )
+            }),
+            "expected at least one mixed special-transform candidate map"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_can_include_directional_special_map() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        for blk in 0..4 {
+            let base = blk * 64;
+            ac_y[base + 1] = 35;
+            ac_y[base + 2] = 28;
+            ac_y[base + 3] = 16;
+            ac_y[base + 8] = 2;
+            ac_y[base + 16] = 1;
+            ac_y[base + 24] = 1;
+        }
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().any(|map| map.iter().any(|&t| {
+                matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT4X8_TRANSFORM_ID | DCT8X4_TRANSFORM_ID
+                )
+            })),
+            "expected at least one directional small-transform candidate map"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_can_include_compact_special_map() {
+        let bw = 8;
+        let bh = 8;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        for blk in 0..8 {
+            let base = blk * 64;
+            ac_y[base + 1] = 6;
+            ac_y[base + 8] = 4;
+        }
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().any(|map| map.iter().any(|&t| {
+                matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    IDENTITY_TRANSFORM_ID | DCT2X2_TRANSFORM_ID | DCT4X4_TRANSFORM_ID
+                )
+            })),
+            "expected at least one compact special-transform candidate map"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_skip_directional_special_when_grid_is_large() {
+        let bw = 65;
+        let bh = 65;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        for blk in 0..64 {
+            let base = blk * 64;
+            ac_y[base + 1] = 40;
+            ac_y[base + 2] = 30;
+            ac_y[base + 3] = 20;
+            ac_y[base + 8] = 2;
+            ac_y[base + 16] = 1;
+            ac_y[base + 24] = 1;
+        }
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().all(|map| map.iter().all(|&t| {
+                !matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT4X8_TRANSFORM_ID | DCT8X4_TRANSFORM_ID
+                )
+            })),
+            "did not expect directional small-transform candidates for large grids"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_skip_compact_special_when_grid_is_large() {
+        let bw = 65;
+        let bh = 65;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        for blk in 0..64 {
+            let base = blk * 64;
+            ac_y[base + 1] = 6;
+            ac_y[base + 8] = 4;
+        }
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().all(|map| map.iter().all(|&t| {
+                !matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    IDENTITY_TRANSFORM_ID | DCT2X2_TRANSFORM_ID | DCT4X4_TRANSFORM_ID
+                )
+            })),
+            "did not expect compact special-transform candidates for large grids"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_can_include_256_family_map() {
+        let bw = 32;
+        let bh = 32;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().any(|map| map.iter().any(|&t| {
+                matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT256_TRANSFORM_ID | DCT256X128_TRANSFORM_ID | DCT128X256_TRANSFORM_ID
+                )
+            })),
+            "expected at least one 256-family candidate map"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_skip_256_family_when_grid_is_too_large() {
+        let bw = 64;
+        let bh = 64;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let ac_y = vec![0i32; num_blocks * 64];
+        let ac_b = vec![0i32; num_blocks * 64];
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().all(|map| map.iter().all(|&t| {
+                !matches!(
+                    t & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT256_TRANSFORM_ID | DCT256X128_TRANSFORM_ID | DCT128X256_TRANSFORM_ID
+                )
+            })),
+            "did not expect 256-family candidates for large grids"
+        );
+    }
+
+    #[test]
+    fn test_build_transform_map_candidates_skip_mixed_special_when_grid_is_large() {
+        let bw = 65;
+        let bh = 65;
+        let num_blocks = bw * bh;
+        let ac_x = vec![0i32; num_blocks * 64];
+        let mut ac_y = vec![0i32; num_blocks * 64];
+        let mut ac_b = vec![0i32; num_blocks * 64];
+
+        ac_y[1] = 6;
+        ac_y[8] = 4;
+
+        let b1 = 64;
+        ac_y[b1 + 1] = 35;
+        ac_y[b1 + 2] = 28;
+        ac_y[b1 + 3] = 16;
+        ac_y[b1 + 8] = 2;
+        ac_y[b1 + 16] = 1;
+        ac_y[b1 + 24] = 1;
+
+        let b2 = 128;
+        ac_y[b2 + 1] = 12;
+        ac_y[b2 + 8] = 2;
+        ac_y[b2 + 27] = 45;
+        ac_b[b2 + 27] = -6;
+
+        let candidates =
+            build_transform_map_candidates_from_quantized_ac(&ac_x, &ac_y, &ac_b, bw, bh, 3.0);
+        assert!(
+            candidates.iter().all(|map| {
+                !matches!(
+                    map[1] & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    DCT2X2_TRANSFORM_ID
+                        | DCT4X4_TRANSFORM_ID
+                        | DCT4X8_TRANSFORM_ID
+                        | DCT8X4_TRANSFORM_ID
+                ) && !matches!(
+                    map[2] & !TRANSFORM_FIRST_BLOCK_FLAG,
+                    AFV0_TRANSFORM_ID | AFV1_TRANSFORM_ID | AFV2_TRANSFORM_ID | AFV3_TRANSFORM_ID
+                )
+            }),
+            "did not expect mixed special-transform candidates for large grids"
+        );
+    }
+
+    #[test]
+    fn test_zero_non_dct8_ac_coeffs_clears_region() {
+        let bw = 2;
+        let bh = 2;
+        let mut ac = vec![0i32; bw * bh * 64];
+        for blk in 0..(bw * bh) {
+            ac[blk * 64 + 5] = 7;
+            ac[blk * 64 + 17] = -3;
+        }
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
+        transform_map[1] = DCT16_TRANSFORM_ID;
+        transform_map[bw] = DCT16_TRANSFORM_ID;
+        transform_map[bw + 1] = DCT16_TRANSFORM_ID;
+
+        zero_non_dct8_ac_coeffs(&mut ac, &transform_map, bw, bh).unwrap();
+        for blk in 0..(bw * bh) {
+            assert!(ac[blk * 64 + 1..blk * 64 + 64].iter().all(|&v| v == 0));
+        }
+    }
+
+    #[test]
+    fn test_forward_dct2d_scalar_roundtrip_via_idct8() {
+        let mut coeffs = [0.0f32; 64];
+        for (i, v) in coeffs.iter_mut().enumerate() {
+            *v = (i as f32 * 0.37).sin() * 20.0 + (i % 7) as f32;
+        }
+
+        let mut spatial = coeffs;
+        jxl_transforms::idct2d_8_8(jxl_simd::scalar::ScalarDescriptor, &mut spatial);
+
+        let mut recovered = spatial.to_vec();
+        forward_dct2d_scalar(&mut recovered, 8, 8);
+
+        let max_err = coeffs
+            .iter()
+            .zip(recovered.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 0.02,
+            "generic 8x8 DCT roundtrip mismatch: max_err={max_err}"
+        );
+    }
+
+    #[test]
+    fn test_forward_special_8x8_roundtrip_via_decoder_transform() {
+        let mut block = vec![0.0f32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                block[y * 8 + x] = (x as f32 * 0.21 + y as f32 * 0.17).sin() * 6.0;
+            }
+        }
+
+        for &(transform_type, forward, err_limit) in &[
+            (
+                HfTransformType::IDENTITY,
+                forward_identity_from_8x8 as fn(&[f32]) -> Vec<f32>,
+                0.02f32,
+            ),
+            (
+                HfTransformType::DCT2X2,
+                forward_dct2x2_from_8x8 as fn(&[f32]) -> Vec<f32>,
+                0.02f32,
+            ),
+            (
+                HfTransformType::DCT4X4,
+                forward_dct4x4_from_8x8 as fn(&[f32]) -> Vec<f32>,
+                0.02f32,
+            ),
+            (
+                HfTransformType::DCT4X8,
+                forward_dct4x8_from_8x8 as fn(&[f32]) -> Vec<f32>,
+                0.03f32,
+            ),
+            (
+                HfTransformType::DCT8X4,
+                forward_dct8x4_from_8x8 as fn(&[f32]) -> Vec<f32>,
+                0.03f32,
+            ),
+        ] {
+            let coeffs = forward(&block);
+            let mut lf = vec![coeffs[0]];
+            let mut pixels = coeffs.clone();
+            transform_to_pixels(transform_type, &mut lf, &mut pixels);
+
+            let max_err = block
+                .iter()
+                .zip(pixels.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < err_limit,
+                "special-transform roundtrip mismatch for {:?}: max_err={}",
+                transform_type,
+                max_err
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_forward_transform_coeffs_special_8x8_roundtrip_with_clamp() {
+        let width = 11;
+        let height = 9;
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.13 + y as f32 * 0.29).sin() * 4.0;
+                x_chan[idx] = v * 0.8 + 0.3;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * -0.2 + (x as f32 * 0.05);
+            }
+        }
+
+        let bx = 1;
+        let by = 1;
+        for &transform_id in &[
+            IDENTITY_TRANSFORM_ID,
+            DCT2X2_TRANSFORM_ID,
+            DCT4X4_TRANSFORM_ID,
+            DCT4X8_TRANSFORM_ID,
+            DCT8X4_TRANSFORM_ID,
+            AFV0_TRANSFORM_ID,
+            AFV1_TRANSFORM_ID,
+            AFV2_TRANSFORM_ID,
+            AFV3_TRANSFORM_ID,
+        ] {
+            let coeffs = compute_forward_transform_coeffs(
+                transform_id,
+                &x_chan,
+                &y_chan,
+                &b_minus_y_chan,
+                width,
+                height,
+                bx,
+                by,
+                8,
+                8,
+            );
+            let transform_type = HfTransformType::from_usize(transform_id as usize).unwrap();
+
+            for (chan_idx, source) in [&x_chan[..], &y_chan[..], &b_minus_y_chan[..]]
+                .into_iter()
+                .enumerate()
+            {
+                let expected = gather_clamped_block(source, width, height, bx * 8, by * 8, 8, 8);
+                let mut lf = vec![coeffs[chan_idx][0]];
+                let mut pixels = coeffs[chan_idx].clone();
+                transform_to_pixels(transform_type, &mut lf, &mut pixels);
+
+                let max_err = expected
+                    .iter()
+                    .zip(pixels.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_err < 0.04,
+                    "special compute_forward mismatch for id {} channel {}: max_err={}",
+                    transform_id,
+                    chan_idx,
+                    max_err
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // ~48s: heavy solver build, run explicitly with --ignored
+    fn test_compute_forward_transform_coeffs_non_special_square_roundtrip_with_clamp() {
+        let width = 140;
+        let height = 120;
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v =
+                    (x as f32 * 0.07 + y as f32 * 0.11).sin() * 5.0 + (x as f32 * 0.03).cos() * 1.5;
+                x_chan[idx] = v * 0.9 + 0.2;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * -0.35 + (y as f32 * 0.02);
+            }
+        }
+
+        let bx = 10;
+        let by = 7;
+        for &(transform_id, block_w, block_h, err_limit) in &[
+            (DCT16_TRANSFORM_ID, 16usize, 16usize, 0.15f32),
+            (DCT32_TRANSFORM_ID, 32usize, 32usize, 0.15f32),
+            (DCT64_TRANSFORM_ID, 64usize, 64usize, 0.30f32),
+        ] {
+            let coeffs = compute_forward_transform_coeffs(
+                transform_id,
+                &x_chan,
+                &y_chan,
+                &b_minus_y_chan,
+                width,
+                height,
+                bx,
+                by,
+                block_w,
+                block_h,
+            );
+            let transform_type = HfTransformType::from_usize(transform_id as usize).unwrap();
+
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            for (chan_idx, source) in [&x_chan[..], &y_chan[..], &b_minus_y_chan[..]]
+                .into_iter()
+                .enumerate()
+            {
+                let expected =
+                    gather_clamped_block(source, width, height, bx * 8, by * 8, block_w, block_h);
+
+                let mut lf = vec![0.0f32; cx * cy];
+                for ly in 0..cy {
+                    for lx in 0..cx {
+                        let sub = gather_clamped_block(
+                            source,
+                            width,
+                            height,
+                            bx * 8 + lx * 8,
+                            by * 8 + ly * 8,
+                            8,
+                            8,
+                        );
+                        let mut dct = [0.0f32; 64];
+                        dct.copy_from_slice(&sub);
+                        dct2d_8_scalar(&mut dct);
+                        lf[ly * cx + lx] = dct[0];
+                    }
+                }
+
+                let mut pixels = coeffs[chan_idx].clone();
+                transform_to_pixels(transform_type, &mut lf, &mut pixels);
+
+                let max_err = expected
+                    .iter()
+                    .zip(pixels.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_err < err_limit,
+                    "non-special compute_forward mismatch for id {} channel {}: max_err={}",
+                    transform_id,
+                    chan_idx,
+                    max_err
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // ~14s: heavy solver build, run explicitly with --ignored
+    fn test_compute_forward_transform_coeffs_rectangular_roundtrip_with_clamp() {
+        let width = 140;
+        let height = 120;
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v =
+                    (x as f32 * 0.07 + y as f32 * 0.11).sin() * 5.0 + (x as f32 * 0.03).cos() * 1.5;
+                x_chan[idx] = v * 0.9 + 0.2;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * -0.35 + (y as f32 * 0.02);
+            }
+        }
+
+        let bx = 10;
+        let by = 7;
+        for &(transform_id, block_w, block_h, err_limit) in &[
+            (DCT16X8_TRANSFORM_ID, 8usize, 16usize, 0.20f32),
+            (DCT8X16_TRANSFORM_ID, 16usize, 8usize, 0.20f32),
+            (DCT32X8_TRANSFORM_ID, 8usize, 32usize, 0.24f32),
+            (DCT8X32_TRANSFORM_ID, 32usize, 8usize, 0.24f32),
+            (DCT32X16_TRANSFORM_ID, 16usize, 32usize, 0.30f32),
+            (DCT16X32_TRANSFORM_ID, 32usize, 16usize, 0.30f32),
+        ] {
+            let coeffs = compute_forward_transform_coeffs(
+                transform_id,
+                &x_chan,
+                &y_chan,
+                &b_minus_y_chan,
+                width,
+                height,
+                bx,
+                by,
+                block_w,
+                block_h,
+            );
+            let transform_type = HfTransformType::from_usize(transform_id as usize).unwrap();
+
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            for (chan_idx, source) in [&x_chan[..], &y_chan[..], &b_minus_y_chan[..]]
+                .into_iter()
+                .enumerate()
+            {
+                let expected =
+                    gather_clamped_block(source, width, height, bx * 8, by * 8, block_w, block_h);
+
+                let mut lf = vec![0.0f32; cx * cy];
+                for ly in 0..cy {
+                    for lx in 0..cx {
+                        let sub = gather_clamped_block(
+                            source,
+                            width,
+                            height,
+                            bx * 8 + lx * 8,
+                            by * 8 + ly * 8,
+                            8,
+                            8,
+                        );
+                        let mut dct = [0.0f32; 64];
+                        dct.copy_from_slice(&sub);
+                        dct2d_8_scalar(&mut dct);
+                        lf[ly * cx + lx] = dct[0];
+                    }
+                }
+
+                let mut pixels = coeffs[chan_idx].clone();
+                transform_to_pixels(transform_type, &mut lf, &mut pixels);
+
+                let max_err = expected
+                    .iter()
+                    .zip(pixels.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_err < err_limit,
+                    "rectangular compute_forward mismatch for id {} channel {}: max_err={}",
+                    transform_id,
+                    chan_idx,
+                    max_err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_square_transform_ignored_coeff_indices_match_canonical_prefix() {
+        for &(transform_id, transform_type) in &[
+            (DCT16_TRANSFORM_ID, HfTransformType::DCT16X16),
+            (DCT32_TRANSFORM_ID, HfTransformType::DCT32X32),
+        ] {
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            let lf_count = cx * cy;
+            let coeff_count = cx * cy * 64;
+
+            let mut ignored = Vec::new();
+            for coeff_idx in 0..coeff_count {
+                let mut lf = vec![0.0f32; lf_count];
+                let mut coeffs = vec![0.0f32; coeff_count];
+                coeffs[coeff_idx] = 1.0;
+                transform_to_pixels(transform_type, &mut lf, &mut coeffs);
+                let energy: f32 = coeffs.iter().map(|v| v.abs()).sum();
+                if energy < 1e-6 {
+                    ignored.push(coeff_idx);
+                }
+            }
+
+            ignored.sort_unstable();
+            assert_eq!(
+                ignored.len(),
+                lf_count,
+                "unexpected ignored count for transform id {}",
+                transform_id
+            );
+
+            let canonical =
+                canonical_transform_for_shape_id(block_shape_id(transform_type) as usize).unwrap();
+            let mut lowfreq = natural_coeff_order_for_transform(canonical)[..lf_count].to_vec();
+            lowfreq.sort_unstable();
+            assert_eq!(
+                ignored, lowfreq,
+                "canonical shape order prefix mismatch for transform id {}",
+                transform_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_rectangular_transform_ignored_coeff_indices() {
+        for &(transform_id, transform_type, expected) in &[
+            (
+                DCT16X8_TRANSFORM_ID,
+                HfTransformType::DCT16X8,
+                &[0usize, 1usize][..],
+            ),
+            (
+                DCT8X16_TRANSFORM_ID,
+                HfTransformType::DCT8X16,
+                &[0usize, 1usize][..],
+            ),
+            (
+                DCT32X8_TRANSFORM_ID,
+                HfTransformType::DCT32X8,
+                &[0usize, 1usize, 2usize, 3usize][..],
+            ),
+            (
+                DCT8X32_TRANSFORM_ID,
+                HfTransformType::DCT8X32,
+                &[0usize, 1usize, 2usize, 3usize][..],
+            ),
+            (
+                DCT32X16_TRANSFORM_ID,
+                HfTransformType::DCT32X16,
+                &[
+                    0usize, 1usize, 2usize, 3usize, 32usize, 33usize, 34usize, 35usize,
+                ][..],
+            ),
+            (
+                DCT16X32_TRANSFORM_ID,
+                HfTransformType::DCT16X32,
+                &[
+                    0usize, 1usize, 2usize, 3usize, 32usize, 33usize, 34usize, 35usize,
+                ][..],
+            ),
+        ] {
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            let lf_count = cx * cy;
+            let coeff_count = cx * cy * 64;
+
+            let mut ignored = Vec::new();
+            for coeff_idx in 0..coeff_count {
+                let mut lf = vec![0.0f32; lf_count];
+                let mut coeffs = vec![0.0f32; coeff_count];
+                coeffs[coeff_idx] = 1.0;
+                transform_to_pixels(transform_type, &mut lf, &mut coeffs);
+                let energy: f32 = coeffs.iter().map(|v| v.abs()).sum();
+                if energy < 1e-6 {
+                    ignored.push(coeff_idx);
+                }
+            }
+
+            ignored.sort_unstable();
+            assert_eq!(
+                ignored.len(),
+                lf_count,
+                "unexpected ignored count for transform id {}",
+                transform_id
+            );
+            assert_eq!(
+                ignored, expected,
+                "unexpected ignored coeff indices for transform id {}",
+                transform_id
+            );
+
+            let canonical = match block_shape_id(transform_type) {
+                4 => HfTransformType::DCT8X16,
+                5 => HfTransformType::DCT8X32,
+                6 => HfTransformType::DCT16X32,
+                _ => unreachable!(),
+            };
+            let mut lowfreq = natural_coeff_order_for_transform(canonical)[..lf_count].to_vec();
+            lowfreq.sort_unstable();
+            assert_eq!(
+                lowfreq, expected,
+                "canonical shape order prefix mismatch for transform id {}",
+                transform_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_afv_from_8x8_roundtrip_via_decoder_transform() {
+        let mut block = vec![0.0f32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                block[y * 8 + x] = (x as f32 * 0.21 + y as f32 * 0.17).sin() * 6.0;
+            }
+        }
+
+        for &(transform_id, transform_type) in &[
+            (AFV0_TRANSFORM_ID, HfTransformType::AFV0),
+            (AFV1_TRANSFORM_ID, HfTransformType::AFV1),
+            (AFV2_TRANSFORM_ID, HfTransformType::AFV2),
+            (AFV3_TRANSFORM_ID, HfTransformType::AFV3),
+        ] {
+            let coeffs = forward_afv_from_8x8(&block, transform_id);
+            let mut lf = vec![coeffs[0]];
+            let mut pixels = coeffs.clone();
+            transform_to_pixels(transform_type, &mut lf, &mut pixels);
+
+            let max_err = block
+                .iter()
+                .zip(pixels.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < 0.01,
+                "AFV roundtrip mismatch for {:?}: max_err={}",
+                transform_type,
+                max_err
+            );
+        }
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct16_nonzero_supported() {
+        let width = 16;
+        let height = 16;
+        let bw = 2;
+        let bh = 2;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = x as f32 * 0.5 + y as f32 * 0.25;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
+        transform_map[1] = DCT16_TRANSFORM_ID;
+        transform_map[bw] = DCT16_TRANSFORM_ID;
+        transform_map[bw + 1] = DCT16_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct8x16_nonzero_supported() {
+        let width = 16;
+        let height = 8;
+        let bw = 2;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.35 + y as f32 * 0.2).sin() * 5.0;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X16_TRANSFORM_ID;
+        transform_map[1] = DCT8X16_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct16x8_nonzero_supported() {
+        let width = 8;
+        let height = 16;
+        let bw = 1;
+        let bh = 2;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.1 + y as f32 * 0.45).cos() * 6.0;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16X8_TRANSFORM_ID;
+        transform_map[1] = DCT16X8_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_identity_nonzero_supported() {
+        let width = 8;
+        let height = 8;
+        let bw = 1;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.13 + y as f32 * 0.29).sin() * 5.0;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | IDENTITY_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct2x2_nonzero_supported() {
+        let width = 8;
+        let height = 8;
+        let bw = 1;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.29 + y as f32 * 0.13).cos() * 5.0;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT2X2_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct4x4_nonzero_supported() {
+        let width = 8;
+        let height = 8;
+        let bw = 1;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.17 + y as f32 * 0.23).sin() * 5.0;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT4X4_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct4x8_nonzero_supported() {
+        let width = 8;
+        let height = 8;
+        let bw = 1;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.33 + y as f32 * 0.27).sin() * 5.3;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT4X8_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct8x4_nonzero_supported() {
+        let width = 8;
+        let height = 8;
+        let bw = 1;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.27 + y as f32 * 0.33).cos() * 5.3;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X4_TRANSFORM_ID;
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_afv_nonzero_supported() {
+        let width = 8;
+        let height = 8;
+        let bw = 1;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.19 + y as f32 * 0.37).sin() * 5.3;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let raw_quant_map = vec![1u8; bw * bh];
+        for afv_id in [
+            AFV0_TRANSFORM_ID,
+            AFV1_TRANSFORM_ID,
+            AFV2_TRANSFORM_ID,
+            AFV3_TRANSFORM_ID,
+        ] {
+            let ac_x = vec![0i32; bw * bh * 64];
+            let ac_y = vec![0i32; bw * bh * 64];
+            let ac_b = vec![0i32; bw * bh * 64];
+
+            let mut transform_map = build_default_transform_map(bw, bh);
+            transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | afv_id;
+
+            let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+                &ac_x,
+                &ac_y,
+                &ac_b,
+                &x_chan,
+                &y_chan,
+                &b_minus_y_chan,
+                width,
+                height,
+                bw,
+                bh,
+                16384,
+                &raw_quant_map,
+                &transform_map,
+                0.8,
+                1.0,
+            )
+            .unwrap();
+
+            let tokens =
+                tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                    .unwrap();
+            assert!(tokens.iter().any(|t| t.value > 0));
+        }
+    }
+
+    #[test]
+    #[ignore] // ~26s: encodes+decodes 24 transform types, run explicitly with --ignored
+    fn test_forced_non8x8_transform_maps_decode() {
+        for &(width, height, transform_id) in &[
+            (16usize, 8usize, DCT8X16_TRANSFORM_ID),
+            (8usize, 16usize, DCT16X8_TRANSFORM_ID),
+            (32usize, 8usize, DCT8X32_TRANSFORM_ID),
+            (8usize, 32usize, DCT32X8_TRANSFORM_ID),
+            (16usize, 32usize, DCT32X16_TRANSFORM_ID),
+            (32usize, 16usize, DCT16X32_TRANSFORM_ID),
+            (8usize, 8usize, IDENTITY_TRANSFORM_ID),
+            (8usize, 8usize, DCT2X2_TRANSFORM_ID),
+            (8usize, 8usize, DCT4X4_TRANSFORM_ID),
+            (8usize, 8usize, DCT4X8_TRANSFORM_ID),
+            (8usize, 8usize, DCT8X4_TRANSFORM_ID),
+            (8usize, 8usize, AFV0_TRANSFORM_ID),
+            (8usize, 8usize, AFV1_TRANSFORM_ID),
+            (8usize, 8usize, AFV2_TRANSFORM_ID),
+            (8usize, 8usize, AFV3_TRANSFORM_ID),
+            (32usize, 32usize, DCT32_TRANSFORM_ID),
+            (64usize, 64usize, DCT64_TRANSFORM_ID),
+            (32usize, 64usize, DCT64X32_TRANSFORM_ID),
+            (64usize, 32usize, DCT32X64_TRANSFORM_ID),
+            (128usize, 128usize, DCT128_TRANSFORM_ID),
+            (64usize, 128usize, DCT128X64_TRANSFORM_ID),
+            (128usize, 64usize, DCT64X128_TRANSFORM_ID),
+            (256usize, 256usize, DCT256_TRANSFORM_ID),
+            (128usize, 256usize, DCT256X128_TRANSFORM_ID),
+            (256usize, 128usize, DCT128X256_TRANSFORM_ID),
+        ] {
+            let mut rgb = vec![0u8; width * height * 3];
+            for y in 0..height {
+                for x in 0..width {
+                    let i = (y * width + x) * 3;
+                    rgb[i] = ((x * 17 + y * 13) & 255) as u8;
+                    rgb[i + 1] = ((x * 7 + y * 29) & 255) as u8;
+                    rgb[i + 2] = ((x * 11 + y * 5) & 255) as u8;
+                }
+            }
+
+            let npixels = width * height;
+            let mut x_chan = vec![0.0f32; npixels];
+            let mut y_chan = vec![0.0f32; npixels];
+            let mut b_chan = vec![0.0f32; npixels];
+            srgb_u8_to_xyb(&rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
+            let b_minus_y_chan: Vec<f32> =
+                b_chan.iter().zip(&y_chan).map(|(&b, &y)| b - y).collect();
+
+            let bw = width.div_ceil(8);
+            let bh = height.div_ceil(8);
+            let mut dct_x = vec![0.0f32; bw * bh * 64];
+            let mut dct_y = vec![0.0f32; bw * bh * 64];
+            let mut dct_b = vec![0.0f32; bw * bh * 64];
+            forward_dct_channel(&x_chan, width, height, bw, bh, &mut dct_x);
+            forward_dct_channel(&y_chan, width, height, bw, bh, &mut dct_y);
+            forward_dct_channel(&b_chan, width, height, bw, bh, &mut dct_b);
+
+            let (global_scale, quant_lf) = distance_to_quant_params(2.5);
+            let raw_quant_map = vec![1u8; bw * bh];
+            let quantized = quantize_vardct_blocks(
+                &dct_x,
+                &dct_y,
+                &dct_b,
+                global_scale,
+                quant_lf,
+                &raw_quant_map,
+                &[4096.0f32, 512.0, 256.0],
+                default_dct8x8_dequant_weights(),
+                0.8,
+                1.0,
+            );
+
+            let mut transform_map = build_default_transform_map(bw, bh);
+            transform_map[0] = TRANSFORM_FIRST_BLOCK_FLAG | transform_id;
+            let transform_type = HfTransformType::from_usize(transform_id as usize).unwrap();
+            let cx = covered_blocks_x(transform_type) as usize;
+            let cy = covered_blocks_y(transform_type) as usize;
+            for yb in 0..cy {
+                for xb in 0..cx {
+                    if xb == 0 && yb == 0 {
+                        continue;
+                    }
+                    transform_map[yb * bw + xb] = transform_id;
+                }
+            }
+
+            let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+                &quantized.ac_x,
+                &quantized.ac_y,
+                &quantized.ac_b,
+                &x_chan,
+                &y_chan,
+                &b_minus_y_chan,
+                width,
+                height,
+                bw,
+                bh,
+                global_scale,
+                &raw_quant_map,
+                &transform_map,
+                0.8,
+                1.0,
+            )
+            .unwrap();
+
+            let cs = encode_vardct_frame(
+                width,
+                height,
+                bw,
+                bh,
+                global_scale,
+                quant_lf,
+                &quantized.dc_y,
+                &quantized.dc_x,
+                &quantized.dc_b,
+                &ac_x,
+                &ac_y,
+                &ac_b,
+                &raw_quant_map,
+                &transform_map,
+            )
+            .unwrap();
+
+            let (_n, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
+                .expect("decode should succeed for forced rectangular transform");
+            assert!(!frames.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct32_nonzero_supported() {
+        let width = 32;
+        let height = 32;
+        let bw = 4;
+        let bh = 4;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.21 + y as f32 * 0.17).sin() * 8.0;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..4 {
+            for x in 0..4 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT32_TRANSFORM_ID
+                } else {
+                    DCT32_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct8x32_nonzero_supported() {
+        let width = 32;
+        let height = 8;
+        let bw = 4;
+        let bh = 1;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.13 + y as f32 * 0.41).cos() * 6.8;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for x in 0..4 {
+            transform_map[x] = if x == 0 {
+                TRANSFORM_FIRST_BLOCK_FLAG | DCT8X32_TRANSFORM_ID
+            } else {
+                DCT8X32_TRANSFORM_ID
+            };
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct32x8_nonzero_supported() {
+        let width = 8;
+        let height = 32;
+        let bw = 1;
+        let bh = 4;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.41 + y as f32 * 0.13).sin() * 6.8;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..4 {
+            transform_map[y * bw] = if y == 0 {
+                TRANSFORM_FIRST_BLOCK_FLAG | DCT32X8_TRANSFORM_ID
+            } else {
+                DCT32X8_TRANSFORM_ID
+            };
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct16x32_nonzero_supported() {
+        let width = 32;
+        let height = 16;
+        let bw = 4;
+        let bh = 2;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.19 + y as f32 * 0.27).cos() * 7.5;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..2 {
+            for x in 0..4 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT16X32_TRANSFORM_ID
+                } else {
+                    DCT16X32_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct32x16_nonzero_supported() {
+        let width = 16;
+        let height = 32;
+        let bw = 2;
+        let bh = 4;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = (x as f32 * 0.27 + y as f32 * 0.19).sin() * 7.5;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..4 {
+            for x in 0..2 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT32X16_TRANSFORM_ID
+                } else {
+                    DCT32X16_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct64_nonzero_supported() {
+        let width = 64;
+        let height = 64;
+        let bw = 8;
+        let bh = 8;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = ((x as f32 * 0.07).sin() + (y as f32 * 0.11).cos()) * 5.5;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..8 {
+            for x in 0..8 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT64_TRANSFORM_ID
+                } else {
+                    DCT64_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct64x32_nonzero_supported() {
+        let width = 32;
+        let height = 64;
+        let bw = 4;
+        let bh = 8;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = ((x as f32 * 0.21).sin() + (y as f32 * 0.05).cos()) * 5.2;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..8 {
+            for x in 0..4 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT64X32_TRANSFORM_ID
+                } else {
+                    DCT64X32_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct32x64_nonzero_supported() {
+        let width = 64;
+        let height = 32;
+        let bw = 8;
+        let bh = 4;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = ((x as f32 * 0.05).sin() + (y as f32 * 0.21).cos()) * 5.2;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..4 {
+            for x in 0..8 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT32X64_TRANSFORM_ID
+                } else {
+                    DCT32X64_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct128_nonzero_supported() {
+        let width = 128;
+        let height = 128;
+        let bw = 16;
+        let bh = 16;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = ((x as f32 * 0.03).sin() + (y as f32 * 0.05).cos()) * 4.8;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..16 {
+            for x in 0..16 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT128_TRANSFORM_ID
+                } else {
+                    DCT128_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct128x64_nonzero_supported() {
+        let width = 64;
+        let height = 128;
+        let bw = 8;
+        let bh = 16;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = ((x as f32 * 0.07).sin() + (y as f32 * 0.03).cos()) * 4.8;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..16 {
+            for x in 0..8 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT128X64_TRANSFORM_ID
+                } else {
+                    DCT128X64_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct64x128_nonzero_supported() {
+        let width = 128;
+        let height = 64;
+        let bw = 16;
+        let bh = 8;
+
+        let mut x_chan = vec![0.0f32; width * height];
+        let mut y_chan = vec![0.0f32; width * height];
+        let mut b_minus_y_chan = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let v = ((x as f32 * 0.03).sin() + (y as f32 * 0.07).cos()) * 4.8;
+                x_chan[idx] = v * 0.9;
+                y_chan[idx] = v;
+                b_minus_y_chan[idx] = v * 0.1;
+            }
+        }
+
+        let ac_x = vec![0i32; bw * bh * 64];
+        let ac_y = vec![0i32; bw * bh * 64];
+        let ac_b = vec![0i32; bw * bh * 64];
+        let raw_quant_map = vec![1u8; bw * bh];
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..8 {
+            for x in 0..16 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT64X128_TRANSFORM_ID
+                } else {
+                    DCT64X128_TRANSFORM_ID
+                };
+            }
+        }
+
+        let (ac_x, ac_y, ac_b) = prepare_ac_for_transform_map(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &x_chan,
+            &y_chan,
+            &b_minus_y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            16384,
+            &raw_quant_map,
+            &transform_map,
+            0.8,
+            1.0,
+        )
+        .unwrap();
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct256_nonzero_supported() {
+        let bw = 32;
+        let bh = 32;
+
+        let mut ac_x = vec![0i32; bw * bh * 64];
+        let mut ac_y = vec![0i32; bw * bh * 64];
+        let mut ac_b = vec![0i32; bw * bh * 64];
+
+        for by in 0..bh {
+            for bx in 0..bw {
+                let base = (by * bw + bx) * 64;
+                ac_x[base + 1] = 1;
+                ac_y[base + 2] = -1;
+                ac_b[base + 3] = 1;
+            }
+        }
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..32 {
+            for x in 0..32 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT256_TRANSFORM_ID
+                } else {
+                    DCT256_TRANSFORM_ID
+                };
+            }
+        }
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct256x128_nonzero_supported() {
+        let bw = 16;
+        let bh = 32;
+
+        let mut ac_x = vec![0i32; bw * bh * 64];
+        let mut ac_y = vec![0i32; bw * bh * 64];
+        let mut ac_b = vec![0i32; bw * bh * 64];
+
+        for by in 0..bh {
+            for bx in 0..bw {
+                let base = (by * bw + bx) * 64;
+                ac_x[base + 1] = 1;
+                ac_y[base + 2] = -1;
+                ac_b[base + 3] = 1;
+            }
+        }
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..32 {
+            for x in 0..16 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT256X128_TRANSFORM_ID
+                } else {
+                    DCT256X128_TRANSFORM_ID
+                };
+            }
+        }
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
+    }
+
+    #[test]
+    fn test_tokenize_hf_region_dct128x256_nonzero_supported() {
+        let bw = 32;
+        let bh = 16;
+
+        let mut ac_x = vec![0i32; bw * bh * 64];
+        let mut ac_y = vec![0i32; bw * bh * 64];
+        let mut ac_b = vec![0i32; bw * bh * 64];
+
+        for by in 0..bh {
+            for bx in 0..bw {
+                let base = (by * bw + bx) * 64;
+                ac_x[base + 1] = 1;
+                ac_y[base + 2] = -1;
+                ac_b[base + 3] = 1;
+            }
+        }
+
+        let mut transform_map = build_default_transform_map(bw, bh);
+        for y in 0..16 {
+            for x in 0..32 {
+                let idx = y * bw + x;
+                transform_map[idx] = if x == 0 && y == 0 {
+                    TRANSFORM_FIRST_BLOCK_FLAG | DCT128X256_TRANSFORM_ID
+                } else {
+                    DCT128X256_TRANSFORM_ID
+                };
+            }
+        }
+
+        let tokens =
+            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None)
+                .unwrap();
+        assert!(tokens.iter().any(|t| t.value > 0));
     }
 
     #[test]
@@ -1049,11 +7104,7 @@ mod tests {
         );
         // All AC should be ~0
         for i in 1..64 {
-            assert!(
-                out[i].abs() < 0.01,
-                "AC[{i}] = {}, expected ~0",
-                out[i]
-            );
+            assert!(out[i].abs() < 0.01, "AC[{i}] = {}, expected ~0", out[i]);
         }
     }
 
@@ -1083,7 +7134,14 @@ mod tests {
         assert_eq!(codestream[0], 0xFF);
         assert_eq!(codestream[1], 0x0A);
         eprintln!("Codestream size: {} bytes", codestream.len());
-        eprintln!("Hex: {}", codestream.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+        eprintln!(
+            "Hex: {}",
+            codestream
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
 
         let container = encode_vardct_u8_rgb(&rgb, width, height, &config).unwrap();
         let path = "/tmp/test_vardct_8x8.jxl";
@@ -1100,9 +7158,8 @@ mod tests {
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
 
         // Decode with the jxl-rs test helper (includes NaN check)
-        let (num_frames, frames) = crate::api::tests::decode(
-            &cs, usize::MAX, true, false, None,
-        ).expect("jxl-rs decode should succeed");
+        let (num_frames, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
+            .expect("jxl-rs decode should succeed");
         assert_eq!(num_frames, 1, "should have 1 frame");
 
         // Check output pixels: f32 interleaved RGB, 3 channels
@@ -1138,10 +7195,26 @@ mod tests {
                 let qx = if x < 8 { 0 } else { 1 };
                 let qy = if y < 8 { 0 } else { 1 };
                 match (qx, qy) {
-                    (0, 0) => { rgb[i] = 255; rgb[i+1] = 0; rgb[i+2] = 0; }     // Red
-                    (1, 0) => { rgb[i] = 0; rgb[i+1] = 255; rgb[i+2] = 0; }     // Green
-                    (0, 1) => { rgb[i] = 0; rgb[i+1] = 0; rgb[i+2] = 255; }     // Blue
-                    _ => { rgb[i] = 255; rgb[i+1] = 255; rgb[i+2] = 0; }         // Yellow
+                    (0, 0) => {
+                        rgb[i] = 255;
+                        rgb[i + 1] = 0;
+                        rgb[i + 2] = 0;
+                    } // Red
+                    (1, 0) => {
+                        rgb[i] = 0;
+                        rgb[i + 1] = 255;
+                        rgb[i + 2] = 0;
+                    } // Green
+                    (0, 1) => {
+                        rgb[i] = 0;
+                        rgb[i + 1] = 0;
+                        rgb[i + 2] = 255;
+                    } // Blue
+                    _ => {
+                        rgb[i] = 255;
+                        rgb[i + 1] = 255;
+                        rgb[i + 2] = 0;
+                    } // Yellow
                 }
             }
         }
@@ -1149,14 +7222,18 @@ mod tests {
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
 
         // Decode with jxl-rs
-        let (_n, frames) = crate::api::tests::decode(
-            &cs, usize::MAX, true, false, None,
-        ).expect("decode should succeed");
+        let (_n, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
+            .expect("decode should succeed");
 
         let buf = &frames[0][0];
         eprintln!("16x16 quad-color test: decoded OK");
         // Check corners - should roughly match input colors (DC-only = block average)
-        for (qx, qy, label) in [(0,0,"TL-Red"), (1,0,"TR-Green"), (0,1,"BL-Blue"), (1,1,"BR-Yellow")] {
+        for (qx, qy, label) in [
+            (0, 0, "TL-Red"),
+            (1, 0, "TR-Green"),
+            (0, 1, "BL-Blue"),
+            (1, 1, "BR-Yellow"),
+        ] {
             let x = qx * 8 + 4;
             let y = qy * 8 + 4;
             let row = buf.row(y);
@@ -1169,7 +7246,10 @@ mod tests {
         // Also write to file for djxl verification
         let file_data = crate::encode::container::wrap_codestream(&cs).unwrap();
         std::fs::write("/tmp/test_vardct_16x16.jxl", &file_data).unwrap();
-        eprintln!("Written {} bytes to /tmp/test_vardct_16x16.jxl", file_data.len());
+        eprintln!(
+            "Written {} bytes to /tmp/test_vardct_16x16.jxl",
+            file_data.len()
+        );
     }
 
     #[test]
@@ -1181,9 +7261,9 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 let i = (y * width + x) * 3;
-                rgb[i] = (x * 255 / 7) as u8;     // R: gradient left-right
+                rgb[i] = (x * 255 / 7) as u8; // R: gradient left-right
                 rgb[i + 1] = (y * 255 / 7) as u8; // G: gradient top-bottom
-                rgb[i + 2] = 128;                   // B: constant
+                rgb[i + 2] = 128; // B: constant
             }
         }
         // Use low distance for AC detail
@@ -1196,9 +7276,8 @@ mod tests {
         std::fs::write("/tmp/test_vardct_gradient.jxl", &file_data).unwrap();
 
         // Decode with jxl-rs
-        let (_n, frames) = crate::api::tests::decode(
-            &cs, usize::MAX, true, false, None,
-        ).expect("decode should succeed");
+        let (_n, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
+            .expect("decode should succeed");
 
         let buf = &frames[0][0];
         eprintln!("Gradient test decoded OK");
@@ -1208,9 +7287,17 @@ mod tests {
                 let r = (row[x * 3].clamp(0.0, 1.0) * 255.0).round() as u8;
                 let g = (row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
                 let b = (row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
-                eprintln!("  pixel({},{}) input=({},{},{}) decoded=({},{},{})",
-                    x, y, rgb[(y*width+x)*3], rgb[(y*width+x)*3+1], rgb[(y*width+x)*3+2],
-                    r, g, b);
+                eprintln!(
+                    "  pixel({},{}) input=({},{},{}) decoded=({},{},{})",
+                    x,
+                    y,
+                    rgb[(y * width + x) * 3],
+                    rgb[(y * width + x) * 3 + 1],
+                    rgb[(y * width + x) * 3 + 2],
+                    r,
+                    g,
+                    b
+                );
             }
         }
     }
@@ -1226,19 +7313,27 @@ mod tests {
             for x in 0..width {
                 let i = (y * width + x) * 3;
                 if (x / 2 + y / 2) % 2 == 0 {
-                    rgb[i] = 200; rgb[i+1] = 50; rgb[i+2] = 100;
+                    rgb[i] = 200;
+                    rgb[i + 1] = 50;
+                    rgb[i + 2] = 100;
                 } else {
-                    rgb[i] = 50; rgb[i+1] = 200; rgb[i+2] = 150;
+                    rgb[i] = 50;
+                    rgb[i + 1] = 200;
+                    rgb[i + 2] = 150;
                 }
             }
         }
 
-        for (distance, label) in [(0.01, "near-lossless"), (0.5, "high"), (1.0, "default"), (3.0, "low")] {
+        for (distance, label) in [
+            (0.01, "near-lossless"),
+            (0.5, "high"),
+            (1.0, "default"),
+            (3.0, "low"),
+        ] {
             let config = VarDctConfig { distance };
             let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
-            let (_n, frames) = crate::api::tests::decode(
-                &cs, usize::MAX, true, false, None,
-            ).expect("decode should succeed");
+            let (_n, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
+                .expect("decode should succeed");
 
             let buf = &frames[0][0];
             // Compute max pixel error
@@ -1247,20 +7342,34 @@ mod tests {
                 let row = buf.row(y);
                 for x in 0..width {
                     let i = (y * width + x) * 3;
-                    let dr = ((row[x * 3].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i] as i32).unsigned_abs();
-                    let dg = ((row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i+1] as i32).unsigned_abs();
-                    let db = ((row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i+2] as i32).unsigned_abs();
+                    let dr = ((row[x * 3].clamp(0.0, 1.0) * 255.0).round() as i32 - rgb[i] as i32)
+                        .unsigned_abs();
+                    let dg = ((row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as i32
+                        - rgb[i + 1] as i32)
+                        .unsigned_abs();
+                    let db = ((row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as i32
+                        - rgb[i + 2] as i32)
+                        .unsigned_abs();
                     max_err = max_err.max(dr).max(dg).max(db);
                 }
             }
-            eprintln!("  d={:.2} ({:14}): {} bytes, max_err={}", distance, label, cs.len(), max_err);
+            eprintln!(
+                "  d={:.2} ({:14}): {} bytes, max_err={}",
+                distance,
+                label,
+                cs.len(),
+                max_err
+            );
 
             // Note: at near-lossless, error can still be significant because
             // our simple encoder doesn't yet optimize for quality (no adaptive
             // quant, no CfL optimization, etc.)
             // At d=0.01, expect max_err < 100 for now.
             if distance <= 0.1 {
-                assert!(max_err <= 100, "near-lossless should have reasonable error, got {max_err}");
+                assert!(
+                    max_err <= 100,
+                    "near-lossless should have reasonable error, got {max_err}"
+                );
             }
         }
     }
@@ -1282,23 +7391,21 @@ mod tests {
             }
         }
 
-        // Test multiple distances  
+        // Test multiple distances
         for distance in [1.0f32, 0.5] {
             let config = VarDctConfig { distance };
-        let cs = match encode_vardct_u8_rgb_codestream(&rgb, width, height, &config) {
-            Ok(cs) => cs,
-            Err(e) => panic!("Encoding failed: {e:?}"),
-        };
-        eprintln!("64x64 codestream: {} bytes", cs.len());
+            let cs = match encode_vardct_u8_rgb_codestream(&rgb, width, height, &config) {
+                Ok(cs) => cs,
+                Err(e) => panic!("Encoding failed: {e:?}"),
+            };
+            eprintln!("64x64 codestream: {} bytes", cs.len());
 
             // Write to file for visual inspection
             let file_data = crate::encode::container::wrap_codestream(&cs).unwrap();
             std::fs::write("/tmp/test_vardct_64x64.jxl", &file_data).unwrap();
 
             // Decode with jxl-rs
-            let result = crate::api::tests::decode(
-                &cs, usize::MAX, true, false, None,
-            );
+            let result = crate::api::tests::decode(&cs, usize::MAX, true, false, None);
             match result {
                 Ok((_n, frames)) => {
                     let buf = &frames[0][0];
@@ -1321,12 +7428,19 @@ mod tests {
         let rgb = vec![128u8; width * height * 3];
         let config = VarDctConfig::default();
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
-        let hex: String = cs.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+        let hex: String = cs
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         eprintln!("Actual codestream ({} bytes): {hex}", cs.len());
 
         let container = encode_vardct_u8_rgb(&rgb, width, height, &config).unwrap();
         std::fs::write("/tmp/test_vardct_8x8.jxl", &container).unwrap();
-        eprintln!("Written {} bytes to /tmp/test_vardct_8x8.jxl", container.len());
+        eprintln!(
+            "Written {} bytes to /tmp/test_vardct_8x8.jxl",
+            container.len()
+        );
     }
 
     #[test]
@@ -1342,12 +7456,18 @@ mod tests {
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
 
         // Print hex
-        let hex: String = cs.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+        let hex: String = cs
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         eprintln!("Codestream ({} bytes): {hex}", cs.len());
 
         // Pad for BitReader
         let mut padded = cs.clone();
-        for _ in 0..128 { padded.push(0); }
+        for _ in 0..128 {
+            padded.push(0);
+        }
 
         // Try parsing the full JxlHeader
         let mut br = BitReader::new(&padded);
@@ -1366,10 +7486,12 @@ mod tests {
         }
 
         // Try parsing frame header
-        use crate::headers::frame_header::FrameHeader;
         use crate::headers::encodings::UnconditionalCoder;
-        let fh_result: crate::error::Result<FrameHeader> =
-            FrameHeader::read_unconditional(&(), &mut br, &crate::headers::frame_header::FrameHeaderNonserialized {
+        use crate::headers::frame_header::FrameHeader;
+        let fh_result: crate::error::Result<FrameHeader> = FrameHeader::read_unconditional(
+            &(),
+            &mut br,
+            &crate::headers::frame_header::FrameHeaderNonserialized {
                 xyb_encoded: true,
                 num_extra_channels: 0,
                 extra_channel_info: vec![],
@@ -1377,7 +7499,8 @@ mod tests {
                 have_timecode: false,
                 img_width: 8,
                 img_height: 8,
-            });
+            },
+        );
         match fh_result {
             Ok(fh) => {
                 eprintln!("Frame header parsed OK at bit {}", br.total_bits_read());
@@ -1434,9 +7557,7 @@ mod tests {
         std::fs::write("/tmp/test_vardct_512x512.jxl", &container).unwrap();
 
         // Verify with jxl-rs decoder
-        let result = crate::api::tests::decode(
-            &cs, usize::MAX, true, false, None,
-        );
+        let result = crate::api::tests::decode(&cs, usize::MAX, true, false, None);
         match result {
             Ok((_n, frames)) => {
                 let buf = &frames[0][0];
@@ -1460,7 +7581,10 @@ mod tests {
                 let rl = (lrow[(width - 1) * 3].clamp(0.0, 1.0) * 255.0).round() as u8;
                 let gl = (lrow[(width - 1) * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
                 let bl = (lrow[(width - 1) * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
-                eprintln!("  pixel({},{height}): ({rl},{gl},{bl}) expected ~(255,255,128)", width-1);
+                eprintln!(
+                    "  pixel({},{height}): ({rl},{gl},{bl}) expected ~(255,255,128)",
+                    width - 1
+                );
                 eprintln!("  Multi-group 512x512 OK: {} bytes", cs.len());
             }
             Err(e) => {
@@ -1470,6 +7594,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // ~11s: large multi-group encode/decode, run with --ignored
     fn test_vardct_multigroup_large() {
         // Test images that cross HF and LF group boundaries
         for (width, height, label) in [
@@ -1495,9 +7620,7 @@ mod tests {
             let path = format!("/tmp/test_vardct_{width}x{height}.jxl");
             std::fs::write(&path, &container).unwrap();
 
-            let result = crate::api::tests::decode(
-                &cs, usize::MAX, true, false, None,
-            );
+            let result = crate::api::tests::decode(&cs, usize::MAX, true, false, None);
             match result {
                 Ok((_n, frames)) => {
                     let buf = &frames[0][0];
@@ -1552,19 +7675,25 @@ mod tests {
         eprintln!("  size: {}x{}", fh.size.xsize(), fh.size.ysize());
 
         // 2. Byte-align before frame header
-        br.jump_to_byte_boundary().expect("byte align before frame header failed");
+        br.jump_to_byte_boundary()
+            .expect("byte align before frame header failed");
         eprintln!("After byte-align: bit {}", br.total_bits_read());
 
         // 3. Frame header
-        let frame_hdr = FrameHeader::read_unconditional(&(), &mut br, &FrameHeaderNonserialized {
-            xyb_encoded: true,
-            num_extra_channels: 0,
-            extra_channel_info: vec![],
-            have_animation: false,
-            have_timecode: false,
-            img_width: width as u32,
-            img_height: height as u32,
-        }).expect("FrameHeader parse failed");
+        let frame_hdr = FrameHeader::read_unconditional(
+            &(),
+            &mut br,
+            &FrameHeaderNonserialized {
+                xyb_encoded: true,
+                num_extra_channels: 0,
+                extra_channel_info: vec![],
+                have_animation: false,
+                have_timecode: false,
+                img_width: width as u32,
+                img_height: height as u32,
+            },
+        )
+        .expect("FrameHeader parse failed");
         eprintln!("FrameHeader OK at bit {}", br.total_bits_read());
         eprintln!("  encoding: {:?}", frame_hdr.encoding);
         eprintln!("  num_groups: {}", frame_hdr.num_groups());
@@ -1573,9 +7702,13 @@ mod tests {
         // 4. TOC
         let num_toc_entries = frame_hdr.num_toc_entries() as u32;
         eprintln!("  toc_entries: {}", num_toc_entries);
-        let toc = Toc::read_unconditional(&(), &mut br, &TocNonserialized {
-            num_entries: num_toc_entries,
-        });
+        let toc = Toc::read_unconditional(
+            &(),
+            &mut br,
+            &TocNonserialized {
+                num_entries: num_toc_entries,
+            },
+        );
         match &toc {
             Ok(toc) => {
                 eprintln!("TOC OK at bit {}: {:?}", br.total_bits_read(), toc.entries);
@@ -1587,9 +7720,7 @@ mod tests {
         }
 
         // 5. Full decode
-        let result = crate::api::tests::decode(
-            &cs, usize::MAX, true, false, None,
-        );
+        let result = crate::api::tests::decode(&cs, usize::MAX, true, false, None);
         match result {
             Ok((_n, frames)) => {
                 let buf = &frames[0][0];

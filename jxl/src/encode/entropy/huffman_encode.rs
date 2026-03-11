@@ -240,7 +240,11 @@ fn cap_code_lengths(lengths: &mut [u8], max_bits: usize) {
         if kraft_sum > target {
             // Too much space used -- make shortest code longer to reduce Kraft sum
             // Pick the symbol with shortest code (largest contribution)
-            if let Some(item) = nz.iter_mut().rev().find(|item| (item.1 as usize) < max_bits) {
+            if let Some(item) = nz
+                .iter_mut()
+                .rev()
+                .find(|item| (item.1 as usize) < max_bits)
+            {
                 item.1 += 1;
             } else {
                 break;
@@ -677,7 +681,7 @@ pub fn write_huffman_histograms(
 
     // Context map.
     if num_contexts > 1 {
-        super::context_map::write_simple_context_map(writer, context_map)?;
+        super::context_map::write_context_map(writer, context_map)?;
     }
 
     // use_prefix_code = true (Huffman).
@@ -952,8 +956,10 @@ mod tests {
                     println!("  al_size={al_size} nonzero={nonzero}: OK");
                 }
                 Err(e) => {
-                    println!("  al_size={al_size} nonzero={nonzero} max_len={}: FAILED: {e:?}",
-                        code.code_lengths.iter().max().unwrap_or(&0));
+                    println!(
+                        "  al_size={al_size} nonzero={nonzero} max_len={}: FAILED: {e:?}",
+                        code.code_lengths.iter().max().unwrap_or(&0)
+                    );
                     panic!("Decode failed at al_size={al_size}");
                 }
             }

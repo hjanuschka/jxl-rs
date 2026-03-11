@@ -10,7 +10,7 @@ pub mod huffman;
 pub mod huffman_encode;
 pub mod hybrid_uint;
 
-pub use context_map::{write_simple_context_map, write_simple_zero_context_map};
+pub use context_map::{write_context_map, write_simple_context_map, write_simple_zero_context_map};
 pub use histograms::{
     write_fixed_symbol_huffman_histograms, write_fixed_symbol_huffman_histograms_with_configs,
     write_single_symbol_huffman_histograms,

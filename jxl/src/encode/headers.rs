@@ -531,8 +531,7 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         let gh = (height - oy).min(256);
 
         let offset = 0i32;
-        let residuals =
-            collect_group_residuals_west(rgb, width_usize, (ox, oy), (gw, gh), offset);
+        let residuals = collect_group_residuals_west(rgb, width_usize, (ox, oy), (gw, gh), offset);
 
         let mut group_writer = BitWriter::new();
         write_hf_group_section_huffman(
@@ -660,13 +659,7 @@ pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) ->
 
         let residuals = collect_gray_residuals_west(gray, width_usize, (ox, oy), (gw, gh));
         let mut group_writer = BitWriter::new();
-        write_hf_group_section_huffman(
-            &mut group_writer,
-            0,
-            predictor,
-            &residuals,
-            uint_config,
-        )?;
+        write_hf_group_section_huffman(&mut group_writer, 0, predictor, &residuals, uint_config)?;
         hf_group_sections.push(group_writer.finish());
     }
 
@@ -1116,9 +1109,7 @@ mod tests {
             let r = (row[x * 3] * 255.0 + 0.5) as u8;
             let g = (row[x * 3 + 1] * 255.0 + 0.5) as u8;
             let b = (row[x * 3 + 2] * 255.0 + 0.5) as u8;
-            eprintln!(
-                "constant pixel ({x},0): decoded ({r},{g},{b}), expected (50,50,50)"
-            );
+            eprintln!("constant pixel ({x},0): decoded ({r},{g},{b}), expected (50,50,50)");
             assert_eq!(r, 50, "R mismatch at x={x}");
             assert_eq!(g, 50, "G mismatch at x={x}");
             assert_eq!(b, 50, "B mismatch at x={x}");
@@ -1241,8 +1232,7 @@ mod tests {
             (width as usize) * (height as usize) * 3,
             "wrong buffer size"
         );
-        let cs =
-            encode_modular_u8_rgb_image_codestream((width, height), rgb).unwrap();
+        let cs = encode_modular_u8_rgb_image_codestream((width, height), rgb).unwrap();
         let (_decoded, frames) =
             crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
         let img = &frames[0][0];
@@ -1273,7 +1263,9 @@ mod tests {
         fn simple_rng(seed: u64) -> impl Iterator<Item = u8> {
             let mut state = seed;
             std::iter::from_fn(move || {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 Some((state >> 33) as u8)
             })
         }
@@ -1340,8 +1332,7 @@ mod tests {
             (width as usize) * (height as usize),
             "wrong buffer size"
         );
-        let cs =
-            encode_modular_u8_gray_image_codestream((width, height), gray).unwrap();
+        let cs = encode_modular_u8_gray_image_codestream((width, height), gray).unwrap();
         let (_decoded, frames) =
             crate::api::tests::decode(&cs, usize::MAX, false, false, None).unwrap();
         let img = &frames[0][0];
@@ -1368,7 +1359,9 @@ mod tests {
         fn simple_rng(seed: u64) -> impl Iterator<Item = u8> {
             let mut state = seed;
             std::iter::from_fn(move || {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 Some((state >> 33) as u8)
             })
         }
