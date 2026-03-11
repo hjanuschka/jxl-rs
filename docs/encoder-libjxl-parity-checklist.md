@@ -64,14 +64,20 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 - `[x]` Linear forward-solver parity paths for selected non-8x8 families:
   square (`DCT16`, gated `DCT32`) and rectangular (`DCT16X8`, `DCT8X16`,
   `DCT32X8`, `DCT8X32`, gated `DCT32X16`/`DCT16X32`); larger families scalar fallback.
-- `[x]` **Entropy-based DCT16x16 merging**: for each aligned 2x2 group of 8x8
+- `[x]` **Quality-first DCT16x16 merging**: for each aligned 2x2 group of 8x8
   blocks, computes forward DCT16 using the same linear solver as encoding,
   quantizes with actual dequant weights, and compares `sqrt(|q|)` entropy
-  against sum of 4x DCT8 entropies. Entropy multiplier calibrated at 1.3x
-  from Kodak test set. Candidate selection picks best by actual encoded byte size.
+  against sum of 4x DCT8 entropies. Conservative entropy multiplier (2.5x)
+  ensures merges only happen on genuinely smooth regions -- PSNR parity with
+  libjxl is prioritized over file size.
 - `[x]` **Hierarchical DCT32x32 merging**: after DCT16 pass, tries merging
-  aligned 2x2 groups of DCT16 blocks into DCT32. Uses entropy_mul_32 = 1.45x.
+  aligned 2x2 groups of DCT16 blocks into DCT32. Uses entropy_mul_32 = 3.5x.
 - `[x]` `estimate_transform_entropy()` helper factored out for reuse.
+- `[x]` **Loss term infrastructure** (dead code, for future activation):
+  `estimate_transform_entropy_full()` with full libjxl `EstimateEntropy` port,
+  `inverse_transform_error()` for DCT-to-pixel error, `compute_masking_1x1()`
+  for perceptual masking. Currently inactive due to forward transform
+  normalization differences making quantization errors near-zero.
 - `[x]` Conservative small-special candidate generation (`DCT4X8`/`DCT8X4`,
   `IDENTITY`/`DCT2X2`/`DCT4X4`, mixed special maps) and sparse AFV candidates
   for high-distance modes, all gated by exact-byte winner selection.
@@ -109,29 +115,33 @@ Tested against jpegxl.info test images + Kodak dataset.
 
 | Image | Dimensions | jxl-rs bytes | libjxl bytes | Size % | jxl-rs dB | libjxl dB | dB gap |
 |-------|-----------|-------------|-------------|--------|-----------|-----------|--------|
-| Unsplash Photo | 896x1080 | 369,409 | 395,134 | **-7%** | 33.1 | 33.4 | -0.3 |
-| Dice | 800x600 | 26,898 | 22,045 | +22% | 43.6 | 44.8 | -1.2 |
-| WebKit Logo P3 | 1000x1000 | 23,089 | 6,546 | +253% | 43.8 | 44.4 | -0.6 |
+| Unsplash Photo | 896x1080 | 369,430 | 395,134 | **-7%** | 33.1 | 33.4 | -0.3 |
+| Dice | 800x600 | 27,522 | 22,045 | +25% | 45.2 | 44.8 | **+0.4** |
+| WebKit Logo P3 | 1000x1000 | 23,142 | 6,546 | +254% | 43.8 | 44.4 | -0.6 |
 | Kodak #01 | 768x512 | 121,715 | 125,196 | **-3%** | 37.4 | 38.1 | -0.8 |
-| Kodak #08 | 768x512 | 134,369 | 135,977 | **-1%** | 36.5 | 37.4 | -0.9 |
+| Kodak #08 | 768x512 | 134,449 | 135,977 | **-1%** | 36.6 | 37.4 | -0.7 |
 | Kodak #13 | 768x512 | 141,881 | 155,927 | **-9%** | 35.0 | 36.2 | -1.2 |
-| Kodak #23 | 768x512 | 55,399 | 49,672 | +12% | 38.9 | 38.1 | **+0.8** |
+| Kodak #23 | 768x512 | 56,551 | 49,672 | +14% | 39.0 | 38.1 | **+0.8** |
 
 **Summary**: 4 out of 7 images are **smaller** than libjxl at Squirrel speed.
-PSNR gap is -0.3 to -1.2 dB on most images, meaning libjxl distributes bits
+2 out of 7 images have **better PSNR** than libjxl (Dice +0.4 dB, Kodak #23 +0.8 dB).
+PSNR gap is -0.3 to -1.2 dB on remaining images, meaning libjxl distributes bits
 more efficiently via full AC strategy selection and block context maps.
 WebKit logo is a pathological case (mostly white/transparent).
 
 ### Key remaining quality gaps
 
 1. **PSNR per byte**: libjxl gets ~0.5-1 dB better quality at similar file sizes
-   due to richer AC strategy selection (DCT16x8/8x16 rectangular merges,
-   `FindBest8x8Transform` with 10 variants per block) and custom block
-   context maps.
+   due to richer AC strategy selection (`FindBest8x8Transform` with 10 variants
+   per block, DCT16x8/8x16 rectangular merges) and custom block context maps.
 2. **WebKit logo**: 3.5x larger -- mostly-white images with sharp edges need
    modular encoding or better block strategy for flat regions.
 3. **Block context map**: libjxl uses `FindBestBlockEntropyModel` to create
    custom entropy contexts per block type, improving compression by 5-10%.
+4. **Perceptual loss term**: libjxl's `EstimateEntropy` loss term (inverse-transform
+   quantization error weighted by masking field, L8 norm) prevents quality-destroying
+   merges on sharp edges. Infrastructure is in place but inactive due to our
+   forward transform normalization producing near-zero quantization residuals.
 
 ### Sampler page
 
