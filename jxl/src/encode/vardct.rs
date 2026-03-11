@@ -306,10 +306,11 @@ pub fn encode_vardct_u8_rgb_codestream(
     let mut b_chan = vec![0.0f32; npixels];
     srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
 
-    // NOTE: Inverse Gaborish is NOT applied here because without adaptive
-    // quantization feedback (butteraugli), the sharpened coefficients get
-    // heavily quantized and produce worse results. The decoder-side forward
-    // Gaborish (gab=true) still provides free quality improvement.
+    // NOTE: Inverse Gaborish is NOT applied. While libjxl uses it (enc_gaborish.cc),
+    // it requires butteraugli-based adaptive quantization that accounts for the
+    // decoder-side smoothing when allocating bits. Without that, the sharpened
+    // coefficients create excessive high-frequency energy (+60% file size).
+    // The decoder-side forward Gaborish (gab=true) still provides free quality.
 
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
@@ -3609,11 +3610,15 @@ fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32) 
     // 22. save_before_ct: cond false (is_last=true) => NOT WRITTEN
     // 23. name: String, size = 0, u2S(0, Bits(4), Bits(5)+16, Bits(10)+48)
     writer.write(2, 0)?; // selector 00 = Val(0)
-    // 24. restoration_filter: all_default=false, gab=true, epf_iters=0
+    // 24. restoration_filter: all_default=false, gab=true, epf_iters=2
     writer.write(1, 0)?; // all_default = false
     writer.write(1, 1)?; // gab = true
     writer.write(1, 0)?; // gab_custom = false (default weights)
-    writer.write(2, 0)?; // epf_iters = 0, Bits(2)
+    writer.write(2, 2)?; // epf_iters = 2, Bits(2)
+    // EPF fields (epf_iters > 0, !is_modular):
+    writer.write(1, 0)?; // epf_sharp_custom = false
+    writer.write(1, 0)?; // epf_weight_custom = false
+    writer.write(1, 0)?; // epf_sigma_custom = false
     // 25. extensions = 0 (u64: selector 00)
     writer.write(2, 0)?;
     Ok(())
@@ -3722,7 +3727,11 @@ fn encode_single_group_section(
         hf_meta[ch2_off + i] = transform_id as i32;
         hf_meta[ch2_off + count + i] = raw_quant.saturating_sub(1) as i32;
     }
-    // ch3 (epf): all 0 (epf_iters=0, no EPF applied)
+    // ch3 (epf): sharpness=4 for all blocks (default, epf_iters=2)
+    let ch3_off = ch2_off + 2 * count;
+    for i in 0..count {
+        hf_meta[ch3_off + i] = 4; // EPF sharpness value 4 (libjxl default)
+    }
 
     // The 4 channels have different sizes and are encoded as a modular subbitstream.
     encode_hf_metadata_modular(&mut w, cr_w, cr_h, count, bw, bh, &hf_meta)?;
@@ -3887,7 +3896,11 @@ fn encode_lf_group_section(
         hf_meta_data[ch2_off + i] = transform_id as i32;
         hf_meta_data[ch2_off + count + i] = raw_quant.saturating_sub(1) as i32;
     }
-    // EPF sharpness = 0 (epf_iters=0, no EPF applied)
+    // EPF sharpness = 4 (default) for all blocks
+    let ch3_off = ch2_off + 2 * count;
+    for i in 0..count {
+        hf_meta_data[ch3_off + i] = 4;
+    }
     encode_hf_metadata_modular(&mut w, cr_w, cr_h, count, gw, gh, &hf_meta_data)?;
 
     w.byte_align_zero_pad()?;
