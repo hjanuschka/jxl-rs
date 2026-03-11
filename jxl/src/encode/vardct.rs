@@ -216,21 +216,21 @@ fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: 
     let normalize = 1.0 / sum;
     let nm = mul * normalize;
 
-    // WeightsSymmetric5 layout: [center, ring1_cardinal, ring1_diagonal,
-    //                            ring2_cardinal, ring2_diagonal, ring2_corner]
-    // In libjxl: {normalize, nm*K[0], nm*K[2], nm*K[1], nm*K[4], nm*K[3]}
-    // The 5x5 symmetric kernel:
-    //   K[3]  K[4]  K[1]  K[4]  K[3]
-    //   K[4]  K[2]  K[0]  K[2]  K[4]
-    //   K[1]  K[0]  1.0   K[0]  K[1]
-    //   K[4]  K[2]  K[0]  K[2]  K[4]
-    //   K[3]  K[4]  K[1]  K[4]  K[3]
+    // WeightsSymmetric5 layout from libjxl convolve.h:
+    //   Lower-right quadrant: c r R    Full kernel:  D L R L D
+    //                         r d L                  L d r d L
+    //                         R L D                  R r c r R
+    //                                                L d r d L
+    //                                                D L R L D
+    // Fields: c=center, r=adjacent(4), d=diagonal(4), R=far_cardinal(4),
+    //         L=knight_move(8), D=far_corner(4)
+    // In libjxl: {c=normalize, r=nm*K[0], R=nm*K[2], d=nm*K[1], D=nm*K[4], L=nm*K[3]}
     let w_center = normalize;
-    let w_card1 = nm * K[0]; // distance 1, cardinal (up/down/left/right)
-    let w_diag1 = nm * K[2]; // distance 1, diagonal
-    let w_card2 = nm * K[1]; // distance 2, cardinal
-    let w_corner = nm * K[3]; // distance 2, corner (2,2)
-    let w_diag2 = nm * K[4]; // distance 2, knight-move (1,2)/(2,1)
+    let w_adj = nm * K[0]; // r: 4 adjacent (up/down/left/right)
+    let w_diag = nm * K[1]; // d: 4 diagonal (1,1)
+    let w_far_card = nm * K[2]; // R: 4 far cardinal (2,0)
+    let w_knight = nm * K[3]; // L: 8 knight-move (1,2)/(2,1)
+    let w_far_diag = nm * K[4]; // D: 4 far diagonal/corner (2,2)
 
     for chan in channels.iter_mut() {
         let input = chan.to_vec();
@@ -245,19 +245,19 @@ fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: 
             for x in 0..width {
                 let ix = x as isize;
                 let mut v = get(ix, iy) * w_center;
-                // Ring 1: cardinal
+                // Adjacent (r): 4 positions at distance 1 cardinal
                 v += (get(ix - 1, iy) + get(ix + 1, iy) + get(ix, iy - 1) + get(ix, iy + 1))
-                    * w_card1;
-                // Ring 1: diagonal
+                    * w_adj;
+                // Diagonal (d): 4 positions at (1,1)
                 v += (get(ix - 1, iy - 1)
                     + get(ix + 1, iy - 1)
                     + get(ix - 1, iy + 1)
                     + get(ix + 1, iy + 1))
-                    * w_diag1;
-                // Ring 2: cardinal
+                    * w_diag;
+                // Far cardinal (R): 4 positions at distance 2 cardinal
                 v += (get(ix - 2, iy) + get(ix + 2, iy) + get(ix, iy - 2) + get(ix, iy + 2))
-                    * w_card2;
-                // Ring 2: diagonal/knight
+                    * w_far_card;
+                // Knight-move (L): 8 positions at (1,2)/(2,1)
                 v += (get(ix - 1, iy - 2)
                     + get(ix + 1, iy - 2)
                     + get(ix - 1, iy + 2)
@@ -266,13 +266,13 @@ fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: 
                     + get(ix + 2, iy - 1)
                     + get(ix - 2, iy + 1)
                     + get(ix + 2, iy + 1))
-                    * w_diag2;
-                // Ring 2: corners
+                    * w_knight;
+                // Far diagonal/corner (D): 4 positions at (2,2)
                 v += (get(ix - 2, iy - 2)
                     + get(ix + 2, iy - 2)
                     + get(ix - 2, iy + 2)
                     + get(ix + 2, iy + 2))
-                    * w_corner;
+                    * w_far_diag;
                 chan[y * width + x] = v;
             }
         }
@@ -306,8 +306,10 @@ pub fn encode_vardct_u8_rgb_codestream(
     let mut b_chan = vec![0.0f32; npixels];
     srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
 
-    // TODO: Apply inverse Gaborish before DCT when gab=true in frame header.
-    // Currently disabled; needs quantization recalibration to work well with Gaborish.
+    // NOTE: Inverse Gaborish is NOT applied here because without adaptive
+    // quantization feedback (butteraugli), the sharpened coefficients get
+    // heavily quantized and produce worse results. The decoder-side forward
+    // Gaborish (gab=true) still provides free quality improvement.
 
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
@@ -2846,6 +2848,8 @@ fn encode_hf_metadata_modular(
 
     // Encode as a regular modular section with a single zero-predictor tree.
     // The residual stream is channel-concatenated in decode order.
+    // For HF metadata, data contains mixed-size channels (ytox, ytob, transform, epf),
+    // so per-channel prediction isn't straightforward. Use zero predictor.
     let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
     crate::encode::modular_encode::write_modular_section_huffman(
         w,
