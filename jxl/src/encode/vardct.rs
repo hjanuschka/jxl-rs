@@ -306,11 +306,10 @@ pub fn encode_vardct_u8_rgb_codestream(
     let mut b_chan = vec![0.0f32; npixels];
     srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
 
-    // NOTE: Inverse Gaborish is NOT applied. While libjxl uses it (enc_gaborish.cc),
-    // it requires butteraugli-based adaptive quantization that accounts for the
-    // decoder-side smoothing when allocating bits. Without that, the sharpened
-    // coefficients create excessive high-frequency energy (+60% file size).
-    // The decoder-side forward Gaborish (gab=true) still provides free quality.
+    // NOTE: Inverse Gaborish still deferred. Even with the full libjxl AQ
+    // pipeline, inv-gab adds +16% bytes and -0.15 dB because our single-pass
+    // AQ doesn't account for the decoder-side smoothing when allocating bits.
+    // libjxl's iterative FindBestQuantization feedback loop handles this.
 
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
