@@ -160,16 +160,33 @@ fn distance_to_quant_params(distance: f32) -> (u32, u32) {
 ///   global_scale = kGlobalScaleDenom * quant_ac / kQuantFieldTarget
 ///   quant_lf = round(quant_dc * inv_global_scale + 0.5)
 ///   base_raw_quant = ClampVal(quant_ac * inv_global_scale + 0.5)
+/// Compute global_scale, quant_lf, and base_raw_quant from distance.
+/// Uses quant_ac = 0.79/d for the base raw_quant calculation.
 fn distance_to_full_quant_params(distance: f32) -> (u32, u32, u8) {
-    const K_AC_QUANT_FAST: f32 = 0.79;
+    let quant_ac = 0.79f32 / distance;
+    let (global_scale, quant_lf, _) = compute_global_scale_and_quant(distance, quant_ac);
+    let inv_global_scale = 65536.0 / global_scale as f32;
+    let base_raw_quant = ((quant_ac * inv_global_scale + 0.5) as u8).clamp(1, 255);
+    (global_scale, quant_lf, base_raw_quant)
+}
+
+/// Core global_scale + quant_lf computation, matching libjxl's
+/// Quantizer::ComputeGlobalScaleAndQuant exactly.
+/// `quant_median` and `quant_median_absd` are the median and median absolute
+/// deviation of the quant field.
+fn compute_global_scale_and_quant(distance: f32, quant_median: f32) -> (u32, u32, u8) {
+    compute_global_scale_and_quant_full(distance, quant_median, 0.0)
+}
+
+fn compute_global_scale_and_quant_full(
+    distance: f32, quant_median: f32, quant_median_absd: f32,
+) -> (u32, u32, u8) {
     const K_DC_QUANT: f32 = 1.095_924;
     const K_DC_QUANT_POW: f32 = 0.83;
     const K_DC_MUL: f32 = 0.3;
     const K_GLOBAL_SCALE_DENOM: f32 = 65536.0;
     const K_QUANT_FIELD_TARGET: f32 = 5.0;
     const K_GLOBAL_SCALE_NUMERATOR: f32 = 4096.0;
-
-    let quant_ac = K_AC_QUANT_FAST / distance;
 
     // DC quant with non-linearity for low distances.
     let dc_target_raw = distance;
@@ -178,8 +195,10 @@ fn distance_to_full_quant_params(distance: f32) -> (u32, u32, u8) {
     );
     let quant_dc = (K_DC_QUANT / dc_target).min(50.0);
 
-    // global_scale = kGlobalScaleDenom * quant_ac / kQuantFieldTarget
-    let mut global_scale = (K_GLOBAL_SCALE_DENOM * quant_ac / K_QUANT_FIELD_TARGET).round() as i32;
+    // libjxl: scale = kGlobalScaleDenom * (quant_median - quant_median_absd) / kQuantFieldTarget
+    // Subtracting absd gives higher resolution on highly varying quant fields.
+    let mut global_scale =
+        (K_GLOBAL_SCALE_DENOM * (quant_median - quant_median_absd) / K_QUANT_FIELD_TARGET) as i32;
     // Clamp so quant_dc won't be too small.
     let scaled_quant_dc = (quant_dc * K_GLOBAL_SCALE_NUMERATOR * 1.6) as i32;
     if global_scale > scaled_quant_dc {
@@ -189,7 +208,7 @@ fn distance_to_full_quant_params(distance: f32) -> (u32, u32, u8) {
 
     let inv_global_scale = K_GLOBAL_SCALE_DENOM / global_scale as f32;
     let quant_lf = ((quant_dc * inv_global_scale + 0.5).min(65536.0) as u32).max(1);
-    let base_raw_quant = ((quant_ac * inv_global_scale + 0.5) as u8).clamp(1, 255);
+    let base_raw_quant = ((quant_median * inv_global_scale + 0.5) as u8).clamp(1, 255);
 
     (global_scale, quant_lf, base_raw_quant)
 }
@@ -306,28 +325,45 @@ pub fn encode_vardct_u8_rgb_codestream(
     let mut b_chan = vec![0.0f32; npixels];
     srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
 
-    // NOTE: Inverse Gaborish still deferred. Even with the full libjxl AQ
-    // pipeline, inv-gab adds +16% bytes and -0.15 dB because our single-pass
-    // AQ doesn't account for the decoder-side smoothing when allocating bits.
-    // libjxl's iterative FindBestQuantization feedback loop handles this.
-
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
     let num_blocks = bw * bh;
 
-    // CfL input for B channel in HF coding: in_b = b - y.
+    // --- libjxl encoder flow (enc_heuristics.cc) ---
+    // 1. Compute AQ map on ORIGINAL opsin (before inverse gaborish).
+    //    global_scale is derived from the quant field median (libjxl style).
+    let quant_ac = 0.79f32 / config.distance;
+    let (adaptive_map, global_scale, quant_lf) = build_adaptive_raw_quant_map_full(
+        &x_chan, &y_chan, &b_chan,
+        width, height, bw, bh, config.distance, quant_ac,
+    );
+    let (_, _, base_raw_quant) = distance_to_full_quant_params(config.distance);
+    let raw_quant_map_candidates = vec![
+        vec![base_raw_quant; bw * bh], // uniform candidate
+        adaptive_map,                   // libjxl-style adaptive candidate
+    ];
+
+    // 2. Apply inverse gaborish to opsin (libjxl: GaborishInverse after AQ).
+    //    Pre-sharpens so decoder-side gaborish smoothing recovers original.
+    if config.distance >= 0.3 {
+        apply_inverse_gaborish(
+            &mut [&mut x_chan, &mut y_chan, &mut b_chan],
+            width,
+            height,
+        );
+    }
+
+    // 3. CfL input for B channel in HF coding: in_b = b - y
+    //    (computed on gaborished opsin, matching libjxl)
     let b_minus_y_chan: Vec<f32> = b_chan.iter().zip(&y_chan).map(|(&b, &y)| b - y).collect();
 
-    // Forward DCT per channel
+    // 4. Forward DCT on gaborished opsin
     let mut dct_x = vec![0.0f32; num_blocks * 64];
     let mut dct_y = vec![0.0f32; num_blocks * 64];
     let mut dct_b = vec![0.0f32; num_blocks * 64];
     forward_dct_channel(&x_chan, width, height, bw, bh, &mut dct_x);
     forward_dct_channel(&y_chan, width, height, bw, bh, &mut dct_y);
     forward_dct_channel(&b_chan, width, height, bw, bh, &mut dct_b);
-
-    // Quantize
-    let (global_scale, quant_lf, base_raw_quant) = distance_to_full_quant_params(config.distance);
 
     // INV_LF_QUANT from the spec/decoder: [4096.0, 512.0, 256.0] for channels [X, Y, B]
     let inv_lf_quant = [4096.0f32, 512.0, 256.0];
@@ -338,21 +374,6 @@ pub fn encode_vardct_u8_rgb_codestream(
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
     let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0); // = 0.8
     let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0); // = 1.0
-
-    // CfL: with default color correlation, y_to_x_lf=0, y_to_b_lf=1.0
-    // For encoding: in_y = dc_y, in_x = dc_x, in_b = dc_b - dc_y
-    // The channels in dct arrays are in XYB order.
-
-    // Adaptive quantization: libjxl-ported pipeline using all 3 XYB channels.
-    let quant_ac = 0.79f32 / config.distance;
-    let adaptive_map = build_adaptive_raw_quant_map_full(
-        &x_chan, &y_chan, &b_chan,
-        width, height, bw, bh, config.distance, quant_ac,
-    );
-    let raw_quant_map_candidates = vec![
-        vec![base_raw_quant; bw * bh], // uniform candidate
-        adaptive_map,                   // libjxl-style adaptive candidate
-    ];
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
@@ -958,18 +979,17 @@ fn apply_per_block_modulations(
 }
 
 /// Build per-block adaptive quant map using libjxl's full pipeline.
+/// Returns (raw_quant_map, global_scale, quant_lf).
 fn build_adaptive_raw_quant_map_full(
     xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
     img_w: usize, img_h: usize,
     bw: usize, bh: usize, distance: f32,
     quant_ac: f32,
-) -> Vec<u8> {
+) -> (Vec<u8>, u32, u32) {
     let num_blocks = bw * bh;
     if distance < 1.0 || num_blocks < 64 {
-        // At very low distance, use uniform quant
-        let base = (quant_ac * (65536.0 / (distance_to_full_quant_params(distance).0 as f32)) + 0.5)
-            .clamp(1.0, 255.0) as u8;
-        return vec![base; num_blocks];
+        let (gs, qlf, base) = distance_to_full_quant_params(distance);
+        return (vec![base; num_blocks], gs, qlf);
     }
 
     // Step 1: Compute initial aq_map from Y-channel Laplacian masking
@@ -979,26 +999,30 @@ fn build_adaptive_raw_quant_map_full(
     let scale = quant_ac;
     apply_per_block_modulations(&mut aq_map, xyb_x, xyb_y, xyb_b, img_w, img_h, bw, bh, distance, scale);
 
-    // Step 3: Convert float aq_map to raw_quant (integer)
-    // aq_map values are already in quant_ac units. We need to convert to
-    // raw_quant = aq_map * inv_global_scale.
-    let (global_scale, _, _) = distance_to_full_quant_params(distance);
-    let inv_global_scale = 65536.0 / global_scale as f32;
+    // Step 3: Convert float aq_map to raw_quant (integer).
+    // libjxl computes global_scale from the median of the quant field via
+    // ComputeGlobalScaleAndQuant. We do the same: find the median of our
+    // aq_map and use it to set global_scale, then convert all values.
+    // Compute median and median absolute deviation, matching libjxl's
+    // SetQuantField -> ComputeGlobalScaleAndQuant.
+    let mut sorted_aq = aq_map.clone();
+    sorted_aq.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let quant_median = sorted_aq[sorted_aq.len() / 2];
+    let mut deviations: Vec<f32> = aq_map.iter().map(|&v| (v - quant_median).abs()).collect();
+    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let quant_median_absd = deviations[deviations.len() / 2];
 
-    // Scale correction: libjxl's iterative FindBestQuantization feedback loop
-    // typically increases quant values by ~2x from the initial aq_map, as it
-    // detects blocks where quality is below the butteraugli target and raises
-    // their raw_quant. Without that loop, we approximate by scaling up.
-    // This factor was calibrated to match libjxl's typical raw_quant range.
-    let correction = 1.35f32;
+    let (global_scale, quant_lf, _) =
+        compute_global_scale_and_quant_full(distance, quant_median, quant_median_absd);
+    let inv_global_scale = 65536.0 / global_scale as f32;
 
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
     for &v in &aq_map {
-        let rq = (v * correction * inv_global_scale + 0.5).clamp(1.0, 255.0) as u8;
+        let rq = (v * inv_global_scale + 0.5).clamp(1.0, 255.0) as u8;
         raw_quant_map.push(rq);
     }
 
-    raw_quant_map
+    (raw_quant_map, global_scale, quant_lf)
 }
 
 
@@ -4855,7 +4879,7 @@ mod tests {
         }
 
         let quant_ac_low = 0.79 / 0.8;
-        let low_dist_map =
+        let (low_dist_map, _, _) =
             build_adaptive_raw_quant_map_full(&xyb_x, &xyb_y, &xyb_b, img_w, img_h, bw, bh, 0.8, quant_ac_low);
         assert!(
             low_dist_map.iter().all(|&q| q == low_dist_map[0]),
@@ -4863,7 +4887,7 @@ mod tests {
         );
 
         let quant_ac_high = 0.79 / 2.0;
-        let high_dist_map =
+        let (high_dist_map, _, _) =
             build_adaptive_raw_quant_map_full(&xyb_x, &xyb_y, &xyb_b, img_w, img_h, bw, bh, 2.0, quant_ac_high);
         assert_eq!(high_dist_map.len(), num_blocks);
         assert!(high_dist_map.iter().all(|&q| q >= 1));
