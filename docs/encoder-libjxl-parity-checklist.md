@@ -50,7 +50,7 @@ Recent incremental VarDCT prototype progress (this branch):
   kGlobalScaleDenom=65536). PSNR at d=1 now exceeds libjxl (29.18 vs 28.62 dB).
 - `[x]` Gaborish enabled in frame header (gab=true) for free decoder-side smoothing,
   with inverse Gaborish encoder pre-filter available but deferred pending
-  quantization recalibration.
+  butteraugli-based adaptive quantization.
 - `[x]` Histogram clustering via seed-based `FastClusterHistograms`-style algorithm
   (`build_greedy_clustered_context_map`), ~11% byte savings at d=1.
 - `[x]` HybridUint config search across 4 presets per entropy candidate.
@@ -59,11 +59,17 @@ Recent incremental VarDCT prototype progress (this branch):
   predictors by estimated cost. Massive savings at d=3 (-39% photo, -48% flat).
 - `[x]` Coefficient order infrastructure: data-driven 8x8 order computation and
   Lehmer-code permutation encoder in place (activates when order differs from natural).
-- `[x]` Inverse Gaborish 5x5 kernel implemented (currently deferred pending quant recal).
+- `[x]` Inverse Gaborish 5x5 kernel implemented (currently deferred pending butteraugli).
 - `[x]` Added conservative small-special candidate generation (`DCT4X8`/`DCT8X4`,
   `IDENTITY`/`DCT2X2`/`DCT4X4`, plus mixed special maps) and sparse AFV candidate
   generation for high-distance modes on moderate grids, all gated by exact-byte
   winner selection.
+- `[x]` Per-tile CfL optimization: least-squares ytox/ytob regression per 64x64 tile,
+  reducing chroma residuals. Skipped at near-lossless (d<0.5).
+- `[x]` Pixel-domain HF activity adaptive quantization: libjxl-style `HfModulation`
+  with 4-connected Y-channel gradient sums, continuous quant modulation via
+  percentile normalization, and distance-dependent damping. Matches libjxl file
+  size at d=1 (65424 vs 65444 bytes) with +0.22 dB better PSNR.
 
 - `[x]` Writer foundation: bit writer, u32/i32 helpers, TOC writer.
 - `[~]` Minimal headers/container writing.
@@ -192,7 +198,8 @@ This maps libjxl encoder areas to jxl-rs files and milestone/issue buckets from 
   - Milestone: M6.
 - [x] E03 Implement quant field generation and quantization pipeline.
   - Files: `jxl/src/encode/vardct.rs` (libjxl-calibrated global_scale/quant_lf/base_raw_quant
-    + adaptive quant map with distance-relative modulation).
+    + pixel-domain HF activity adaptive quant with continuous modulation and per-tile CfL).
+  - Remaining gap: butteraugli-based perceptual masking for truly adaptive allocation.
   - Milestone: M6, M7.
 - [x] E04 Implement LF/HF coefficient tokenization and entropy coding.
   - Files: `jxl/src/encode/vardct.rs`.
