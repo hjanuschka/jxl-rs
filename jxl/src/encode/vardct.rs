@@ -985,9 +985,16 @@ fn build_adaptive_raw_quant_map_full(
     let (global_scale, _, _) = distance_to_full_quant_params(distance);
     let inv_global_scale = 65536.0 / global_scale as f32;
 
+    // Scale correction: libjxl's iterative FindBestQuantization feedback loop
+    // typically increases quant values by ~2x from the initial aq_map, as it
+    // detects blocks where quality is below the butteraugli target and raises
+    // their raw_quant. Without that loop, we approximate by scaling up.
+    // This factor was calibrated to match libjxl's typical raw_quant range.
+    let correction = 1.35f32;
+
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
     for &v in &aq_map {
-        let rq = (v * inv_global_scale + 0.5).clamp(1.0, 255.0) as u8;
+        let rq = (v * correction * inv_global_scale + 0.5).clamp(1.0, 255.0) as u8;
         raw_quant_map.push(rq);
     }
 
