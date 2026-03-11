@@ -347,6 +347,9 @@ pub fn encode_vardct_u8_rgb_codestream(
         &dct_x,
         &dct_y,
         &dct_b,
+        &y_chan,
+        width,
+        height,
         bw,
         bh,
         config.distance,
@@ -661,20 +664,26 @@ fn build_adaptive_raw_quant_map(
     dct_x: &[f32],
     dct_y: &[f32],
     dct_b: &[f32],
+    xyb_y: &[f32],
+    img_w: usize,
+    img_h: usize,
     bw: usize,
     bh: usize,
     distance: f32,
     base_quant: u8,
 ) -> Vec<u8> {
     build_adaptive_raw_quant_map_with_profile(
-        dct_x, dct_y, dct_b, bw, bh, distance, base_quant, 0.0, true,
+        dct_x, dct_y, dct_b, xyb_y, img_w, img_h, bw, bh, distance, base_quant, 0.0, true,
     )
 }
 
 fn build_adaptive_raw_quant_map_with_profile(
-    dct_x: &[f32],
-    dct_y: &[f32],
-    dct_b: &[f32],
+    _dct_x: &[f32],
+    _dct_y: &[f32],
+    _dct_b: &[f32],
+    xyb_y: &[f32],
+    img_w: usize,
+    img_h: usize,
     bw: usize,
     bh: usize,
     distance: f32,
@@ -690,18 +699,34 @@ fn build_adaptive_raw_quant_map_with_profile(
         return raw_quant_map;
     }
 
-    // Activity estimate from AC magnitudes.
+    // Pixel-domain HF activity measure, inspired by libjxl's HfModulation.
+    // Sum of clamped 4-connected pixel differences in Y channel per 8x8 block.
+    // High sum = edges/texture = visually important = needs LOWER raw_quant.
+    // Low sum = smooth area = can tolerate HIGHER raw_quant.
     let mut activity = vec![0.0f32; num_blocks];
-    for blk in 0..num_blocks {
-        let mut sum = 0.0f32;
-        let base = blk * 64;
-        for k in 1..64 {
-            let x = dct_x[base + k].abs();
-            let y = dct_y[base + k].abs();
-            let b = dct_b[base + k].abs();
-            sum += y + 0.35 * (x + b);
+    let val_clamp = 0.0206f32; // libjxl's valmin_y: clamp large diffs
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut sum = 0.0f32;
+            for dy in 0..8u32 {
+                for dx in 0..8u32 {
+                    let py = (by * 8 + dy as usize).min(img_h - 1);
+                    let px = (bx * 8 + dx as usize).min(img_w - 1);
+                    let v = xyb_y[py * img_w + px];
+                    // Right neighbor
+                    if dx < 7 {
+                        let px2 = (bx * 8 + dx as usize + 1).min(img_w - 1);
+                        sum += (v - xyb_y[py * img_w + px2]).abs().min(val_clamp);
+                    }
+                    // Bottom neighbor
+                    if dy < 7 {
+                        let py2 = (by * 8 + dy as usize + 1).min(img_h - 1);
+                        sum += (v - xyb_y[py2 * img_w + px]).abs().min(val_clamp);
+                    }
+                }
+            }
+            activity[by * bw + bx] = sum;
         }
-        activity[blk] = sum / 63.0;
     }
 
     // Light spatial smoothing to reduce map entropy.
@@ -731,52 +756,39 @@ fn build_adaptive_raw_quant_map_with_profile(
         }
     }
 
+    // Continuous quantization modulation based on activity.
+    // Maps activity to a multiplier: low activity -> higher quant (coarser),
+    // high activity -> lower quant (finer, preserving detail).
+    //
+    // Inspired by libjxl's PerBlockModulations: the quant field is a
+    // multiplicative modulation of the base quant, with the modulation
+    // strength damped at high distances (where all blocks are coarse anyway).
     let mut sorted = smoothed.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let percentile = |p: f32| {
-        let p = p.clamp(0.01, 0.99);
-        let idx = ((sorted.len().saturating_sub(1)) as f32 * p).round() as usize;
-        sorted[idx.min(sorted.len().saturating_sub(1))]
-    };
-    let p = |base: f32| base + percentile_shift;
+    let p10 = sorted[(sorted.len() as f32 * (0.10 + percentile_shift).clamp(0.01, 0.99)) as usize];
+    let p90 = sorted[(sorted.len() as f32 * (0.90 + percentile_shift).clamp(0.01, 0.99)) as usize];
+    let range = (p90 - p10).max(1e-6);
 
-    // Adaptive raw_quant values centered around base_quant.
-    // Low-activity blocks get higher raw_quant (coarser quantization, fewer bits).
-    // High-activity blocks get lower raw_quant (finer quantization, preserves detail).
-    let bq = base_quant as i16;
-    let cq = |offset: i16| (bq + offset).clamp(1, 255) as u8;
-    let (thresholds, quant_levels, num_levels): ([f32; 3], [u8; 4], usize) = if distance < 1.5 {
-        // At low distance: narrow range base +/- 1
-        ([percentile(p(0.40)), 0.0, 0.0], [cq(1), cq(-1), 0, 0], 2)
-    } else if distance < 2.5 {
-        // Medium distance: base +/- 2
-        (
-            [percentile(p(0.30)), percentile(p(0.60)), 0.0],
-            [cq(2), cq(0), cq(-2), 0],
-            3,
-        )
+    // Dampen modulation at high distances (libjxl: ramp from 2.0 to 14.0)
+    let dampen = if distance < 2.0 {
+        1.0f32
+    } else if distance < 14.0 {
+        1.0 - (distance - 2.0) / 12.0
     } else {
-        // High distance: base +/- 3
-        (
-            [
-                percentile(p(0.20)),
-                percentile(p(0.45)),
-                percentile(p(0.70)),
-            ],
-            [cq(3), cq(1), cq(-1), cq(-2)],
-            4,
-        )
+        0.0
     };
 
+    // Modulation range: how many raw_quant steps from base
+    let max_mod = if distance < 1.5 { 2.0f32 } else if distance < 2.5 { 3.0 } else { 4.0 };
+    let mod_range = max_mod * dampen;
+
+    let bq = base_quant as f32;
     for (idx, &a) in smoothed.iter().enumerate() {
-        let mut q = quant_levels[num_levels - 1];
-        for i in 0..(num_levels - 1) {
-            if a <= thresholds[i] {
-                q = quant_levels[i];
-                break;
-            }
-        }
-        raw_quant_map[idx] = q;
+        // Normalize activity to [0, 1] (0=smooth, 1=textured)
+        let t = ((a - p10) / range).clamp(0.0, 1.0);
+        // Map: smooth (t=0) -> +mod_range (coarser), textured (t=1) -> -mod_range (finer)
+        let offset = mod_range * (1.0 - 2.0 * t);
+        raw_quant_map[idx] = (bq + offset).round().clamp(1.0, 255.0) as u8;
     }
 
     if regularize {
@@ -824,6 +836,9 @@ fn build_adaptive_raw_quant_map_candidates(
     dct_x: &[f32],
     dct_y: &[f32],
     dct_b: &[f32],
+    xyb_y: &[f32],
+    img_w: usize,
+    img_h: usize,
     bw: usize,
     bh: usize,
     distance: f32,
@@ -865,12 +880,15 @@ fn build_adaptive_raw_quant_map_candidates(
 
     for (shift, regularize) in profiles {
         let map = if *shift == 0.0 && *regularize {
-            build_adaptive_raw_quant_map(dct_x, dct_y, dct_b, bw, bh, distance, base_quant)
+            build_adaptive_raw_quant_map(dct_x, dct_y, dct_b, xyb_y, img_w, img_h, bw, bh, distance, base_quant)
         } else {
             build_adaptive_raw_quant_map_with_profile(
                 dct_x,
                 dct_y,
                 dct_b,
+                xyb_y,
+                img_w,
+                img_h,
                 bw,
                 bh,
                 distance,
@@ -4707,9 +4725,13 @@ mod tests {
             }
         }
 
+        // Create a dummy Y pixel channel for the test
+        let (img_w, img_h) = (bw * 8, bh * 8);
+        let xyb_y_dummy = vec![0.5f32; img_w * img_h];
+
         let (_, _, base_low) = distance_to_full_quant_params(0.8);
         let low_dist_map =
-            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, bw, bh, 0.8, base_low);
+            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, &xyb_y_dummy, img_w, img_h, bw, bh, 0.8, base_low);
         assert!(
             low_dist_map.iter().all(|&q| q == base_low),
             "distance gating should keep raw_quant=base({base_low})"
@@ -4717,7 +4739,7 @@ mod tests {
 
         let (_, _, base_high) = distance_to_full_quant_params(2.0);
         let high_dist_map =
-            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, bw, bh, 2.0, base_high);
+            build_adaptive_raw_quant_map(&dct_x, &dct_y, &dct_b, &xyb_y_dummy, img_w, img_h, bw, bh, 2.0, base_high);
         assert_eq!(high_dist_map.len(), num_blocks);
         assert!(high_dist_map.iter().all(|&q| q >= 1));
         assert!(
