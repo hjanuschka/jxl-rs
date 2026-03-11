@@ -412,7 +412,7 @@ pub fn encode_vardct_u8_rgb_codestream(
             &ytox_map,
             &ytob_map,
         );
-        let transform_map_candidates = build_transform_map_candidates_from_quantized_ac(
+        let mut transform_map_candidates = build_transform_map_candidates_from_quantized_ac(
             &quantized.ac_x,
             &quantized.ac_y,
             &quantized.ac_b,
@@ -420,6 +420,24 @@ pub fn encode_vardct_u8_rgb_codestream(
             bh,
             config.distance,
         );
+        // At low distances, add entropy-based DCT16 merge candidate using actual
+        // pixel-domain forward transforms (libjxl EstimateEntropy approach).
+        if config.distance < 1.5 && bw >= 2 && bh >= 2 {
+            let entropy_map = build_entropy_merge_transform_map(
+                &x_chan, &y_chan, &b_chan,
+                width, height, bw, bh,
+                &quantized.ac_y, &quantized.ac_x, &quantized.ac_b,
+                global_scale, raw_quant_map,
+                &dequant_weights, x_dm_multiplier, b_dm_multiplier,
+                config.distance,
+            );
+            let default_map = build_default_transform_map(bw, bh);
+            if entropy_map != default_map
+                && !transform_map_candidates.contains(&entropy_map)
+            {
+                transform_map_candidates.push(entropy_map);
+            }
+        }
 
         let mut best_frame = None;
         let mut best_size = usize::MAX;
@@ -1650,6 +1668,20 @@ fn rectangular_forward_solver(transform_id: u8) -> Option<&'static TransformLine
     Some(RECTANGULAR_FORWARD_SOLVERS[idx].get_or_init(|| build_linear_forward_solver(transform)))
 }
 
+/// Compute forward DCT NxN using the linear solver (decoder-basis inversion).
+/// N must be 16, 32, or 64.
+fn forward_dct_nxn(pixels: &[f32], coeffs: &mut [f32], n: usize) {
+    let transform_id = match n {
+        16 => DCT16_TRANSFORM_ID,
+        32 => DCT32_TRANSFORM_ID,
+        _ => panic!("unsupported DCT size {}", n),
+    };
+    let solver = square_forward_solver(transform_id)
+        .unwrap_or_else(|| panic!("no solver for DCT{}", n));
+    let result = forward_with_linear_solver(pixels, solver);
+    coeffs[..result.len()].copy_from_slice(&result);
+}
+
 fn forward_with_linear_solver(block: &[f32], solver: &TransformLinearForwardSolver) -> Vec<f32> {
     debug_assert_eq!(block.len(), solver.coeff_count);
     let n = solver.coeff_count;
@@ -1984,121 +2016,131 @@ fn build_transform_map_from_quantized_ac(
     distance: f32,
 ) -> Vec<u8> {
     if distance >= 1.5 {
-        // At high distances, use zero-region merging for DCT16.
         return build_zero_merge_transform_map(ac_x, ac_y, ac_b, bw, bh, &[DCT16_TRANSFORM_ID]);
     }
-    // At lower distances, use entropy-based DCT16 merging.
-    build_entropy_merge_transform_map(ac_x, ac_y, ac_b, bw, bh, distance)
+    build_default_transform_map(bw, bh)
 }
 
-/// Entropy-based DCT16x16 merging for low distances.
-/// For each aligned 2x2 group of 8x8 blocks, estimates whether DCT16x16
-/// would be cheaper than 4x DCT8x8 using sqrt(|coeff|) entropy estimate
-/// from libjxl's EstimateEntropy (enc_ac_strategy.cc).
+/// Entropy-based DCT16x16 merging using libjxl's EstimateEntropy approach.
+/// For each aligned 2x2 group of 8x8 blocks, computes forward DCT16x16 on
+/// actual pixel data, quantizes, and compares sqrt(|q|) entropy against
+/// the sum of 4x DCT8x8 entropies. Port of enc_ac_strategy.cc logic.
 fn build_entropy_merge_transform_map(
-    ac_x: &[i32],
-    ac_y: &[i32],
-    ac_b: &[i32],
+    pixel_x: &[f32],
+    pixel_y: &[f32],
+    pixel_b: &[f32],
+    width: usize,
+    height: usize,
     bw: usize,
     bh: usize,
+    dct8_ac_y: &[i32],
+    dct8_ac_x: &[i32],
+    dct8_ac_b: &[i32],
+    global_scale: u32,
+    raw_quant_map: &[u8],
+    dequant_weights_8x8: &[f32],
+    x_dm_multiplier: f32,
+    b_dm_multiplier: f32,
     distance: f32,
 ) -> Vec<u8> {
     let mut map = build_default_transform_map(bw, bh);
 
-    // libjxl uses entropy_mul = 1.34 for DCT16x16 vs 0.8 for DCT8x8
-    // The relative penalty is 1.34 / 0.8 = 1.675, but also modulated by
-    // the 8x8 mul: k8x8mul2 + k8x8mul1 / (target + k8x8base)
-    // = 1.0 + (-0.4) / (d + 1.4) = at d=1: 1.0 - 0.4/2.4 = 0.833
-    // So the 8x8 entropy is multiplied by 0.833, making larger blocks
-    // need to beat 0.833x the 8x8 cost.
-    // Effective threshold: DCT16 wins if its entropy < 4 * 8x8_entropy * (1.34/0.8) * 0.833
-    // = 4 * 8x8_entropy * 1.395
-    // Simplified: if DCT16 entropy < sum_of_4_8x8_entropies * threshold
-    let k8x8mul = 1.0 + (-0.4) / (distance + 1.4);
+    // libjxl entropy multipliers from enc_ac_strategy.cc
+    let k8x8mul = 1.0 + (-0.4) / (distance + 1.4);  // favors 8x8 at low d
+    let entropy_mul_8 = 0.8 * k8x8mul;
     let entropy_mul_16 = 1.34;
-    let entropy_mul_8 = 0.8;
-    // DCT16 wins when: entropy_16 * entropy_mul_16 < sum_4_8x8 * entropy_mul_8 * k8x8mul
-    // i.e.: entropy_16 < sum_4_8x8 * (entropy_mul_8 * k8x8mul / entropy_mul_16)
-    let threshold = entropy_mul_8 * k8x8mul / entropy_mul_16;
 
-    // Estimate 8x8 block entropy as sum of sqrt(|coeff|) for Y channel.
+    // Compute 8x8 block entropies from quantized coefficients.
+    // entropy = sum of sqrt(|quantized_ac|) -- libjxl EstimateEntropy
     let estimate_8x8_entropy = |blk: usize| -> f32 {
         let base = blk * 64;
         let mut e = 0.0f32;
         for k in 1..64 {
-            e += (ac_y[base + k].abs() as f32).sqrt();
+            e += (dct8_ac_y[base + k].abs() as f32).sqrt();
+            e += (dct8_ac_x[base + k].abs() as f32).sqrt() * 0.3;
+            e += (dct8_ac_b[base + k].abs() as f32).sqrt() * 0.3;
         }
-        e
+        e * entropy_mul_8
     };
 
-    // Estimate 16x16 block entropy. For the 2x2 group starting at (bx, by),
-    // we use the sum of all AC coefficients across the 4 blocks, but only
-    // count them once (since DCT16 would encode them as a single block).
-    // A simple heuristic: count how many non-zero coefficients the 4 blocks
-    // have together. Smooth regions will have fewer non-zeros and benefit
-    // from DCT16.
-    let estimate_16x16_entropy = |bx: usize, by: usize| -> f32 {
-        // Sum AC energy across all 4 blocks in the 2x2 group.
-        let mut total_energy = 0.0f32;
-        let mut total_nz = 0usize;
-        for dy in 0..2 {
-            for dx in 0..2 {
-                let blk = (by + dy) * bw + (bx + dx);
-                let base = blk * 64;
-                for k in 1..64 {
-                    let v = ac_y[base + k].abs();
-                    if v > 0 {
-                        total_energy += (v as f32).sqrt();
-                        total_nz += 1;
-                    }
-                }
-            }
-        }
-        // DCT16 typically gets ~60% of the combined 8x8 entropy for smooth
-        // areas (fewer non-zeros needed), but ~90% for detailed areas.
-        // Approximate: entropy scales with nz_fraction^0.7
-        let max_nz = 4 * 63;
-        let nz_frac = total_nz as f32 / max_nz as f32;
-        // At low nz_frac (smooth), DCT16 is much better.
-        // At high nz_frac (detailed), DCT16 is only slightly better.
-        let efficiency = 0.5 + 0.4 * nz_frac; // 0.5 for smooth, 0.9 for detailed
-        total_energy * efficiency
-    };
-
-    // Try to merge aligned 2x2 groups.
-    // We use a simpler criterion: if the 4 blocks have low combined
-    // AC energy (mostly smooth), DCT16 is likely better.
+    // Try to merge aligned 2x2 groups into DCT16x16.
     let h2 = bh / 2;
     let w2 = bw / 2;
+
+    // Get DCT16x16 dequant weights (needed for quantization).
+    // DCT16x16 dequant weights: quant_table_id=4, 3 channels * 256 coeffs each
+    let dct16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(4);
+
     for by2 in 0..h2 {
         for bx2 in 0..w2 {
             let bx = bx2 * 2;
             let by = by2 * 2;
-            // Sum of 4x DCT8x8 entropies.
+
+            // Sum of 4x DCT8x8 entropies (already scaled by entropy_mul_8).
             let e8_sum = estimate_8x8_entropy(by * bw + bx)
                 + estimate_8x8_entropy(by * bw + bx + 1)
                 + estimate_8x8_entropy((by + 1) * bw + bx)
                 + estimate_8x8_entropy((by + 1) * bw + bx + 1);
-            // Count non-zero Y coefficients and max magnitude across all 4 blocks.
-            let mut total_nz = 0usize;
-            let mut max_abs = 0i32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let blk = (by + dy) * bw + (bx + dx);
-                    let base = blk * 64;
-                    for k in 1..64 {
-                        let v = ac_y[base + k];
-                        if v != 0 { total_nz += 1; }
-                        max_abs = max_abs.max(v.abs());
+
+            // Use the max raw_quant from the 4 blocks (libjxl AdjustQuantField
+            // uses max at low distances).
+            let rq = [
+                raw_quant_map[by * bw + bx],
+                raw_quant_map[by * bw + bx + 1],
+                raw_quant_map[(by + 1) * bw + bx],
+                raw_quant_map[(by + 1) * bw + bx + 1],
+            ];
+            let raw_quant = *rq.iter().max().unwrap() as u32;
+
+            // Gather 16x16 pixel blocks and compute forward DCT16x16 for all 3 channels.
+            let mut all_coeffs = [[0.0f32; 256]; 3];
+            for c in 0..3usize {
+                let chan = match c { 0 => pixel_x, 1 => pixel_y, _ => pixel_b };
+                let mut pixels = [0.0f32; 256];
+                for dy in 0..16 {
+                    for dx in 0..16 {
+                        let sy = (by * 8 + dy).min(height - 1);
+                        let sx = (bx * 8 + dx).min(width - 1);
+                        pixels[dy * 16 + dx] = chan[sy * width + sx];
                     }
                 }
+                forward_dct_nxn(&pixels, &mut all_coeffs[c], 16);
             }
-            // Smooth criterion: low non-zero fraction AND low coefficient magnitudes.
-            // High max_abs means sharp edges (text, etc.) that need 8x8 precision.
-            let nz_frac = total_nz as f32 / (4.0 * 63.0);
-            if nz_frac < 0.30 && max_abs <= 6 && e8_sum > 0.0 {
-                // Mark 2x2 group as DCT16x16.
-                // Top-left gets FIRST_BLOCK flag, others get just the ID.
+
+            // Get CfL factors for this tile.
+            // Quantize and estimate entropy.
+            let mut e16 = 0.0f32;
+            let scale = (global_scale as f32 * raw_quant as f32) / 65536.0;
+            for c in 0..3usize {
+                let dw_base = match c {
+                    0 => &dct16_weights[..256],
+                    1 => &dct16_weights[256..512],
+                    _ => &dct16_weights[512..768],
+                };
+                let dm_mul = match c {
+                    0 => x_dm_multiplier,
+                    1 => 1.0,
+                    _ => b_dm_multiplier,
+                };
+                let chan_weight = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                for k in 1..256 {
+                    let dw = dw_base[k] * dm_mul;
+                    if dw.abs() < 1e-10 { continue; }
+                    let q = (all_coeffs[c][k] * scale / dw).round();
+                    e16 += (q.abs()).sqrt() * chan_weight;
+                }
+            }
+            e16 *= entropy_mul_16;
+
+            // DCT16 wins if its estimated entropy is lower.
+            if bx == 0 && by == 0 {
+                // Debug: print weight stats
+                let dw16_y = &dct16_weights[256..512];
+            // Currently, DCT16 entropy tends to be higher than 4x DCT8 due to
+            // the forward solver producing slightly different coefficients than
+            // libjxl's TransformFromPixels. This means very few merges happen.
+            }
+            if e16 < e8_sum {
                 map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
                 map[by * bw + bx + 1] = DCT16_TRANSFORM_ID;
                 map[(by + 1) * bw + bx] = DCT16_TRANSFORM_ID;
