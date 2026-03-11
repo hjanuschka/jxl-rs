@@ -2292,6 +2292,32 @@ fn estimate_transform_entropy_full(
 }
 
 /// Inverse-transform quantization error from DCT domain to pixel domain.
+/// Inverse transform for all 3 channels of an 8x8 block (any special transform type).
+/// Returns [x_pixels, y_pixels, b_pixels], each 64 floats.
+#[allow(dead_code)]
+fn inverse_transform_8x8_all_channels(
+    transform_id: u8,
+    coeffs: &[Vec<f32>; 3],
+) -> [Vec<f32>; 3] {
+    use jxl_transforms::transform_map::HfTransformType;
+
+    let transform = HfTransformType::from_usize(transform_id as usize)
+        .unwrap_or(HfTransformType::DCT);
+
+    let mut result = [vec![0.0f32; 64], vec![0.0f32; 64], vec![0.0f32; 64]];
+    for c in 0..3 {
+        // For 8x8 transforms: lf is 1 element (DC), hf is 64 elements (full block)
+        // transform_to_pixels places lf[0] into hf[0] then runs inverse transform
+        let mut lf = [coeffs[c][0]];
+        let mut hf = vec![0.0f32; 64];
+        hf.copy_from_slice(&coeffs[c][..64]);
+
+        transform_to_pixels(transform, &mut lf, &mut hf);
+        result[c] = hf;
+    }
+    result
+}
+
 /// Uses the decoder's inverse transform to convert error coefficients to pixels.
 #[allow(dead_code)]
 fn inverse_transform_error(
@@ -2384,7 +2410,11 @@ fn build_entropy_merge_transform_map(
     let entropy_mul_16 = 2.5f32;
     let entropy_mul_32 = 3.5f32;
 
-    // Simple entropy estimate using sqrt(|quantized|) from quantized coefficients.
+    // Simple entropy estimate using sqrt(|quantized|) from DCT8 coefficients.
+    // NOTE: Per-block 8x8 transform selection (FindBest8x8Transform) requires
+    // a working perceptual loss term. Without it, entropy-only selection picks
+    // transforms that minimize bits but destroy quality. Deferred until loss
+    // term normalization is resolved.
     let estimate_8x8_entropy = |blk: usize, _bx: usize, _by: usize| -> f32 {
         let base = blk * 64;
         let mut e = 0.0f32;
