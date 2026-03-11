@@ -71,6 +71,100 @@ struct Opt {
     /// Modular predictor id (0=Zero, 1=West, ... 13=AverageAll)
     #[arg(long, default_value_t = 0)]
     modular_predictor: u32,
+
+    /// Frame duration in milliseconds (for animation input with numbered PPM frames)
+    #[arg(long, default_value_t = 50)]
+    frame_duration_ms: u32,
+
+    /// Encode raw interleaved RGBA8 bytes from this file (length must be width*height*4)
+    #[arg(long)]
+    raw_rgba8_input: Option<PathBuf>,
+}
+
+/// Encode animation from a directory of sorted PPM frames.
+fn encode_animation_from_dir(opt: &Opt, dir: &PathBuf) -> Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .wrap_err_with(|| format!("Failed to read directory {:?}", dir))?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            name.ends_with(".ppm")
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    if entries.is_empty() {
+        return Err(color_eyre::eyre::eyre!("No .ppm files found in {:?}", dir));
+    }
+
+    eprintln!("Found {} PPM frames in {:?}", entries.len(), dir);
+
+    let mut frames_data: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
+
+    for (i, entry) in entries.iter().enumerate() {
+        let pnm = read_pnm(&entry.path())?;
+        match pnm {
+            PnmImage::Rgb8 { width: w, height: h, data } => {
+                if i == 0 {
+                    width = w;
+                    height = h;
+                } else if w != width || h != height {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Frame {} has different size {}x{} (expected {}x{})",
+                        i, w, h, width, height
+                    ));
+                }
+                frames_data.push((data, opt.frame_duration_ms));
+            }
+            PnmImage::Gray8 { width: w, height: h, data } => {
+                if i == 0 {
+                    width = w;
+                    height = h;
+                } else if w != width || h != height {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Frame {} has different size {}x{} (expected {}x{})",
+                        i, w, h, width, height
+                    ));
+                }
+                // Convert gray to RGB
+                let mut rgb = vec![0u8; data.len() * 3];
+                for (j, &g) in data.iter().enumerate() {
+                    rgb[j * 3] = g;
+                    rgb[j * 3 + 1] = g;
+                    rgb[j * 3 + 2] = g;
+                }
+                frames_data.push((rgb, opt.frame_duration_ms));
+            }
+        }
+    }
+
+    let frame_refs: Vec<(&[u8], u32)> = frames_data.iter()
+        .map(|(d, ms)| (d.as_slice(), *ms))
+        .collect();
+
+    use jxl::encode::vardct::{VarDctConfig, encode_vardct_animation_u8_rgb};
+    let config = VarDctConfig { distance: opt.distance };
+    let bytes = encode_vardct_animation_u8_rgb(&frame_refs, width as usize, height as usize, &config)
+        .map_err(|e| color_eyre::eyre::eyre!("Animation encode failed: {e:?}"))?;
+
+    let output = opt.output.clone().unwrap_or_else(|| {
+        let mut p = dir.clone();
+        p.set_extension("jxl");
+        p
+    });
+
+    std::fs::write(&output, &bytes)
+        .wrap_err_with(|| format!("Failed to write {:?}", output))?;
+
+    eprintln!(
+        "{:?} -> {:?}: {}x{}, {} frames, {} bytes (VarDCT animation, d={:.2}, {}ms/frame)",
+        dir, output, width, height, frames_data.len(), bytes.len(),
+        opt.distance, opt.frame_duration_ms
+    );
+
+    Ok(())
 }
 
 /// Parsed PPM/PGM result.
@@ -186,7 +280,12 @@ fn main() -> Result<()> {
     let enc = JxlEncoder::default();
 
     // --- Simple mode: jxle input.ppm [-o output.jxl] [-d distance] ---
+    // If input is a directory, treat as animation (sorted PPM frames).
     if let Some(input_path) = &opt.input {
+        if input_path.is_dir() {
+            return encode_animation_from_dir(&opt, input_path);
+        }
+
         let pnm = read_pnm(input_path)?;
         let output = opt.output.clone().unwrap_or_else(|| {
             let mut p = input_path.clone();
@@ -271,6 +370,33 @@ fn main() -> Result<()> {
             bytes.len(),
             opt.distance,
             ratio
+        );
+        return Ok(());
+    }
+
+    // --- Raw RGBA8 input mode ---
+    if let Some(rgba_path) = &opt.raw_rgba8_input {
+        let width = opt.width.expect("--width required for --raw-rgba8-input");
+        let height = opt.height.expect("--height required for --raw-rgba8-input");
+        let rgba = std::fs::read(rgba_path)
+            .wrap_err_with(|| format!("Failed to read {:?}", rgba_path))?;
+        let expected = (width as usize) * (height as usize) * 4;
+        if rgba.len() != expected {
+            return Err(color_eyre::eyre::eyre!(
+                "RGBA file size {} != expected {} ({}x{}x4)",
+                rgba.len(), expected, width, height
+            ));
+        }
+        use jxl::encode::vardct::{VarDctConfig, encode_vardct_u8_rgba};
+        let config = VarDctConfig { distance: opt.distance };
+        let bytes = encode_vardct_u8_rgba(&rgba, width as usize, height as usize, &config)
+            .map_err(|e| color_eyre::eyre::eyre!("RGBA encode failed: {e:?}"))?;
+        let output = opt.output.clone().unwrap_or_else(|| PathBuf::from("output.jxl"));
+        std::fs::write(&output, &bytes)
+            .wrap_err_with(|| format!("Failed to write {:?}", output))?;
+        eprintln!(
+            "{:?} -> {:?}: {}x{} RGBA, {} bytes (VarDCT+alpha, d={:.2})",
+            rgba_path, output, width, height, bytes.len(), opt.distance
         );
         return Ok(());
     }
