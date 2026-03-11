@@ -558,9 +558,12 @@ fn quantize_vardct_blocks(
             let ac_y = dct_y[blk * 64 + k];
             let ac_b = dct_b[blk * 64 + k] - dct_y[blk * 64 + k];
 
-            qx[blk * 64 + k] = quantize_ac(ac_x, global_scale, raw_quant, dw_x);
-            qy[blk * 64 + k] = quantize_ac(ac_y, global_scale, raw_quant, dw_y);
-            qb[blk * 64 + k] = quantize_ac(ac_b, global_scale, raw_quant, dw_b);
+            qx[blk * 64 + k] =
+                quantize_ac(ac_x, global_scale, raw_quant, dw_x, AC_DEAD_ZONE);
+            qy[blk * 64 + k] =
+                quantize_ac(ac_y, global_scale, raw_quant, dw_y, AC_DEAD_ZONE);
+            qb[blk * 64 + k] =
+                quantize_ac(ac_b, global_scale, raw_quant, dw_b, AC_DEAD_ZONE);
         }
     }
 
@@ -1745,18 +1748,21 @@ fn prepare_ac_for_transform_map_with_cache(
                     global_scale,
                     raw_quant,
                     wx[coeff_index] * x_dm_multiplier,
+                    AC_DEAD_ZONE,
                 );
                 ac_y[storage_index] = quantize_ac(
                     coeffs[1][coeff_index],
                     global_scale,
                     raw_quant,
                     wy[coeff_index],
+                    AC_DEAD_ZONE,
                 );
                 ac_b[storage_index] = quantize_ac(
                     coeffs[2][coeff_index],
                     global_scale,
                     raw_quant,
                     wb[coeff_index] * b_dm_multiplier,
+                    AC_DEAD_ZONE,
                 );
             }
         }
@@ -2551,24 +2557,29 @@ fn default_dct8x8_dequant_weights() -> &'static [f32] {
 /// For forward quantization (ignoring quant bias):
 ///   quantized = round(ac_float * raw_quant / (dequant_weight[k] * inv_global_scale))
 ///             = round(ac_float * raw_quant * global_scale / (dequant_weight[k] * 2^16))
-fn quantize_ac(ac_float: f32, global_scale: u32, raw_quant: u32, dequant_weight: f32) -> i32 {
+fn quantize_ac(
+    ac_float: f32,
+    global_scale: u32,
+    raw_quant: u32,
+    dequant_weight: f32,
+    dead_zone: f32,
+) -> i32 {
     if dequant_weight.abs() < 1e-10 {
         return 0;
     }
     let scale = (global_scale as f32 * raw_quant as f32) / ((1u32 << 16) as f32 * dequant_weight);
     let scaled = ac_float * scale;
-    // Dead-zone quantization: values in [-0.5-dz, 0.5+dz) map to 0.
-    // A dead-zone of ~0.46 biases small coefficients toward zero,
-    // reducing the number of non-zero coefficients and improving entropy.
-    // This matches libjxl's approach (which has a slight bias toward zero).
-    const DEAD_ZONE: f32 = 0.25;
     let abs_scaled = scaled.abs();
-    if abs_scaled < 0.5 + DEAD_ZONE {
+    if abs_scaled < 0.5 + dead_zone {
         0
     } else {
         scaled.round() as i32
     }
 }
+
+/// Default dead-zone for AC quantization.
+/// Values in [-0.5-DZ, 0.5+DZ) are rounded to zero.
+const AC_DEAD_ZONE: f32 = 0.25;
 
 /// Build the complete VarDCT frame bitstream.
 fn encode_vardct_frame(
