@@ -1983,12 +1983,131 @@ fn build_transform_map_from_quantized_ac(
     bh: usize,
     distance: f32,
 ) -> Vec<u8> {
-    if distance < 1.5 {
-        return build_default_transform_map(bw, bh);
+    if distance >= 1.5 {
+        // At high distances, use zero-region merging for DCT16.
+        return build_zero_merge_transform_map(ac_x, ac_y, ac_b, bw, bh, &[DCT16_TRANSFORM_ID]);
+    }
+    // At lower distances, use entropy-based DCT16 merging.
+    build_entropy_merge_transform_map(ac_x, ac_y, ac_b, bw, bh, distance)
+}
+
+/// Entropy-based DCT16x16 merging for low distances.
+/// For each aligned 2x2 group of 8x8 blocks, estimates whether DCT16x16
+/// would be cheaper than 4x DCT8x8 using sqrt(|coeff|) entropy estimate
+/// from libjxl's EstimateEntropy (enc_ac_strategy.cc).
+fn build_entropy_merge_transform_map(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+) -> Vec<u8> {
+    let mut map = build_default_transform_map(bw, bh);
+
+    // libjxl uses entropy_mul = 1.34 for DCT16x16 vs 0.8 for DCT8x8
+    // The relative penalty is 1.34 / 0.8 = 1.675, but also modulated by
+    // the 8x8 mul: k8x8mul2 + k8x8mul1 / (target + k8x8base)
+    // = 1.0 + (-0.4) / (d + 1.4) = at d=1: 1.0 - 0.4/2.4 = 0.833
+    // So the 8x8 entropy is multiplied by 0.833, making larger blocks
+    // need to beat 0.833x the 8x8 cost.
+    // Effective threshold: DCT16 wins if its entropy < 4 * 8x8_entropy * (1.34/0.8) * 0.833
+    // = 4 * 8x8_entropy * 1.395
+    // Simplified: if DCT16 entropy < sum_of_4_8x8_entropies * threshold
+    let k8x8mul = 1.0 + (-0.4) / (distance + 1.4);
+    let entropy_mul_16 = 1.34;
+    let entropy_mul_8 = 0.8;
+    // DCT16 wins when: entropy_16 * entropy_mul_16 < sum_4_8x8 * entropy_mul_8 * k8x8mul
+    // i.e.: entropy_16 < sum_4_8x8 * (entropy_mul_8 * k8x8mul / entropy_mul_16)
+    let threshold = entropy_mul_8 * k8x8mul / entropy_mul_16;
+
+    // Estimate 8x8 block entropy as sum of sqrt(|coeff|) for Y channel.
+    let estimate_8x8_entropy = |blk: usize| -> f32 {
+        let base = blk * 64;
+        let mut e = 0.0f32;
+        for k in 1..64 {
+            e += (ac_y[base + k].abs() as f32).sqrt();
+        }
+        e
+    };
+
+    // Estimate 16x16 block entropy. For the 2x2 group starting at (bx, by),
+    // we use the sum of all AC coefficients across the 4 blocks, but only
+    // count them once (since DCT16 would encode them as a single block).
+    // A simple heuristic: count how many non-zero coefficients the 4 blocks
+    // have together. Smooth regions will have fewer non-zeros and benefit
+    // from DCT16.
+    let estimate_16x16_entropy = |bx: usize, by: usize| -> f32 {
+        // Sum AC energy across all 4 blocks in the 2x2 group.
+        let mut total_energy = 0.0f32;
+        let mut total_nz = 0usize;
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let blk = (by + dy) * bw + (bx + dx);
+                let base = blk * 64;
+                for k in 1..64 {
+                    let v = ac_y[base + k].abs();
+                    if v > 0 {
+                        total_energy += (v as f32).sqrt();
+                        total_nz += 1;
+                    }
+                }
+            }
+        }
+        // DCT16 typically gets ~60% of the combined 8x8 entropy for smooth
+        // areas (fewer non-zeros needed), but ~90% for detailed areas.
+        // Approximate: entropy scales with nz_fraction^0.7
+        let max_nz = 4 * 63;
+        let nz_frac = total_nz as f32 / max_nz as f32;
+        // At low nz_frac (smooth), DCT16 is much better.
+        // At high nz_frac (detailed), DCT16 is only slightly better.
+        let efficiency = 0.5 + 0.4 * nz_frac; // 0.5 for smooth, 0.9 for detailed
+        total_energy * efficiency
+    };
+
+    // Try to merge aligned 2x2 groups.
+    // We use a simpler criterion: if the 4 blocks have low combined
+    // AC energy (mostly smooth), DCT16 is likely better.
+    let h2 = bh / 2;
+    let w2 = bw / 2;
+    for by2 in 0..h2 {
+        for bx2 in 0..w2 {
+            let bx = bx2 * 2;
+            let by = by2 * 2;
+            // Sum of 4x DCT8x8 entropies.
+            let e8_sum = estimate_8x8_entropy(by * bw + bx)
+                + estimate_8x8_entropy(by * bw + bx + 1)
+                + estimate_8x8_entropy((by + 1) * bw + bx)
+                + estimate_8x8_entropy((by + 1) * bw + bx + 1);
+            // Count non-zero Y coefficients and max magnitude across all 4 blocks.
+            let mut total_nz = 0usize;
+            let mut max_abs = 0i32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let blk = (by + dy) * bw + (bx + dx);
+                    let base = blk * 64;
+                    for k in 1..64 {
+                        let v = ac_y[base + k];
+                        if v != 0 { total_nz += 1; }
+                        max_abs = max_abs.max(v.abs());
+                    }
+                }
+            }
+            // Smooth criterion: low non-zero fraction AND low coefficient magnitudes.
+            // High max_abs means sharp edges (text, etc.) that need 8x8 precision.
+            let nz_frac = total_nz as f32 / (4.0 * 63.0);
+            if nz_frac < 0.30 && max_abs <= 6 && e8_sum > 0.0 {
+                // Mark 2x2 group as DCT16x16.
+                // Top-left gets FIRST_BLOCK flag, others get just the ID.
+                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16_TRANSFORM_ID;
+                map[by * bw + bx + 1] = DCT16_TRANSFORM_ID;
+                map[(by + 1) * bw + bx] = DCT16_TRANSFORM_ID;
+                map[(by + 1) * bw + bx + 1] = DCT16_TRANSFORM_ID;
+            }
+        }
     }
 
-    // Conservative first strategy: only DCT16x16 zero-region merging.
-    build_zero_merge_transform_map(ac_x, ac_y, ac_b, bw, bh, &[DCT16_TRANSFORM_ID])
+    map
 }
 
 fn build_afv_transform_map_from_quantized_ac(
