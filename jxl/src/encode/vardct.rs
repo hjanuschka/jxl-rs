@@ -220,6 +220,12 @@ fn compute_global_scale_and_quant_full(
 /// The decoder applies forward Gaborish (3x3 smoothing) when gab=true.
 /// The encoder compensates by applying this approximate inverse BEFORE the DCT.
 fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: usize) {
+    apply_inverse_gaborish_weighted(channels, width, height, [1.0, 1.0, 1.0]);
+}
+
+fn apply_inverse_gaborish_weighted(
+    channels: &mut [&mut [f32]; 3], width: usize, height: usize, weights: [f32; 3],
+) {
     // libjxl inverse Gaborish kernel (symmetric 5x5).
     const K: [f32; 5] = [
         -0.094_958_16,
@@ -229,29 +235,18 @@ fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: 
         -0.001_478_906_4,
     ];
 
-    // mul[c] = 1.0 for all channels (default).
-    let mul = 1.0f32;
-    let sum = 1.0 + mul * 4.0 * (K[0] + K[1] + K[2] + K[4] + 2.0 * K[3]);
-    let normalize = 1.0 / sum;
-    let nm = mul * normalize;
+    for (ch_idx, chan) in channels.iter_mut().enumerate() {
+        let mul = weights[ch_idx];
+        let sum = 1.0 + mul * 4.0 * (K[0] + K[1] + K[2] + K[4] + 2.0 * K[3]);
+        let normalize = 1.0 / sum;
+        let nm = mul * normalize;
+        let w_center = normalize;
+        let w_adj = nm * K[0];
+        let w_diag = nm * K[1];
+        let w_far_card = nm * K[2];
+        let w_knight = nm * K[3];
+        let w_far_diag = nm * K[4];
 
-    // WeightsSymmetric5 layout from libjxl convolve.h:
-    //   Lower-right quadrant: c r R    Full kernel:  D L R L D
-    //                         r d L                  L d r d L
-    //                         R L D                  R r c r R
-    //                                                L d r d L
-    //                                                D L R L D
-    // Fields: c=center, r=adjacent(4), d=diagonal(4), R=far_cardinal(4),
-    //         L=knight_move(8), D=far_corner(4)
-    // In libjxl: {c=normalize, r=nm*K[0], R=nm*K[2], d=nm*K[1], D=nm*K[4], L=nm*K[3]}
-    let w_center = normalize;
-    let w_adj = nm * K[0]; // r: 4 adjacent (up/down/left/right)
-    let w_diag = nm * K[1]; // d: 4 diagonal (1,1)
-    let w_far_card = nm * K[2]; // R: 4 far cardinal (2,0)
-    let w_knight = nm * K[3]; // L: 8 knight-move (1,2)/(2,1)
-    let w_far_diag = nm * K[4]; // D: 4 far diagonal/corner (2,2)
-
-    for chan in channels.iter_mut() {
         let input = chan.to_vec();
         let get = |x: isize, y: isize| -> f32 {
             let cx = x.clamp(0, width as isize - 1) as usize;
@@ -297,6 +292,7 @@ fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: 
         }
     }
 }
+
 
 /// Encode an sRGB u8 RGB image as a VarDCT JXL file (container-wrapped).
 pub fn encode_vardct_u8_rgb(
