@@ -51,6 +51,10 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
   `epf_sigma_custom=false`. Both single-group and multi-group paths populate
   EPF sharpness channel (ch3 in HF metadata).
 - `[x]` Fixed LoopFilter extensions field in frame header serialization.
+- `[x]` **EPF dynamic sharpness investigated**: At d=1.0, sharpness values
+  {0, 2, 4, 7} produce identical decoded output (EPF sigma too small to have
+  effect). Dynamic per-block sharpness optimization deferred -- not a quality
+  factor at typical distances.
 
 ### Transform and block strategy
 
@@ -112,6 +116,23 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
   custom LfGlobal encoding), but currently disabled -- overhead exceeds savings
   without per-block transform variety.
 - `[ ]` Modular transforms (palette, squeeze, RCT).
+- `[ ]` Effort tiers (mapping effort 1-9 to heuristic complexity).
+- `[ ]` Alpha/16-bit/HDR input support.
+
+### Investigated and resolved (not needed)
+
+- `[x]` **Per-block 8x8 transform selection (`FindBest8x8Transform`)**: Fully
+  ported and analyzed. At d<=4.0, `val = coeff * inv_matrix * quant_norm16`
+  produces all-zero quantized values for every transform, making entropy and
+  loss terms identical. DCT8 wins by being first candidate. libjxl also keeps
+  all-DCT8 at these distances. Transform variety comes from merge step only.
+  Only useful at d>4.0 where quantized coefficients are non-zero.
+- `[x]` **EPF dynamic sharpness**: At d=1.0, all sharpness values (0-7)
+  produce bit-identical decoded output. EPF sigma is too small at typical
+  quality settings for sharpness modulation to have any effect.
+- `[x]` **Dequant weight table convention**: Confirmed `get_library_table()`
+  returns `1/dequant_weight` (inv_matrix). All code using these tables
+  correctly treats them as inverse weights.
 
 ### Current benchmarks (d=1.0, Squirrel speed)
 
@@ -228,10 +249,10 @@ Includes all 7 test images with side-by-side jxl-rs vs libjxl decoded output.
 - [~] E02 Block strategy selection and transform dispatch.
   - Done: Quality-first DCT16 + DCT32 entropy-based merging (hierarchical),
     special-transform candidates, AFV candidates, proper separable forward DCT-N,
-    loss term infrastructure for future per-block selection.
-  - Remaining: `FindBest8x8Transform` per-block selection (requires working
-    perceptual loss term -- entropy-only selection destroys quality),
-    DCT16x8/8x16 merging, `FindBestFirstLevelDivisionForSquare`.
+    loss term infrastructure, full FindBest8x8Transform port (analyzed and
+    confirmed degenerate at d<=4.0 -- libjxl also keeps all-DCT8).
+  - Remaining: DCT16x8/8x16 rectangular merges, `AdjustQuantField` for
+    merged regions.
 - [x] E03 Quant field generation pipeline (full libjxl Squirrel-speed AQ port).
 - [x] E04 LF/HF coefficient tokenization and entropy coding.
 - [~] E05 Quality tuning heuristics and effort tiers.
