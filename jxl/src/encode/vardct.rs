@@ -248,10 +248,16 @@ fn apply_inverse_gaborish_weighted(
         let w_far_diag = nm * K[4];
 
         let input = chan.to_vec();
+        // Mirror boundary conditions, matching libjxl's Symmetric5 convolution.
+        let mirror = |v: isize, max: isize| -> usize {
+            if v < 0 { (-v) as usize }
+            else if v >= max { (2 * max - 2 - v) as usize }
+            else { v as usize }
+        };
+        let w_i = width as isize;
+        let h_i = height as isize;
         let get = |x: isize, y: isize| -> f32 {
-            let cx = x.clamp(0, width as isize - 1) as usize;
-            let cy = y.clamp(0, height as isize - 1) as usize;
-            input[cy * width + cx]
+            input[mirror(y, h_i) * width + mirror(x, w_i)]
         };
 
         for y in 0..height {
@@ -325,10 +331,11 @@ pub fn encode_vardct_u8_rgb_codestream(
     let bh = height.div_ceil(8);
     let num_blocks = bw * bh;
 
-    // --- libjxl encoder flow (enc_heuristics.cc) ---
+    // --- libjxl encoder flow (enc_heuristics.cc, Squirrel default speed) ---
     // 1. Compute AQ map on ORIGINAL opsin (before inverse gaborish).
-    //    global_scale is derived from the quant field median (libjxl style).
-    let quant_ac = 0.79f32 / config.distance;
+    //    kAcQuant = 0.765 for AdaptiveQuantizationMap scale.
+    //    global_scale from ComputeGlobalScaleAndQuant(quant_dc, 0.39/d, 0).
+    let quant_ac = 0.765f32 / config.distance;
     let (adaptive_map, global_scale, quant_lf) = build_adaptive_raw_quant_map_full(
         &x_chan, &y_chan, &b_chan,
         width, height, bw, bh, config.distance, quant_ac,
@@ -991,25 +998,19 @@ fn build_adaptive_raw_quant_map_full(
     // Step 1: Compute initial aq_map from Y-channel Laplacian masking
     let mut aq_map = compute_aq_map(xyb_y, img_w, img_h, bw, bh, distance);
 
-    // Step 2: Apply per-block modulations (ComputeMask + Gamma + HF + Blue)
+    // Step 2: Apply per-block modulations (ComputeMask + Gamma + HF + Blue).
+    // libjxl PerBlockModulations uses quant_ac as the `scale` parameter.
     let scale = quant_ac;
     apply_per_block_modulations(&mut aq_map, xyb_x, xyb_y, xyb_b, img_w, img_h, bw, bh, distance, scale);
 
     // Step 3: Convert float aq_map to raw_quant (integer).
-    // libjxl computes global_scale from the median of the quant field via
-    // ComputeGlobalScaleAndQuant. We do the same: find the median of our
-    // aq_map and use it to set global_scale, then convert all values.
-    // Compute median and median absolute deviation, matching libjxl's
-    // SetQuantField -> ComputeGlobalScaleAndQuant.
-    let mut sorted_aq = aq_map.clone();
-    sorted_aq.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let quant_median = sorted_aq[sorted_aq.len() / 2];
-    let mut deviations: Vec<f32> = aq_map.iter().map(|&v| (v - quant_median).abs()).collect();
-    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let quant_median_absd = deviations[deviations.len() / 2];
-
+    // libjxl Squirrel path: ComputeGlobalScaleAndQuant(quant_dc, 0.39/d, 0)
+    // sets global_scale from 0.39/d with absd=0, NOT from the AQ map median.
+    // Then SetQuantFieldRect converts each aq_map[i] to
+    //   raw_quant = clamp(aq_map[i] * inv_global_scale + 0.5, 1, 255).
+    let q_for_global_scale = 0.39 / distance;
     let (global_scale, quant_lf, _) =
-        compute_global_scale_and_quant_full(distance, quant_median, quant_median_absd);
+        compute_global_scale_and_quant(distance, q_for_global_scale);
     let inv_global_scale = 65536.0 / global_scale as f32;
 
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
