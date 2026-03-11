@@ -406,6 +406,25 @@ pub fn encode_modular_signed_stream(
         .map(|&v| pack_signed(v) as u64)
         .sum();
 
+    // Average predictor (4): (L + T) / 2
+    let mut avg_residuals = Vec::with_capacity(data.len());
+    for c in 0..num_channels {
+        let ch = &data[c * channel_size..(c + 1) * channel_size];
+        for y in 0..height {
+            for x in 0..width {
+                let val = ch[y * width + x];
+                let left = if x > 0 { ch[y * width + x - 1] } else { 0 };
+                let top = if y > 0 { ch[(y - 1) * width + x] } else { 0 };
+                let avg = (left + top) / 2;
+                avg_residuals.push(val - avg);
+            }
+        }
+    }
+    let avg_cost: u64 = avg_residuals
+        .iter()
+        .map(|&v| pack_signed(v) as u64)
+        .sum();
+
     // Pick the best
     let mut best_cost = zero_cost;
     let mut best_predictor = 0u32;
@@ -425,6 +444,11 @@ pub fn encode_modular_signed_stream(
         best_cost = top_cost;
         best_predictor = 2;
         best_residuals = Some(top_residuals);
+    }
+    if avg_cost < best_cost {
+        best_cost = avg_cost;
+        best_predictor = 4;
+        best_residuals = Some(avg_residuals);
     }
     let _ = best_cost;
 
