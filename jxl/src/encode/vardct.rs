@@ -641,12 +641,15 @@ fn quantize_vardct_blocks(
             let ac_y = dct_y[blk * 64 + k];
             let ac_b = dct_b[blk * 64 + k] - ytob_ratio * dct_y[blk * 64 + k];
 
+            let scale_x = if dw_x.abs() > 1e-10 { (global_scale as f32 * raw_quant as f32) / (65536.0 * dw_x) } else { 0.0 };
+            let scale_y = if dw_y.abs() > 1e-10 { (global_scale as f32 * raw_quant as f32) / (65536.0 * dw_y) } else { 0.0 };
+            let scale_b = if dw_b.abs() > 1e-10 { (global_scale as f32 * raw_quant as f32) / (65536.0 * dw_b) } else { 0.0 };
             qx[blk * 64 + k] =
-                quantize_ac(ac_x, global_scale, raw_quant, dw_x, AC_DEAD_ZONE);
+                quantize_ac(ac_x, global_scale, raw_quant, dw_x, ac_dead_zone_from_scale(scale_x));
             qy[blk * 64 + k] =
-                quantize_ac(ac_y, global_scale, raw_quant, dw_y, AC_DEAD_ZONE);
+                quantize_ac(ac_y, global_scale, raw_quant, dw_y, ac_dead_zone_from_scale(scale_y));
             qb[blk * 64 + k] =
-                quantize_ac(ac_b, global_scale, raw_quant, dw_b, AC_DEAD_ZONE);
+                quantize_ac(ac_b, global_scale, raw_quant, dw_b, ac_dead_zone_from_scale(scale_b));
         }
     }
 
@@ -749,17 +752,14 @@ fn build_adaptive_raw_quant_map_with_profile(
     let bq = base_quant as i16;
     let cq = |offset: i16| (bq + offset).clamp(1, 255) as u8;
     let (thresholds, quant_levels, num_levels): ([f32; 3], [u8; 4], usize) = if distance < 1.5 {
-        // At low distance: narrow range base +/- 1
-        ([percentile(p(0.40)), 0.0, 0.0], [cq(1), cq(-1), 0, 0], 2)
-    } else if distance < 2.5 {
-        // Medium distance: base +/- 2
+        // At low distance: wider range to let smooth areas save bytes
         (
-            [percentile(p(0.30)), percentile(p(0.60)), 0.0],
-            [cq(2), cq(0), cq(-2), 0],
+            [percentile(p(0.25)), percentile(p(0.55)), 0.0],
+            [cq(2), cq(0), cq(-1), 0],
             3,
         )
-    } else {
-        // High distance: base +/- 3
+    } else if distance < 2.5 {
+        // Medium distance: base +/- 3
         (
             [
                 percentile(p(0.20)),
@@ -767,6 +767,17 @@ fn build_adaptive_raw_quant_map_with_profile(
                 percentile(p(0.70)),
             ],
             [cq(3), cq(1), cq(-1), cq(-2)],
+            4,
+        )
+    } else {
+        // High distance: base +/- 4
+        (
+            [
+                percentile(p(0.20)),
+                percentile(p(0.45)),
+                percentile(p(0.70)),
+            ],
+            [cq(4), cq(1), cq(-1), cq(-3)],
             4,
         )
     };
@@ -788,7 +799,7 @@ fn build_adaptive_raw_quant_map_with_profile(
         for by in 0..bh {
             for bx in 0..bw {
                 let idx = by * bw + bx;
-                let mut hist = [0u8; 9];
+                let mut hist = [0u8; 256];
                 let mut add = |q: u8| hist[q as usize] = hist[q as usize].saturating_add(1);
 
                 add(prev[idx]);
@@ -1826,26 +1837,33 @@ fn prepare_ac_for_transform_map_with_cache(
             for coeff_index in 0..coeff_count {
                 let storage_index =
                     transform_coeff_index_to_block_storage(bw, bx, by, cx, coeff_index);
+                let dw_x = wx[coeff_index] * x_dm_multiplier;
+                let dw_y = wy[coeff_index];
+                let dw_b = wb[coeff_index] * b_dm_multiplier;
+                let gs_rq = global_scale as f32 * raw_quant as f32;
+                let sx = if dw_x.abs() > 1e-10 { gs_rq / (65536.0 * dw_x) } else { 0.0 };
+                let sy = if dw_y.abs() > 1e-10 { gs_rq / (65536.0 * dw_y) } else { 0.0 };
+                let sb = if dw_b.abs() > 1e-10 { gs_rq / (65536.0 * dw_b) } else { 0.0 };
                 ac_x[storage_index] = quantize_ac(
                     coeffs[0][coeff_index],
                     global_scale,
                     raw_quant,
-                    wx[coeff_index] * x_dm_multiplier,
-                    AC_DEAD_ZONE,
+                    dw_x,
+                    ac_dead_zone_from_scale(sx),
                 );
                 ac_y[storage_index] = quantize_ac(
                     coeffs[1][coeff_index],
                     global_scale,
                     raw_quant,
-                    wy[coeff_index],
-                    AC_DEAD_ZONE,
+                    dw_y,
+                    ac_dead_zone_from_scale(sy),
                 );
                 ac_b[storage_index] = quantize_ac(
                     coeffs[2][coeff_index],
                     global_scale,
                     raw_quant,
-                    wb[coeff_index] * b_dm_multiplier,
-                    AC_DEAD_ZONE,
+                    dw_b,
+                    ac_dead_zone_from_scale(sb),
                 );
             }
         }
@@ -2660,9 +2678,31 @@ fn quantize_ac(
     }
 }
 
-/// Default dead-zone for AC quantization.
-/// Values in [-0.5-DZ, 0.5+DZ) are rounded to zero.
-const AC_DEAD_ZONE: f32 = 0.25;
+/// Dead-zone for AC quantization, varying by dequant weight.
+/// Low dequant weight = visually important = small dead-zone (preserve detail).
+/// High dequant weight = less important = large dead-zone (save bytes).
+/// Returns dead-zone given the dequant_weight for the coefficient.
+#[inline]
+/// Compute dead-zone from the effective quantization scale.
+/// scale = global_scale * raw_quant / (65536 * dequant_weight).
+/// High scale = fine quantization (many non-zero coefficients) = needs larger dead-zone.
+/// Low scale = coarse quantization = naturally few non-zeros = small dead-zone sufficient.
+#[inline]
+fn ac_dead_zone_from_scale(scale: f32) -> f32 {
+    // Scale-dependent dead-zone:
+    // Low scale (coarse quant, high distance) -> small dead-zone
+    // High scale (fine quant, low distance) -> larger dead-zone for HF savings
+    // Preserves low-frequency sharpness while aggressively zeroing HF.
+    if scale < 80.0 {
+        0.05
+    } else if scale < 200.0 {
+        0.10
+    } else if scale < 350.0 {
+        0.20
+    } else {
+        0.30
+    }
+}
 
 /// Build the complete VarDCT frame bitstream.
 fn encode_vardct_frame(
@@ -7877,3 +7917,4 @@ mod tests {
         }
     }
 }
+
