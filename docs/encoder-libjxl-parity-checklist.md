@@ -59,7 +59,9 @@ Recent incremental VarDCT prototype progress (this branch):
   predictors by estimated cost. Massive savings at d=3 (-39% photo, -48% flat).
 - `[x]` Coefficient order infrastructure: data-driven 8x8 order computation and
   Lehmer-code permutation encoder in place (activates when order differs from natural).
-- `[x]` Inverse Gaborish 5x5 kernel implemented (currently deferred pending butteraugli).
+- `[x]` Inverse Gaborish enabled: pre-sharpens opsin before DCT, matching libjxl's
+  `enc_heuristics.cc` flow (AQ on original opsin -> GaborishInverse -> DCT).
+  Eliminates decoder-side gaborish blur. Source image PSNR jumped 26->34 dB.
 - `[x]` Added conservative small-special candidate generation (`DCT4X8`/`DCT8X4`,
   `IDENTITY`/`DCT2X2`/`DCT4X4`, plus mixed special maps) and sparse AFV candidate
   generation for high-distance modes on moderate grids, all gated by exact-byte
