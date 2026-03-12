@@ -8,9 +8,20 @@
 //! Converts sRGB u8 pixels to the XYB color space used by VarDCT encoding.
 //! This is the exact inverse of the decoder's `XybStage`.
 
-use crate::util::{Matrix3x3, inv_3x3_matrix};
+use crate::{
+    error::{Error, Result},
+    util::Matrix3x3,
+};
+
+/// Default opsin biases (same for all 3 channels).
+#[allow(clippy::excessive_precision)]
+const DEFAULT_OPSIN_BIAS: f32 = -0.0037930732552754493;
+
+/// Default intensity target (nits).
+const DEFAULT_INTENSITY_TARGET: f32 = 255.0;
 
 /// Default opsin inverse matrix (from `OpsinInverseMatrix` defaults in transform_data.rs).
+#[cfg(test)]
 #[allow(clippy::excessive_precision)]
 const DEFAULT_INVERSE_MATRIX: [f32; 9] = [
     11.031566901960783,
@@ -24,35 +35,12 @@ const DEFAULT_INVERSE_MATRIX: [f32; 9] = [
     1.9459282392156863,
 ];
 
-/// Default opsin biases (same for all 3 channels).
-#[allow(clippy::excessive_precision)]
-const DEFAULT_OPSIN_BIAS: f32 = -0.0037930732552754493;
-
-/// Default intensity target (nits).
-const DEFAULT_INTENSITY_TARGET: f32 = 255.0;
-
-/// Compute the forward opsin absorbance matrix (inverse of the inverse matrix).
-fn compute_forward_matrix() -> Matrix3x3<f64> {
-    let inv = [
-        [
-            DEFAULT_INVERSE_MATRIX[0] as f64,
-            DEFAULT_INVERSE_MATRIX[1] as f64,
-            DEFAULT_INVERSE_MATRIX[2] as f64,
-        ],
-        [
-            DEFAULT_INVERSE_MATRIX[3] as f64,
-            DEFAULT_INVERSE_MATRIX[4] as f64,
-            DEFAULT_INVERSE_MATRIX[5] as f64,
-        ],
-        [
-            DEFAULT_INVERSE_MATRIX[6] as f64,
-            DEFAULT_INVERSE_MATRIX[7] as f64,
-            DEFAULT_INVERSE_MATRIX[8] as f64,
-        ],
-    ];
-    // The forward matrix is the inverse of the inverse matrix.
-    inv_3x3_matrix(&inv).expect("default opsin inverse matrix is invertible")
-}
+/// Forward opsin absorbance matrix (inverse of DEFAULT_INVERSE_MATRIX).
+const DEFAULT_FORWARD_MATRIX: Matrix3x3<f64> = [
+    [0.2999999989467609, 0.6219999966883528, 0.0779999996754753],
+    [0.2299999984251923, 0.6919999951851371, 0.0779999995041812],
+    [0.2434226894556144, 0.2047674443555890, 0.5518098669709147],
+];
 
 /// Apply the sRGB transfer function in reverse: sRGB -> linear.
 ///
@@ -83,14 +71,25 @@ pub fn srgb_u8_to_xyb(
     out_x: &mut [f32],
     out_y: &mut [f32],
     out_b: &mut [f32],
-) {
-    assert_eq!(rgb.len(), width * height * 3);
-    let npixels = width * height;
-    assert_eq!(out_x.len(), npixels);
-    assert_eq!(out_y.len(), npixels);
-    assert_eq!(out_b.len(), npixels);
+) -> Result<()> {
+    let npixels = width
+        .checked_mul(height)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let expected_rgb = npixels.checked_mul(3).ok_or(Error::ArithmeticOverflow)?;
+    if rgb.len() != expected_rgb {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: expected_rgb,
+            actual: rgb.len(),
+        });
+    }
+    if out_x.len() != npixels || out_y.len() != npixels || out_b.len() != npixels {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: npixels,
+            actual: out_x.len().min(out_y.len()).min(out_b.len()),
+        });
+    }
 
-    let forward_mat = compute_forward_matrix();
+    let forward_mat = DEFAULT_FORWARD_MATRIX;
     let bias = DEFAULT_OPSIN_BIAS;
     let bias_cbrt = bias.cbrt();
     let intensity_target = DEFAULT_INTENSITY_TARGET;
@@ -141,6 +140,8 @@ pub fn srgb_u8_to_xyb(
         out_y[i] = y;
         out_b[i] = b_out;
     }
+
+    Ok(())
 }
 
 /// Convert XYB float channels back to sRGB u8 (for testing).
@@ -220,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_forward_matrix_invertible() {
-        let fwd = compute_forward_matrix();
+        let fwd = DEFAULT_FORWARD_MATRIX;
         // Verify forward * inverse = identity
         let inv = [
             [
@@ -270,7 +271,7 @@ mod tests {
             let mut y = [0.0f32; 1];
             let mut b = [0.0f32; 1];
 
-            srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b);
+            srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b).unwrap();
 
             // Convert back
             let mut out = [0u8; 3];
@@ -293,7 +294,7 @@ mod tests {
             let mut y = [0.0f32; 1];
             let mut b = [0.0f32; 1];
 
-            srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b);
+            srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b).unwrap();
 
             let mut out = [0u8; 3];
             xyb_to_srgb_u8(&x, &y, &b, 1, 1, &mut out);
@@ -315,7 +316,7 @@ mod tests {
         let mut y = vec![0.0f32; npixels];
         let mut b = vec![0.0f32; npixels];
 
-        srgb_u8_to_xyb(&rgb, npixels, 1, &mut x, &mut y, &mut b);
+        srgb_u8_to_xyb(&rgb, npixels, 1, &mut x, &mut y, &mut b).unwrap();
 
         let mut out = vec![0u8; npixels * 3];
         xyb_to_srgb_u8(&x, &y, &b, npixels, 1, &mut out);
@@ -340,7 +341,7 @@ mod tests {
         let mut y = [0.0f32; 1];
         let mut b = [0.0f32; 1];
 
-        srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b);
+        srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b).unwrap();
 
         // X should be very close to 0 (symmetric for achromatic colors)
         assert!(x[0].abs() < 0.001, "x for black = {}", x[0]);
@@ -356,7 +357,7 @@ mod tests {
         let mut y = [0.0f32; 1];
         let mut b = [0.0f32; 1];
 
-        srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b);
+        srgb_u8_to_xyb(&rgb, 1, 1, &mut x, &mut y, &mut b).unwrap();
 
         // X should be near 0 for achromatic
         assert!(x[0].abs() < 0.01, "x for white = {}", x[0]);
@@ -382,7 +383,7 @@ mod tests {
         let mut x = [0.0f32; 1];
         let mut y = [0.0f32; 1];
         let mut b = [0.0f32; 1];
-        srgb_u8_to_xyb(&rgb_red, 1, 1, &mut x, &mut y, &mut b);
+        srgb_u8_to_xyb(&rgb_red, 1, 1, &mut x, &mut y, &mut b).unwrap();
 
         // Check against decoder's expected XYB values
         assert!(

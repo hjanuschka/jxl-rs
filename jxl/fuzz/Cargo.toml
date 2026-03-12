@@ -38,3 +38,21 @@ name = "encode_bit_writer_roundtrip"
 path = "fuzz_targets/encode_bit_writer_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "encode_vardct_smoke"
+path = "fuzz_targets/encode_vardct_smoke.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_api_smoke"
+path = "fuzz_targets/encode_api_smoke.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_progressive_alpha_smoke"
+path = "fuzz_targets/encode_progressive_alpha_smoke.rs"
+test = false
+doc = false

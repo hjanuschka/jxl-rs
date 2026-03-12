@@ -26,6 +26,10 @@ struct Opt {
     #[arg(long, default_value_t = 7)]
     effort: u8,
 
+    /// Enable multi-pass progressive VarDCT output
+    #[arg(long)]
+    progressive: bool,
+
     /// Use modular (lossless) encoding instead of VarDCT
     #[arg(long)]
     modular: bool,
@@ -168,6 +172,7 @@ fn encode_animation_from_dir(opt: &Opt, dir: &PathBuf) -> Result<()> {
         let config = VarDctConfig {
             distance: opt.distance,
             effort: opt.effort,
+            progressive: opt.progressive,
         };
         let bytes =
             encode_vardct_animation_u8_rgba(&frame_refs, width as usize, height as usize, &config)
@@ -256,6 +261,7 @@ fn encode_animation_from_dir(opt: &Opt, dir: &PathBuf) -> Result<()> {
     let config = VarDctConfig {
         distance: opt.distance,
         effort: opt.effort,
+        progressive: opt.progressive,
     };
     let bytes =
         encode_vardct_animation_u8_rgb(&frame_refs, width as usize, height as usize, &config)
@@ -528,6 +534,7 @@ fn main() -> Result<()> {
             let config = VarDctConfig {
                 distance: opt.distance,
                 effort: opt.effort,
+                progressive: opt.progressive,
             };
             if opt.bare {
                 encode_vardct_u8_rgb_codestream(&rgb, width as usize, height as usize, &config)
@@ -580,6 +587,7 @@ fn main() -> Result<()> {
         let config = VarDctConfig {
             distance: opt.distance,
             effort: opt.effort,
+            progressive: opt.progressive,
         };
         let bytes = encode_vardct_u8_rgba(&rgba, width as usize, height as usize, &config)
             .map_err(|e| color_eyre::eyre::eyre!("RGBA encode failed: {e:?}"))?;

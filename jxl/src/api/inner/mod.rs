@@ -6,12 +6,13 @@
 #[cfg(test)]
 use crate::api::FrameCallback;
 use crate::{
-    api::{JxlFrameHeader, VisibleFrameInfo, VisibleFrameSeekTarget},
+    api::JxlFrameHeader,
     error::{Error, Result},
 };
 
 use super::{JxlBasicInfo, JxlColorProfile, JxlDecoderOptions, JxlPixelFormat};
 use crate::container::frame_index::FrameIndexBox;
+use crate::jpeg::JpegReconstructionData;
 use box_parser::BoxParser;
 use codestream_parser::CodestreamParser;
 
@@ -141,27 +142,14 @@ impl JxlDecoderInner {
         self.box_parser.frame_index.as_ref()
     }
 
-    /// Returns visible frame info entries collected during parsing.
-    pub fn scanned_frames(&self) -> &[VisibleFrameInfo] {
-        &self.codestream_parser.scanned_frames
+    /// Returns JPEG reconstruction data parsed from a `jbrd` box, if present.
+    pub fn jpeg_reconstruction_data(&self) -> Option<&JpegReconstructionData> {
+        self.box_parser.jpeg_reconstruction.as_ref()
     }
 
-    /// Resets frame-level state to prepare for decoding a new frame.
-    ///
-    /// Preserves image-level state (file header, decoder state including
-    /// reference frames, color profiles, pixel format). Clears frame header,
-    /// TOC, section buffers, and restores the box parser to the correct
-    /// state so the next `process()` call parses a new frame header.
-    ///
-    /// The `seek_target` comes from `VisibleFrameInfo::seek_target`. It tells
-    /// the decoder which container box position to seek to and how many visible
-    /// frames to skip before the target frame. The caller must provide raw file
-    /// input starting from `seek_target.decode_start_file_offset`.
-    pub fn start_new_frame(&mut self, seek_target: VisibleFrameSeekTarget) {
-        self.box_parser
-            .reset_for_codestream_seek(seek_target.remaining_in_box);
-        self.codestream_parser
-            .start_new_frame(seek_target.visible_frames_to_skip);
+    /// Returns whether a `jbrd` JPEG reconstruction box was found.
+    pub fn has_jpeg_reconstruction(&self) -> bool {
+        self.box_parser.jpeg_reconstruction.is_some()
     }
 
     #[cfg(test)]

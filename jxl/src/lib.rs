@@ -17,6 +17,7 @@ pub mod frame;
 pub mod headers;
 pub mod icc;
 pub mod image;
+pub mod jpeg;
 pub mod render;
 pub mod util;
 

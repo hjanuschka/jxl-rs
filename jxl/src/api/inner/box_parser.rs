@@ -7,6 +7,7 @@ use std::io::IoSliceMut;
 
 use crate::container::frame_index::FrameIndexBox;
 use crate::error::{Error, Result};
+use crate::jpeg::JpegReconstructionData;
 
 use crate::api::{
     JxlBitstreamInput, JxlSignatureType, check_signature_internal, inner::process::SmallBuffer,
@@ -20,6 +21,8 @@ enum ParseState {
     SkippableBox(u64),
     /// Buffering a jxli box: (remaining bytes, accumulated content).
     BufferingFrameIndex(u64, Vec<u8>),
+    /// Buffering a jbrd box: (remaining bytes, accumulated content).
+    BufferingJpegReconstruction(u64, Vec<u8>),
 }
 
 enum CodestreamBoxType {
@@ -35,8 +38,8 @@ pub(super) struct BoxParser {
     box_type: CodestreamBoxType,
     /// Parsed frame index box, if present in the file.
     pub(super) frame_index: Option<FrameIndexBox>,
-    /// Total file bytes consumed from the underlying input.
-    pub(super) total_file_consumed: u64,
+    /// Parsed JPEG reconstruction data (`jbrd`), if present in the file.
+    pub(super) jpeg_reconstruction: Option<JpegReconstructionData>,
 }
 
 impl BoxParser {
@@ -46,7 +49,7 @@ impl BoxParser {
             state: ParseState::SignatureNeeded,
             box_type: CodestreamBoxType::None,
             frame_index: None,
-            total_file_consumed: 0,
+            jpeg_reconstruction: None,
         }
     }
 
@@ -60,8 +63,7 @@ impl BoxParser {
         loop {
             match self.state.clone() {
                 ParseState::SignatureNeeded => {
-                    let read = self.box_buffer.refill(|b| input.read(b), None)?;
-                    self.total_file_consumed += read as u64;
+                    self.box_buffer.refill(|b| input.read(b), None)?;
                     match check_signature_internal(&self.box_buffer)? {
                         None => return Err(Error::InvalidSignature),
                         Some(JxlSignatureType::Codestream) => {
@@ -83,9 +85,7 @@ impl BoxParser {
                     let skipped = if !self.box_buffer.is_empty() {
                         self.box_buffer.consume(num)
                     } else {
-                        let skipped = input.skip(num)?;
-                        self.total_file_consumed += skipped as u64;
-                        skipped
+                        input.skip(num)?
                     };
                     if skipped == 0 {
                         return Err(Error::OutOfBounds(num));
@@ -108,7 +108,6 @@ impl BoxParser {
                         let old_len = buf.len();
                         buf.resize(old_len + num, 0);
                         let read = input.read(&mut [IoSliceMut::new(&mut buf[old_len..])])?;
-                        self.total_file_consumed += read as u64;
                         if read == 0 {
                             return Err(Error::OutOfBounds(num));
                         }
@@ -123,9 +122,32 @@ impl BoxParser {
                         self.state = ParseState::BufferingFrameIndex(remaining, buf);
                     }
                 }
+                ParseState::BufferingJpegReconstruction(mut remaining, mut buf) => {
+                    let num = remaining.min(usize::MAX as u64) as usize;
+                    if !self.box_buffer.is_empty() {
+                        let take = num.min(self.box_buffer.len());
+                        buf.extend_from_slice(&self.box_buffer[..take]);
+                        self.box_buffer.consume(take);
+                        remaining -= take as u64;
+                    } else {
+                        let old_len = buf.len();
+                        buf.resize(old_len + num, 0);
+                        let read = input.read(&mut [IoSliceMut::new(&mut buf[old_len..])])?;
+                        if read == 0 {
+                            return Err(Error::OutOfBounds(num));
+                        }
+                        buf.truncate(old_len + read);
+                        remaining -= read as u64;
+                    }
+                    if remaining == 0 {
+                        self.jpeg_reconstruction = Some(JpegReconstructionData::parse(&buf)?);
+                        self.state = ParseState::BoxNeeded;
+                    } else {
+                        self.state = ParseState::BufferingJpegReconstruction(remaining, buf);
+                    }
+                }
                 ParseState::BoxNeeded => {
-                    let read = self.box_buffer.refill(|b| input.read(b), None)?;
-                    self.total_file_consumed += read as u64;
+                    self.box_buffer.refill(|b| input.read(b), None)?;
                     let min_len = match &self.box_buffer[..] {
                         [0, 0, 0, 1, ..] => 16,
                         _ => 8,
@@ -203,6 +225,20 @@ impl BoxParser {
                                 );
                             }
                         }
+                        b"jbrd" => {
+                            if content_len == u64::MAX {
+                                return Err(Error::InvalidBox);
+                            }
+                            // Keep same conservative size cap as jxli buffering.
+                            if content_len > 16 * 1024 * 1024 {
+                                self.state = ParseState::SkippableBox(content_len);
+                            } else {
+                                self.state = ParseState::BufferingJpegReconstruction(
+                                    content_len,
+                                    Vec::with_capacity(content_len as usize),
+                                );
+                            }
+                        }
                         _ => {
                             self.state = ParseState::SkippableBox(content_len);
                         }
@@ -211,26 +247,6 @@ impl BoxParser {
                 }
             }
         }
-    }
-
-    /// Accounts file bytes consumed directly by codestream parser reads/skips.
-    pub(super) fn mark_file_consumed(&mut self, amount: usize) {
-        self.total_file_consumed += amount as u64;
-    }
-
-    /// Resets the box parser for seeking to a specific codestream position.
-    ///
-    /// Sets the parser to `CodestreamBox(remaining)` state with cleared
-    /// buffers.  The caller must provide raw input starting from the file
-    /// position that corresponds to the target codestream offset.
-    ///
-    /// `remaining` is the number of codestream bytes left in the current
-    /// box from the target file position.  For bare-codestream files this
-    /// is `u64::MAX`.
-    pub(super) fn reset_for_codestream_seek(&mut self, remaining: u64) {
-        self.box_buffer = SmallBuffer::new(128);
-        self.state = ParseState::CodestreamBox(remaining);
-        // Keep frame_index unchanged.
     }
 
     pub(super) fn consume_codestream(&mut self, amount: u64) {
