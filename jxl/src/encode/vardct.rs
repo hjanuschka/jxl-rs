@@ -4517,6 +4517,20 @@ fn encode_vardct_frame_inner(
             vec![None; num_groups]
         };
 
+        // Optional custom coefficient order for DCT8 (global for all HF groups).
+        let custom_orders_8x8 = if effort >= 8 {
+            let orders = compute_optimal_coeff_orders_8x8(
+                ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh,
+            );
+            if orders != [natural_coeff_order_8x8(); 3] {
+                Some(orders)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // --- Phase 1: Tokenize ALL HF groups' AC data to build global histogram ---
         let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
 
@@ -4543,7 +4557,7 @@ fn encode_vardct_frame_inner(
                 gh,
                 num_contexts,
                 0,
-                None, // TODO: add custom orders for multi-group
+                custom_orders_8x8.as_ref(),
                 Some(raw_quant_map),
                 block_ctx.as_ref(),
             )?;
@@ -4652,6 +4666,7 @@ fn encode_vardct_frame_inner(
                     &context_map,
                     &uint_config,
                     &distributions,
+                    custom_orders_8x8.as_ref(),
                 )?;
                 let mut hf_groups = Vec::with_capacity(num_groups);
                 for g in 0..num_groups {
@@ -4677,8 +4692,13 @@ fn encode_vardct_frame_inner(
             }
 
             let codes = build_huffman_codes_from_frequencies(&cluster_frequencies)?;
-            let hf_global =
-                encode_hf_global_section_with_code(num_groups, &context_map, &uint_config, &codes)?;
+            let hf_global = encode_hf_global_section_with_code(
+                num_groups,
+                &context_map,
+                &uint_config,
+                &codes,
+                custom_orders_8x8.as_ref(),
+            )?;
             let mut hf_groups = Vec::with_capacity(num_groups);
             for g in 0..num_groups {
                 let at = alpha_tiles[g]
@@ -6422,6 +6442,7 @@ fn encode_hf_global_section_with_code(
     context_map: &[u8],
     uint_config: &crate::encode::entropy::HybridUintConfig,
     codes: &[crate::encode::entropy::huffman_encode::HuffmanCode],
+    custom_orders_8x8: Option<&[[usize; 64]; 3]>, // [Y, X, B]
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -6438,9 +6459,18 @@ fn encode_hf_global_section_with_code(
         w.write(num_histo_bits as usize, 0)?;
     }
 
-    // Per-pass data (1 pass):
-    // used_orders: selector 2 = no custom orders (natural order)
-    w.write(2, 2)?;
+    // Per-pass data (1 pass): used_orders + optional custom coeff orders.
+    if let Some(orders) = custom_orders_8x8 {
+        // used_orders = 1 (only DCT8x8), encoded with selector=3 (Bits(13)).
+        w.write(2, 3)?;
+        w.write(13, 1)?;
+        // Decoder expects coeff-order channels in [X, Y, B]; `orders` is [Y, X, B].
+        let decoder_order = [orders[1], orders[0], orders[2]];
+        encode_coeff_orders(&mut w, &decoder_order)?;
+    } else {
+        // used_orders selector 2 = value 0 (natural order)
+        w.write(2, 2)?;
+    }
 
     // Write Histograms header (tables only, no token data)
     let uint_configs = vec![*uint_config; codes.len()];
@@ -6461,6 +6491,7 @@ fn encode_hf_global_section_with_ans(
     context_map: &[u8],
     uint_config: &crate::encode::entropy::HybridUintConfig,
     distributions: &[crate::encode::entropy::ans::AnsDistribution],
+    custom_orders_8x8: Option<&[[usize; 64]; 3]>, // [Y, X, B]
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -6477,8 +6508,15 @@ fn encode_hf_global_section_with_ans(
         w.write(num_histo_bits as usize, 0)?;
     }
 
-    // Per-pass data (1 pass): used_orders selector = 2 (natural order)
-    w.write(2, 2)?;
+    // Per-pass data (1 pass): used_orders + optional custom coeff orders.
+    if let Some(orders) = custom_orders_8x8 {
+        w.write(2, 3)?;
+        w.write(13, 1)?;
+        let decoder_order = [orders[1], orders[0], orders[2]];
+        encode_coeff_orders(&mut w, &decoder_order)?;
+    } else {
+        w.write(2, 2)?;
+    }
 
     // Write ANS histograms header (tables only, no token data)
     let uint_configs = vec![*uint_config; distributions.len()];
