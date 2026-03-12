@@ -9019,11 +9019,14 @@ mod tests {
         let buf = &frames[0][0];
         eprintln!("16x16 quad-color test: decoded OK");
         // Check corners - should roughly match input colors (DC-only = block average)
-        for (qx, qy, label) in [
-            (0, 0, "TL-Red"),
-            (1, 0, "TR-Green"),
-            (0, 1, "BL-Blue"),
-            (1, 1, "BR-Yellow"),
+        // Verify dominant channel for each quadrant.
+        // TL=Red (R high, G/B low), TR=Green (G high, R/B low),
+        // BL=Blue (B high, R/G low), BR=Yellow (R+G high, B low).
+        for (qx, qy, label, expect_r_hi, expect_g_hi, expect_b_hi) in [
+            (0, 0, "TL-Red", true, false, false),
+            (1, 0, "TR-Green", false, true, false),
+            (0, 1, "BL-Blue", false, false, true),
+            (1, 1, "BR-Yellow", true, true, false),
         ] {
             let x = qx * 8 + 4;
             let y = qy * 8 + 4;
@@ -9032,6 +9035,21 @@ mod tests {
             let g = (row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
             let b = (row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
             eprintln!("  {} center: ({},{},{})", label, r, g, b);
+            if expect_r_hi {
+                assert!(r > 180, "{label}: R should be high, got {r}");
+            } else {
+                assert!(r < 80, "{label}: R should be low, got {r}");
+            }
+            if expect_g_hi {
+                assert!(g > 180, "{label}: G should be high, got {g}");
+            } else {
+                assert!(g < 80, "{label}: G should be low, got {g}");
+            }
+            if expect_b_hi {
+                assert!(b > 180, "{label}: B should be high, got {b}");
+            } else {
+                assert!(b < 100, "{label}: B should be low, got {b}");
+            }
         }
 
         // Also write to file for djxl verification
