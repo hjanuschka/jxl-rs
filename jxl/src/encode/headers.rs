@@ -197,7 +197,7 @@ pub(crate) fn write_image_metadata_animated(
     writer.write(1, 0)?;
 
     // bit_depth: default 8-bit int
-    writer.write(1, 0)?;  // floating_point_sample = false
+    writer.write(1, 0)?; // floating_point_sample = false
     write_u32(writer, &bit_depth_int_coder(), 8)?;
 
     // modular_16bit_sufficient = true
@@ -230,7 +230,7 @@ pub(crate) fn write_image_metadata_with_alpha(writer: &mut BitWriter) -> Result<
     writer.write(1, 0)?;
 
     // bit_depth: 8-bit integer default
-    writer.write(1, 0)?;  // floating_point_sample = false
+    writer.write(1, 0)?; // floating_point_sample = false
     write_u32(writer, &bit_depth_int_coder(), 8)?;
 
     // modular_16bit_sufficient = true
@@ -382,15 +382,8 @@ fn tps_denominator_coder() -> U32Coder {
 
 fn num_loops_coder() -> U32Coder {
     // u2S(0, Bits(3), Bits(16), Bits(32))
-    U32Coder::Select(
-        U32::Val(0),
-        U32::Bits(3),
-        U32::Bits(16),
-        U32::Bits(32),
-    )
+    U32Coder::Select(U32::Val(0), U32::Bits(3), U32::Bits(16), U32::Bits(32))
 }
-
-
 
 pub(crate) fn write_file_header(
     writer: &mut BitWriter,
@@ -660,33 +653,37 @@ pub fn encode_minimal_modular_image_codestream(size: (u32, u32)) -> Result<Vec<u
 /// The encoding uses the West (left) predictor with offset 0 for good
 /// compression of smooth images; channel-major, row-major order.
 pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
+    encode_modular_u8_rgb_image_codestream_with_mode(size, rgb, false)
+}
+
+pub(crate) fn encode_modular_u8_rgb_image_codestream_with_mode(
+    size: (u32, u32),
+    rgb: &[u8],
+    fast_lossless: bool,
+) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
     validate_rgb_u8_buffer(width, height, rgb)?;
 
-    let uint_config = HybridUintConfig::new(4, 2, 0);
-    let predictor = 1u32; // West (left neighbor)
+    let uint_config = if fast_lossless {
+        HybridUintConfig::new(3, 1, 0)
+    } else {
+        HybridUintConfig::new(4, 2, 0)
+    };
 
     let width_usize = width as usize;
     let num_groups = default_num_groups(width, height);
     let num_lf_groups = default_num_lf_groups(width, height);
     let num_groups_x = width.div_ceil(256);
 
-    /// Collect signed residuals for a group region using the West predictor.
-    ///
-    /// Matches the decoder's `PredictionData::get_rows` behavior for `Predictor::West`:
-    /// - x=0, y=0: prediction = 0 (no neighbors)
-    /// - x=0, y>0: prediction = sample[0, y-1] (top pixel at x=0)
-    /// - x>0: prediction = sample[x-1, y] (left neighbor)
-    ///
-    /// The tree leaf `offset` is added to the prediction by the decoder, so
-    /// residual = sample - (prediction + offset).
-    fn collect_group_residuals_west(
+    /// Collect signed residuals for a group region using a modular predictor.
+    fn collect_group_residuals_predictor(
         rgb: &[u8],
         width_usize: usize,
         origin: (u32, u32),
         group_size: (u32, u32),
         offset: i32,
+        predictor: u32,
     ) -> Vec<i32> {
         let (ox, oy) = origin;
         let (gw, gh) = group_size;
@@ -695,15 +692,23 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
 
         // Channel-major, row-major within each channel.
         for channel in 0..3 {
-            // Track the first column of the previous row for the West predictor fallback.
             let mut prev_row_first = 0i32;
 
             for y in oy..(oy + gh) {
                 let local_y = (y - oy) as usize;
-                // First pixel in row: West prediction = top pixel at x=0 (y>0) or 0 (y=0).
-                let first_pred = if local_y > 0 { prev_row_first } else { 0 };
                 let first_pixel_index = y as usize * width_usize + ox as usize;
                 let first_sample = i32::from(rgb[first_pixel_index * 3 + channel]);
+
+                let first_pred = match predictor {
+                    1 => {
+                        if local_y > 0 {
+                            prev_row_first
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                };
                 residuals.push(first_sample - (first_pred + offset));
                 prev_row_first = first_sample;
 
@@ -711,7 +716,11 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
                 for x in (ox + 1)..(ox + gw) {
                     let pixel_index = y as usize * width_usize + x as usize;
                     let sample = i32::from(rgb[pixel_index * 3 + channel]);
-                    residuals.push(sample - (prev + offset));
+                    let pred = match predictor {
+                        1 => prev,
+                        _ => 0,
+                    };
+                    residuals.push(sample - (pred + offset));
                     prev = sample;
                 }
             }
@@ -719,18 +728,52 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         residuals
     }
 
+    fn residual_score(residuals: &[i32]) -> u64 {
+        residuals
+            .iter()
+            .map(|&v| (v as i64).unsigned_abs())
+            .sum::<u64>()
+    }
+
     // Single-group path: LF global section contains tree + residuals.
     if num_groups == 1 {
-        let offset = 0i32; // West predictor doesn't need a nonzero offset
-        let residuals =
-            collect_group_residuals_west(rgb, width_usize, (0, 0), (width, height), offset);
+        let offset = 0i32;
+        let mut best_predictor = if fast_lossless { 1u32 } else { 0u32 };
+        let mut best_residuals = collect_group_residuals_predictor(
+            rgb,
+            width_usize,
+            (0, 0),
+            (width, height),
+            offset,
+            best_predictor,
+        );
+        let mut best_score = residual_score(&best_residuals);
+
+        if !fast_lossless {
+            for predictor in [1u32] {
+                let residuals = collect_group_residuals_predictor(
+                    rgb,
+                    width_usize,
+                    (0, 0),
+                    (width, height),
+                    offset,
+                    predictor,
+                );
+                let score = residual_score(&residuals);
+                if score < best_score {
+                    best_score = score;
+                    best_predictor = predictor;
+                    best_residuals = residuals;
+                }
+            }
+        }
 
         let mut lf_global_writer = BitWriter::new();
         write_lf_global_section_huffman(
             &mut lf_global_writer,
             offset,
-            predictor,
-            Some(&residuals),
+            best_predictor,
+            Some(&best_residuals),
             uint_config,
         )?;
         let lf_global_section = lf_global_writer.finish();
@@ -751,7 +794,7 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
     // - section N+1: HF global (empty)
     // - section N+2..: HF groups (local tree + residual data)
     let mut lf_global_writer = BitWriter::new();
-    write_lf_global_section_huffman(&mut lf_global_writer, 0, predictor, None, uint_config)?;
+    write_lf_global_section_huffman(&mut lf_global_writer, 0, 0, None, uint_config)?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
@@ -764,14 +807,42 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
         let gh = (height - oy).min(256);
 
         let offset = 0i32;
-        let residuals = collect_group_residuals_west(rgb, width_usize, (ox, oy), (gw, gh), offset);
+        let mut best_predictor = if fast_lossless { 1u32 } else { 0u32 };
+        let mut best_residuals = collect_group_residuals_predictor(
+            rgb,
+            width_usize,
+            (ox, oy),
+            (gw, gh),
+            offset,
+            best_predictor,
+        );
+        let mut best_score = residual_score(&best_residuals);
+
+        if !fast_lossless {
+            for predictor in [1u32] {
+                let residuals = collect_group_residuals_predictor(
+                    rgb,
+                    width_usize,
+                    (ox, oy),
+                    (gw, gh),
+                    offset,
+                    predictor,
+                );
+                let score = residual_score(&residuals);
+                if score < best_score {
+                    best_score = score;
+                    best_predictor = predictor;
+                    best_residuals = residuals;
+                }
+            }
+        }
 
         let mut group_writer = BitWriter::new();
         write_hf_group_section_huffman(
             &mut group_writer,
             offset,
-            predictor,
-            &residuals,
+            best_predictor,
+            &best_residuals,
             uint_config,
         )?;
         hf_group_sections.push(group_writer.finish());
@@ -803,6 +874,14 @@ pub fn encode_modular_u8_rgb_image_codestream(size: (u32, u32), rgb: &[u8]) -> R
 /// modular image with `color_space=Gray`, avoiding the 3x data expansion of
 /// converting gray to RGB.
 pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) -> Result<Vec<u8>> {
+    encode_modular_u8_gray_image_codestream_with_mode(size, gray, false)
+}
+
+pub(crate) fn encode_modular_u8_gray_image_codestream_with_mode(
+    size: (u32, u32),
+    gray: &[u8],
+    fast_lossless: bool,
+) -> Result<Vec<u8>> {
     let (width, height) = size;
     validate_size(width, height)?;
     let expected_len = (width as usize) * (height as usize);
@@ -813,20 +892,24 @@ pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) ->
         });
     }
 
-    let uint_config = HybridUintConfig::new(4, 2, 0);
-    let predictor = 1u32; // West
+    let uint_config = if fast_lossless {
+        HybridUintConfig::new(3, 1, 0)
+    } else {
+        HybridUintConfig::new(4, 2, 0)
+    };
 
     let width_usize = width as usize;
     let num_groups = default_num_groups(width, height);
     let num_lf_groups = default_num_lf_groups(width, height);
     let num_groups_x = width.div_ceil(256);
 
-    /// Collect signed residuals for a gray group region using the West predictor.
-    fn collect_gray_residuals_west(
+    /// Collect signed residuals for a gray group region using a predictor.
+    fn collect_gray_residuals_predictor(
         gray: &[u8],
         width_usize: usize,
         origin: (u32, u32),
         group_size: (u32, u32),
+        predictor: u32,
     ) -> Vec<i32> {
         let (ox, oy) = origin;
         let (gw, gh) = group_size;
@@ -836,7 +919,16 @@ pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) ->
         let mut prev_row_first = 0i32;
         for y in oy..(oy + gh) {
             let local_y = (y - oy) as usize;
-            let first_pred = if local_y > 0 { prev_row_first } else { 0 };
+            let first_pred = match predictor {
+                1 => {
+                    if local_y > 0 {
+                        prev_row_first
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
             let first_idx = y as usize * width_usize + ox as usize;
             let first_sample = i32::from(gray[first_idx]);
             residuals.push(first_sample - first_pred);
@@ -846,23 +938,59 @@ pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) ->
             for x in (ox + 1)..(ox + gw) {
                 let idx = y as usize * width_usize + x as usize;
                 let sample = i32::from(gray[idx]);
-                residuals.push(sample - prev);
+                let pred = match predictor {
+                    1 => prev,
+                    _ => 0,
+                };
+                residuals.push(sample - pred);
                 prev = sample;
             }
         }
         residuals
     }
 
+    fn residual_score(residuals: &[i32]) -> u64 {
+        residuals
+            .iter()
+            .map(|&v| (v as i64).unsigned_abs())
+            .sum::<u64>()
+    }
+
     // Single-group path
     if num_groups == 1 {
-        let residuals = collect_gray_residuals_west(gray, width_usize, (0, 0), (width, height));
+        let mut best_predictor = if fast_lossless { 1u32 } else { 0u32 };
+        let mut best_residuals = collect_gray_residuals_predictor(
+            gray,
+            width_usize,
+            (0, 0),
+            (width, height),
+            best_predictor,
+        );
+        let mut best_score = residual_score(&best_residuals);
+        if !fast_lossless {
+            for predictor in [1u32] {
+                let residuals = collect_gray_residuals_predictor(
+                    gray,
+                    width_usize,
+                    (0, 0),
+                    (width, height),
+                    predictor,
+                );
+                let score = residual_score(&residuals);
+                if score < best_score {
+                    best_score = score;
+                    best_predictor = predictor;
+                    best_residuals = residuals;
+                }
+            }
+        }
 
         let mut lf_global_writer = BitWriter::new();
         write_lf_global_section_huffman(
             &mut lf_global_writer,
             0,
-            predictor,
-            Some(&residuals),
+            best_predictor,
+            Some(&best_residuals),
             uint_config,
         )?;
         let lf_global_section = lf_global_writer.finish();
@@ -878,7 +1006,7 @@ pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) ->
 
     // Multi-group path
     let mut lf_global_writer = BitWriter::new();
-    write_lf_global_section_huffman(&mut lf_global_writer, 0, predictor, None, uint_config)?;
+    write_lf_global_section_huffman(&mut lf_global_writer, 0, 0, None, uint_config)?;
     let lf_global_section = lf_global_writer.finish();
 
     let mut hf_group_sections = Vec::with_capacity(num_groups as usize);
@@ -890,9 +1018,41 @@ pub fn encode_modular_u8_gray_image_codestream(size: (u32, u32), gray: &[u8]) ->
         let gw = (width - ox).min(256);
         let gh = (height - oy).min(256);
 
-        let residuals = collect_gray_residuals_west(gray, width_usize, (ox, oy), (gw, gh));
+        let mut best_predictor = if fast_lossless { 1u32 } else { 0u32 };
+        let mut best_residuals = collect_gray_residuals_predictor(
+            gray,
+            width_usize,
+            (ox, oy),
+            (gw, gh),
+            best_predictor,
+        );
+        let mut best_score = residual_score(&best_residuals);
+        if !fast_lossless {
+            for predictor in [1u32] {
+                let residuals = collect_gray_residuals_predictor(
+                    gray,
+                    width_usize,
+                    (ox, oy),
+                    (gw, gh),
+                    predictor,
+                );
+                let score = residual_score(&residuals);
+                if score < best_score {
+                    best_score = score;
+                    best_predictor = predictor;
+                    best_residuals = residuals;
+                }
+            }
+        }
+
         let mut group_writer = BitWriter::new();
-        write_hf_group_section_huffman(&mut group_writer, 0, predictor, &residuals, uint_config)?;
+        write_hf_group_section_huffman(
+            &mut group_writer,
+            0,
+            best_predictor,
+            &best_residuals,
+            uint_config,
+        )?;
         hf_group_sections.push(group_writer.finish());
     }
 

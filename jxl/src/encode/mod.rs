@@ -12,8 +12,10 @@ pub mod headers;
 pub mod input;
 pub mod modular;
 pub mod modular_encode;
+pub mod modular_transforms;
 pub mod options;
 pub mod toc;
+pub mod tools;
 pub mod vardct;
 pub mod xyb;
 
@@ -44,5 +46,5 @@ pub use modular::{
     write_single_leaf_tree_with_entropy_params, write_single_leaf_tree_with_offset,
     write_single_leaf_tree_with_params, write_split0_fixed_token_signed_stream,
 };
-pub use options::JxlEncoderOptions;
+pub use options::{JxlEncoderMode, JxlEncoderOptions};
 pub use toc::write_toc;

@@ -140,6 +140,10 @@ pub enum Error {
     InvalidPixelBufferLength { expected: usize, actual: usize },
     #[error("Invalid pixel row stride: minimum {minimum}, got {actual}")]
     InvalidPixelRowStride { minimum: usize, actual: usize },
+    #[error("Encoded output too large: {actual} bytes (limit {limit} bytes)")]
+    EncodedOutputTooLarge { actual: usize, limit: usize },
+    #[error("Invalid encoder thread count: {0}")]
+    InvalidThreadCount(usize),
     #[error("Value {value} cannot be encoded with fixed split0 token {token}")]
     InvalidFixedTokenValue { token: u32, value: u32 },
     // Generic arithmetic overflow. Prefer using other errors if possible.

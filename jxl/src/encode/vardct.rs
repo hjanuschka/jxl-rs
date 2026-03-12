@@ -139,6 +139,8 @@ pub struct VarDctConfig {
     pub distance: f32,
     /// Effort tier in [1..=9], where higher values spend more CPU for better R-D.
     pub effort: u8,
+    /// Emit multi-pass progressive VarDCT AC sections.
+    pub progressive: bool,
 }
 
 impl Default for VarDctConfig {
@@ -146,6 +148,7 @@ impl Default for VarDctConfig {
         Self {
             distance: 1.0,
             effort: 7,
+            progressive: false,
         }
     }
 }
@@ -157,23 +160,58 @@ struct EffortParams {
     enable_custom_coeff_orders: bool,
 }
 
-fn effort_params(effort: u8) -> EffortParams {
+/// Maps encoder effort `1..=9` to a libjxl-like speed tier index.
+///
+/// libjxl maps effort to `SpeedTier` via `speed_tier = 10 - effort`.
+/// We use the same numeric mapping to gate heuristics consistently.
+fn effort_to_speed_tier_index(effort: u8) -> u8 {
     let e = effort.clamp(1, 9);
-    let max_total_encodes = match e {
-        1 => 4,
-        2 => 6,
-        3 => 8,
-        4 => 12,
-        5 => 16,
-        6 => 24,
-        7 => 32,
-        8 => 40,
-        _ => 56,
+    10 - e
+}
+
+fn effort_params(effort: u8) -> EffortParams {
+    let speed_tier = effort_to_speed_tier_index(effort);
+
+    // Candidate budget: larger at slower (higher quality) effort tiers.
+    let max_total_encodes = match speed_tier {
+        9 => 4,  // Lightning (effort 1)
+        8 => 6,  // Thunder   (effort 2)
+        7 => 8,  // Falcon    (effort 3)
+        6 => 12, // Cheetah   (effort 4)
+        5 => 18, // Hare      (effort 5)
+        4 => 26, // Wombat    (effort 6)
+        3 => 36, // Squirrel  (effort 7)
+        2 => 48, // Kitten    (effort 8)
+        _ => 64, // Tortoise-ish (effort 9)
     };
+
     EffortParams {
+        // Enable entropy-merge heuristics from Hare-and-slower style tiers.
+        enable_entropy_merge: speed_tier <= 5,
+        // Enable custom coefficient orders from Squirrel-and-slower tiers.
+        enable_custom_coeff_orders: speed_tier <= 3,
         max_total_encodes,
-        enable_entropy_merge: e >= 4,
-        enable_custom_coeff_orders: e >= 6,
+    }
+}
+
+fn choose_progressive_pass_plan(
+    progressive: bool,
+    has_alpha: bool,
+    effort: u8,
+    width: usize,
+    height: usize,
+) -> (usize, Vec<u32>) {
+    if !progressive || has_alpha {
+        return (1, vec![]);
+    }
+
+    let pixels = width.saturating_mul(height);
+    // Fuller progressive scheduling: use 3 passes at highest effort for larger
+    // images, otherwise keep robust 2-pass mode.
+    if effort >= 9 && pixels >= 768 * 512 {
+        (3, vec![2, 1])
+    } else {
+        (2, vec![1])
     }
 }
 
@@ -424,6 +462,90 @@ fn simplify_invisible_xyb(
     simplify_invisible_channel(b, alpha, width, height);
 }
 
+fn quantize_alpha_for_lossy_step(alpha: &[u8], step: u16) -> Vec<u8> {
+    if step <= 1 {
+        return alpha.to_vec();
+    }
+
+    alpha
+        .iter()
+        .map(|&a| {
+            if a == 0 || a == 255 {
+                return a;
+            }
+            let aa = a as u16;
+            let q = ((aa + step / 2) / step) * step;
+            q.clamp(1, 254) as u8
+        })
+        .collect()
+}
+
+fn alpha_psnr_db(orig: &[u8], cand: &[u8]) -> f32 {
+    if orig.is_empty() {
+        return 99.0;
+    }
+    let mse = orig
+        .iter()
+        .zip(cand.iter())
+        .map(|(&o, &c)| {
+            let d = o as f32 - c as f32;
+            d * d
+        })
+        .sum::<f32>()
+        / orig.len() as f32;
+    if mse <= 1e-9 {
+        99.0
+    } else {
+        10.0 * ((255.0f32 * 255.0) / mse).log10()
+    }
+}
+
+fn estimate_alpha_modular_bytes(alpha: &[u8], width: usize, height: usize) -> Result<usize> {
+    let mut w = BitWriter::new();
+    let alpha_i32: Vec<i32> = alpha.iter().map(|&a| a as i32).collect();
+    crate::encode::modular_encode::encode_modular_signed_stream(&mut w, width, height, 1, &alpha_i32)?;
+    w.byte_align_zero_pad()?;
+    Ok(w.finish().len())
+}
+
+fn choose_lossy_alpha_candidate(
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    distance: f32,
+    effort: u8,
+) -> Result<Vec<u8>> {
+    if distance <= 0.0 || effort < 5 {
+        return Ok(alpha.to_vec());
+    }
+
+    let psnr_floor = if distance <= 1.0 {
+        49.0
+    } else if distance <= 2.0 {
+        44.0
+    } else {
+        40.0
+    };
+
+    let mut best = alpha.to_vec();
+    let mut best_bytes = estimate_alpha_modular_bytes(&best, width, height)?;
+
+    for &step in &[2u16, 3, 4, 6, 8, 12, 16, 24, 32] {
+        let cand = quantize_alpha_for_lossy_step(alpha, step);
+        let psnr = alpha_psnr_db(alpha, &cand);
+        if psnr < psnr_floor {
+            continue;
+        }
+        let bytes = estimate_alpha_modular_bytes(&cand, width, height)?;
+        if bytes < best_bytes {
+            best_bytes = bytes;
+            best = cand;
+        }
+    }
+
+    Ok(best)
+}
+
 // Heuristic: spend more bits on blocks that mix transparent and opaque pixels.
 // This targets RGBA edge halos ("glow") by reducing color quantization error
 // exactly where alpha compositing is most sensitive.
@@ -471,13 +593,7 @@ fn boost_quant_on_alpha_edges(
 // Flat-region optimization for line-art / logo-like inputs.
 // Adds an additional quant-map candidate that spends fewer bits on large,
 // very flat interiors while keeping edge blocks less affected.
-fn detect_flat_graphic(
-    y_chan: &[f32],
-    width: usize,
-    height: usize,
-    bw: usize,
-    bh: usize,
-) -> bool {
+fn detect_flat_graphic(y_chan: &[f32], width: usize, height: usize, bw: usize, bh: usize) -> bool {
     let num_blocks = bw * bh;
     if num_blocks == 0 {
         return false;
@@ -781,11 +897,29 @@ fn encode_single_rgba_frame(
     }
     assert!(width > 0 && height > 0);
 
+    let mut alpha_owned = None;
+    let alpha = if let Some(a) = alpha {
+        if config.distance > 0.0 {
+            alpha_owned = Some(choose_lossy_alpha_candidate(
+                a,
+                width,
+                height,
+                config.distance,
+                config.effort,
+            )?);
+            alpha_owned.as_deref()
+        } else {
+            Some(a)
+        }
+    } else {
+        None
+    };
+
     let npixels = width * height;
     let mut x_chan = vec![0.0f32; npixels];
     let mut y_chan = vec![0.0f32; npixels];
     let mut b_chan = vec![0.0f32; npixels];
-    srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
+    srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan)?;
 
     // Match libjxl enc_frame.cc:SimplifyInvisible for lossy non-associated alpha.
     // This only touches fully invisible pixels (alpha == 0).
@@ -796,6 +930,7 @@ fn encode_single_rgba_frame(
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
     let num_blocks = bw * bh;
+    let is_flat_graphic_pre = detect_flat_graphic(&y_chan, width, height, bw, bh);
 
     // --- libjxl encoder flow (enc_heuristics.cc, Squirrel default speed) ---
     // 1. Compute AQ map on ORIGINAL opsin (before inverse gaborish).
@@ -822,10 +957,17 @@ fn encode_single_rgba_frame(
         adaptive_map,                  // libjxl-style adaptive candidate
     ];
 
-    // For RGBA input, improve color fidelity on translucent edges.
+    // For RGBA input, add boosted quant candidates for translucent edges,
+    // but keep non-boosted maps available for size wins.
     if let Some(a) = alpha {
-        for map in &mut raw_quant_map_candidates {
+        let mut boosted = raw_quant_map_candidates.clone();
+        for map in &mut boosted {
             boost_quant_on_alpha_edges(map, a, width, height, bw, bh);
+        }
+        for map in boosted {
+            if !raw_quant_map_candidates.contains(&map) {
+                raw_quant_map_candidates.push(map);
+            }
         }
     }
 
@@ -841,16 +983,32 @@ fn encode_single_rgba_frame(
     ) {
         raw_quant_map_candidates.push(flat_map);
     }
-    if let Some(flat_map_aggr) = apply_flat_region_quant_boost(
-        &raw_quant_map_candidates[1],
-        &y_chan,
-        width,
-        height,
-        bw,
-        bh,
-        1.8,
-    ) {
+    if config.distance > 1.2
+        && let Some(flat_map_aggr) = apply_flat_region_quant_boost(
+            &raw_quant_map_candidates[1],
+            &y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            1.8,
+        )
+    {
         raw_quant_map_candidates.push(flat_map_aggr);
+    }
+    if config.distance > 1.6
+        && is_flat_graphic_pre
+        && let Some(flat_map_ultra) = apply_flat_region_quant_boost(
+            &raw_quant_map_candidates[1],
+            &y_chan,
+            width,
+            height,
+            bw,
+            bh,
+            2.6,
+        )
+    {
+        raw_quant_map_candidates.push(flat_map_ultra);
     }
 
     // Compute per-pixel masking field for AC strategy loss estimation.
@@ -862,7 +1020,6 @@ fn encode_single_rgba_frame(
     // per-block transform selection. The decoder applies gaborish smoothing,
     // so the viewer sees approximately the original opsin, not the sharpened version.
     let orig_y_chan = y_chan.clone();
-    let is_flat_graphic_pre = detect_flat_graphic(&y_chan, width, height, bw, bh);
 
     // 2. Apply inverse gaborish to opsin (libjxl: GaborishInverse after AQ).
     //    For very flat graphics/logos, skip gab to avoid edge halo overhead.
@@ -1011,6 +1168,7 @@ fn encode_single_rgba_frame(
                 anim_params.is_none(), // include file header only for standalone images
                 alpha,
                 config.effort,
+                config.progressive,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -1063,6 +1221,7 @@ fn encode_single_rgba_frame(
                     anim_params.is_none(),
                     alpha,
                     config.effort,
+                    config.progressive,
                 )?;
 
                 total_encodes += 1;
@@ -4454,6 +4613,7 @@ fn encode_vardct_frame(
         true, // no animation, include file header
         None, // no alpha
         7,
+        false,
     )
 }
 
@@ -4482,6 +4642,7 @@ fn encode_vardct_frame_inner(
     include_file_header: bool,
     alpha: Option<&[u8]>,
     effort: u8,
+    progressive: bool,
 ) -> Result<Vec<u8>> {
     let has_alpha = alpha.is_some();
     let num_extra_channels = if has_alpha { 1u32 } else { 0 };
@@ -4503,6 +4664,9 @@ fn encode_vardct_frame_inner(
     // The decoder byte-aligns before frame-header parsing.
     writer.byte_align_zero_pad()?;
 
+    let (progressive_num_passes, progressive_pass_shifts) =
+        choose_progressive_pass_plan(progressive, alpha.is_some(), effort, width, height);
+
     // Frame header (VarDCT)
     write_vardct_frame_header_full(
         &mut writer,
@@ -4512,6 +4676,8 @@ fn encode_vardct_frame_inner(
             have_animation: anim_params.is_some(),
             duration: anim_params.map_or(0, |ap| ap.duration),
             is_last: anim_params.map_or(true, |ap| ap.is_last),
+            num_passes: progressive_num_passes as u32,
+            pass_shifts: progressive_pass_shifts.clone(),
         },
     )?;
 
@@ -4524,7 +4690,7 @@ fn encode_vardct_frame_inner(
     assert_eq!(raw_quant_map.len(), bw * bh);
     assert_eq!(transform_map.len(), bw * bh);
 
-    if num_groups == 1 {
+    if num_groups == 1 && !(progressive && alpha.is_none()) {
         // Single-group image: 1 TOC entry, everything in one section.
         let section = encode_single_group_section(
             bw,
@@ -4567,7 +4733,8 @@ fn encode_vardct_frame_inner(
         let num_lf_groups_y = bh.div_ceil(lf_group_dim_blocks);
         let num_lf_groups = num_lf_groups_x * num_lf_groups_y;
 
-        let total_sections = 2 + num_lf_groups + num_groups;
+        let num_passes = progressive_num_passes;
+        let total_sections = 2 + num_lf_groups + num_groups * num_passes;
         let mut sections: Vec<Vec<u8>> = Vec::with_capacity(total_sections);
 
         // Block context map: currently disabled as the overhead exceeds savings
@@ -4601,10 +4768,10 @@ fn encode_vardct_frame_inner(
         };
 
         // Optional custom coefficient order for DCT8 (global for all HF groups).
-        let custom_orders_8x8 = if effort >= 8 {
-            let orders = compute_optimal_coeff_orders_8x8(
-                ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh,
-            );
+        let effort_cfg = effort_params(effort);
+        let custom_orders_8x8 = if effort_cfg.enable_custom_coeff_orders && num_passes == 1 {
+            let orders =
+                compute_optimal_coeff_orders_8x8(ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh);
             if orders != [natural_coeff_order_8x8(); 3] {
                 Some(orders)
             } else {
@@ -4617,8 +4784,76 @@ fn encode_vardct_frame_inner(
         // --- Phase 1: Tokenize ALL HF groups' AC data to build global histogram ---
         let num_ac_contexts = num_contexts * (NON_ZERO_BUCKETS + ZERO_DENSITY_CONTEXT_COUNT);
 
-        // Per-HF-group token lists
-        let mut group_tokens: Vec<Vec<AcToken>> = Vec::with_capacity(num_groups);
+        // Per-pass, per-HF-group token lists.
+        let mut group_tokens_passes: Vec<Vec<Vec<AcToken>>> =
+            vec![Vec::with_capacity(num_groups); num_passes];
+
+        // Progressive split: early passes carry coarse coefficients, final pass
+        // carries residual refinement.
+        let mut pass_ac_x: Vec<Vec<i32>> = vec![vec![0i32; ac_x.len()]; num_passes];
+        let mut pass_ac_y: Vec<Vec<i32>> = vec![vec![0i32; ac_y.len()]; num_passes];
+        let mut pass_ac_b: Vec<Vec<i32>> = vec![vec![0i32; ac_b.len()]; num_passes];
+        if num_passes == 1 {
+            pass_ac_x[0].copy_from_slice(ac_x);
+            pass_ac_y[0].copy_from_slice(ac_y);
+            pass_ac_b[0].copy_from_slice(ac_b);
+        } else {
+            let pass_shifts: Vec<i32> = progressive_pass_shifts
+                .iter()
+                .copied()
+                .map(|s| s as i32)
+                .collect();
+
+            let prog_residual_keep_coeffs: usize = if effort <= 3 {
+                40
+            } else if effort <= 5 {
+                48
+            } else if effort <= 7 {
+                52
+            } else {
+                64
+            };
+            let prog_mid_keep_coeffs: usize = if num_passes >= 3 {
+                if effort <= 7 { 56 } else { 48 }
+            } else {
+                64
+            };
+
+            for i in 0..ac_x.len() {
+                let mut rx = ac_x[i];
+                let mut ry = ac_y[i];
+                let mut rb = ac_b[i];
+                let k = i % 64;
+
+                for p in 0..(num_passes - 1) {
+                    let s = pass_shifts.get(p).copied().unwrap_or(0).clamp(0, 3);
+                    let bx = rx >> s;
+                    let by = ry >> s;
+                    let bb = rb >> s;
+
+                    let keep_this_pass = if num_passes >= 3 && p == num_passes - 2 {
+                        k < prog_mid_keep_coeffs
+                    } else {
+                        true
+                    };
+
+                    if keep_this_pass {
+                        pass_ac_x[p][i] = bx;
+                        pass_ac_y[p][i] = by;
+                        pass_ac_b[p][i] = bb;
+                        rx -= bx << s;
+                        ry -= by << s;
+                        rb -= bb << s;
+                    }
+                }
+
+                if k < prog_residual_keep_coeffs {
+                    pass_ac_x[num_passes - 1][i] = rx;
+                    pass_ac_y[num_passes - 1][i] = ry;
+                    pass_ac_b[num_passes - 1][i] = rb;
+                }
+            }
+        }
 
         for g in 0..num_groups {
             let gx = g % num_groups_x;
@@ -4628,42 +4863,71 @@ fn encode_vardct_frame_inner(
             let gw = (x0 + group_dim_blocks).min(bw) - x0;
             let gh = (y0 + group_dim_blocks).min(bh) - y0;
 
-            let tokens = tokenize_hf_region(
-                ac_x,
-                ac_y,
-                ac_b,
-                transform_map,
-                bw,
-                x0,
-                y0,
-                gw,
-                gh,
-                num_contexts,
-                0,
-                custom_orders_8x8.as_ref(),
-                Some(raw_quant_map),
-                block_ctx.as_ref(),
-            )?;
-            group_tokens.push(tokens);
+            for pass in 0..num_passes {
+                let tokens_p = tokenize_hf_region(
+                    &pass_ac_x[pass],
+                    &pass_ac_y[pass],
+                    &pass_ac_b[pass],
+                    transform_map,
+                    bw,
+                    x0,
+                    y0,
+                    gw,
+                    gh,
+                    num_contexts,
+                    0,
+                    custom_orders_8x8.as_ref(),
+                    Some(raw_quant_map),
+                    block_ctx.as_ref(),
+                )?;
+                group_tokens_passes[pass].push(tokens_p);
+            }
         }
 
-        // Build global token frequencies from all groups.
-        let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
-        let all_encoded: Vec<Vec<_>> = group_tokens
+        // Build token encodings for each pass/group.
+        let per_pass_uint_configs: Vec<crate::encode::entropy::HybridUintConfig> =
+            if num_passes > 1 {
+                vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0); num_passes]
+            } else {
+                vec![crate::encode::entropy::HybridUintConfig::new(4, 1, 2)]
+            };
+        let all_encoded_passes: Vec<Vec<Vec<crate::encode::entropy::HybridUintEncoded>>> =
+            group_tokens_passes
+                .iter()
+                .enumerate()
+                .map(|(pass, group_tokens)| {
+                    let uint_config = per_pass_uint_configs
+                        .get(pass)
+                        .copied()
+                        .unwrap_or(per_pass_uint_configs[0]);
+                    group_tokens
+                        .iter()
+                        .map(|tokens| {
+                            tokens
+                                .iter()
+                                .map(|t| uint_config.encode(t.value))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        let max_token = all_encoded_passes
             .iter()
-            .map(|tokens| {
-                tokens
-                    .iter()
-                    .map(|t| uint_config.encode(t.value))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let max_token = all_encoded
-            .iter()
+            .flat_map(|per_pass| per_pass.iter())
             .flat_map(|enc| enc.iter().map(|e| e.token))
             .max()
             .unwrap_or(0);
         let alphabet_size = (max_token as usize + 1).max(1);
+
+        let mut merged_group_tokens: Vec<Vec<AcToken>> = vec![Vec::new(); num_groups];
+        let mut merged_all_encoded: Vec<Vec<crate::encode::entropy::HybridUintEncoded>> =
+            vec![Vec::new(); num_groups];
+        for pass in 0..num_passes {
+            for g in 0..num_groups {
+                merged_group_tokens[g].extend(group_tokens_passes[pass][g].iter().copied());
+                merged_all_encoded[g].extend(all_encoded_passes[pass][g].iter().copied());
+            }
+        }
 
         // --- Phase 2: Write sections ---
 
@@ -4696,23 +4960,30 @@ fn encode_vardct_frame_inner(
         }
 
         let mut context_counts = vec![0u64; num_ac_contexts];
-        for tokens in &group_tokens {
+        for tokens in &merged_group_tokens {
             for token in tokens {
                 context_counts[token.context] += 1;
             }
         }
 
-        // Build context map candidates: preset heuristics + data-driven greedy clustering.
-        let mut context_map_candidates =
-            build_ac_context_map_candidates(num_ac_contexts, &context_counts);
-        {
+        // Build context map candidates.
+        let mut context_map_candidates = if num_passes > 1 {
+            // Conservative progressive mode: single AC histogram cluster for robustness.
+            vec![vec![0u8; num_ac_contexts]]
+        } else {
+            build_ac_context_map_candidates(num_ac_contexts, &context_counts)
+        };
+        if num_passes == 1 {
             // Build combined tokens+encoded for greedy clustering.
-            let all_tokens_flat: Vec<AcToken> = group_tokens
+            let all_tokens_flat: Vec<AcToken> = merged_group_tokens
                 .iter()
                 .flat_map(|t| t.iter().copied())
                 .collect();
             let all_encoded_flat: Vec<crate::encode::entropy::HybridUintEncoded> =
-                all_encoded.iter().flat_map(|e| e.iter().copied()).collect();
+                merged_all_encoded
+                    .iter()
+                    .flat_map(|e| e.iter().copied())
+                    .collect();
             for max_c in [2, 4, 8, 16, 32] {
                 if max_c <= num_ac_contexts {
                     let greedy_map = build_greedy_clustered_context_map(
@@ -4729,6 +5000,13 @@ fn encode_vardct_frame_inner(
             }
         }
 
+        // num_histograms is serialized with ceil_log2(num_groups) bits in HFGlobal,
+        // so cluster count must not exceed num_groups.
+        context_map_candidates.retain(|m| num_clusters_in_context_map(m) <= num_groups);
+        if context_map_candidates.is_empty() {
+            context_map_candidates.push(vec![0u8; num_ac_contexts]);
+        }
+
         // Evaluate entropy candidates by exact encoded section size and keep the best.
         let mut best_bits = usize::MAX;
         let mut best_hf_global = None;
@@ -4738,8 +5016,8 @@ fn encode_vardct_frame_inner(
             let cluster_frequencies = build_cluster_frequencies_for_groups(
                 &context_map,
                 alphabet_size,
-                &group_tokens,
-                &all_encoded,
+                &merged_group_tokens,
+                &merged_all_encoded,
             )?;
 
             if USE_ANS_AC_ENTROPY {
@@ -4747,23 +5025,30 @@ fn encode_vardct_frame_inner(
                 let hf_global = encode_hf_global_section_with_ans(
                     num_groups,
                     &context_map,
-                    &uint_config,
+                    &per_pass_uint_configs[0],
                     &distributions,
                     custom_orders_8x8.as_ref(),
+                    num_passes,
                 )?;
-                let mut hf_groups = Vec::with_capacity(num_groups);
-                for g in 0..num_groups {
-                    let at = alpha_tiles[g]
-                        .as_ref()
-                        .map(|(d, w, h)| (d.as_slice(), *w, *h));
-                    hf_groups.push(encode_hf_group_tokens_ans(
-                        num_groups,
-                        &group_tokens[g],
-                        &all_encoded[g],
-                        &context_map,
-                        &distributions,
-                        at,
-                    )?);
+                let mut hf_groups = Vec::with_capacity(num_groups * num_passes);
+                for pass in 0..num_passes {
+                    for g in 0..num_groups {
+                        let at = if pass == 0 {
+                            alpha_tiles[g]
+                                .as_ref()
+                                .map(|(d, w, h)| (d.as_slice(), *w, *h))
+                        } else {
+                            None
+                        };
+                        hf_groups.push(encode_hf_group_tokens_ans(
+                            1,
+                            &group_tokens_passes[pass][g],
+                            &all_encoded_passes[pass][g],
+                            &context_map,
+                            &distributions,
+                            at,
+                        )?);
+                    }
                 }
                 let bits =
                     hf_global.len() * 8 + hf_groups.iter().map(|s| s.len() * 8).sum::<usize>();
@@ -4774,27 +5059,45 @@ fn encode_vardct_frame_inner(
                 }
             }
 
-            let codes = build_huffman_codes_from_frequencies(&cluster_frequencies)?;
+            let mut codes_per_pass: Vec<Vec<crate::encode::entropy::huffman_encode::HuffmanCode>> =
+                Vec::with_capacity(num_passes);
+            for pass in 0..num_passes {
+                let freqs_pass = build_cluster_frequencies_for_groups(
+                    &context_map,
+                    alphabet_size,
+                    &group_tokens_passes[pass],
+                    &all_encoded_passes[pass],
+                )?;
+                codes_per_pass.push(build_huffman_codes_from_frequencies(&freqs_pass)?);
+            }
+
             let hf_global = encode_hf_global_section_with_code(
                 num_groups,
                 &context_map,
-                &uint_config,
-                &codes,
+                &per_pass_uint_configs,
+                &codes_per_pass,
                 custom_orders_8x8.as_ref(),
+                num_passes,
             )?;
-            let mut hf_groups = Vec::with_capacity(num_groups);
-            for g in 0..num_groups {
-                let at = alpha_tiles[g]
-                    .as_ref()
-                    .map(|(d, w, h)| (d.as_slice(), *w, *h));
-                hf_groups.push(encode_hf_group_tokens(
-                    num_groups,
-                    &group_tokens[g],
-                    &all_encoded[g],
-                    &context_map,
-                    &codes,
-                    at,
-                )?);
+            let mut hf_groups = Vec::with_capacity(num_groups * num_passes);
+            for pass in 0..num_passes {
+                for g in 0..num_groups {
+                    let at = if pass == 0 {
+                        alpha_tiles[g]
+                            .as_ref()
+                            .map(|(d, w, h)| (d.as_slice(), *w, *h))
+                    } else {
+                        None
+                    };
+                    hf_groups.push(encode_hf_group_tokens(
+                        1,
+                        &group_tokens_passes[pass][g],
+                        &all_encoded_passes[pass][g],
+                        &context_map,
+                        &codes_per_pass[pass],
+                        at,
+                    )?);
+                }
             }
             let bits = hf_global.len() * 8 + hf_groups.iter().map(|s| s.len() * 8).sum::<usize>();
             if bits < best_bits {
@@ -5492,6 +5795,8 @@ struct FrameHeaderConfig {
     have_animation: bool,
     duration: u32,
     is_last: bool,
+    num_passes: u32,
+    pass_shifts: Vec<u32>,
 }
 
 /// Unified VarDCT frame header writer.
@@ -5514,8 +5819,27 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     writer.write(3, 3)?;
     // 11. b_qm_scale = 2
     writer.write(3, 2)?;
-    // 12. passes: num_passes = 1
-    writer.write(2, 0)?;
+    // 12. passes
+    let num_passes = cfg.num_passes.max(1);
+    match num_passes {
+        1 => writer.write(2, 0)?,
+        2 => writer.write(2, 1)?,
+        3 => writer.write(2, 2)?,
+        n => {
+            writer.write(2, 3)?;
+            writer.write(3, (n - 4) as u64)?;
+        }
+    }
+    if num_passes != 1 {
+        // num_ds = 0
+        writer.write(2, 0)?;
+        // shift for each pass except last (num_passes - 1 entries).
+        for i in 0..(num_passes - 1) {
+            let s = cfg.pass_shifts.get(i as usize).copied().unwrap_or(0).min(3);
+            writer.write(2, s as u64)?;
+        }
+        // no downsample / last_pass entries because num_ds == 0
+    }
     // 14. have_crop = false
     writer.write(1, 0)?;
     // 16. blending_info: mode = Replace (0)
@@ -5578,6 +5902,8 @@ fn write_vardct_frame_header(
             have_animation: false,
             duration: 0,
             is_last: true,
+            num_passes: 1,
+            pass_shifts: vec![],
         },
     )
 }
@@ -5599,6 +5925,8 @@ fn write_vardct_frame_header_animated(
             have_animation: true,
             duration,
             is_last,
+            num_passes: 1,
+            pass_shifts: vec![],
         },
     )
 }
@@ -6523,9 +6851,10 @@ fn estimate_huffman_payload_bits(
 fn encode_hf_global_section_with_code(
     num_groups: usize,
     context_map: &[u8],
-    uint_config: &crate::encode::entropy::HybridUintConfig,
-    codes: &[crate::encode::entropy::huffman_encode::HuffmanCode],
+    uint_configs_per_pass: &[crate::encode::entropy::HybridUintConfig],
+    codes_per_pass: &[Vec<crate::encode::entropy::huffman_encode::HuffmanCode>],
     custom_orders_8x8: Option<&[[usize; 64]; 3]>, // [Y, X, B]
+    num_passes: usize,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -6542,27 +6871,34 @@ fn encode_hf_global_section_with_code(
         w.write(num_histo_bits as usize, 0)?;
     }
 
-    // Per-pass data (1 pass): used_orders + optional custom coeff orders.
-    if let Some(orders) = custom_orders_8x8 {
-        // used_orders = 1 (only DCT8x8), encoded with selector=3 (Bits(13)).
-        w.write(2, 3)?;
-        w.write(13, 1)?;
-        // Decoder expects coeff-order channels in [X, Y, B]; `orders` is [Y, X, B].
-        let decoder_order = [orders[1], orders[0], orders[2]];
-        encode_coeff_orders(&mut w, &decoder_order)?;
-    } else {
-        // used_orders selector 2 = value 0 (natural order)
-        w.write(2, 2)?;
-    }
+    // Per-pass data.
+    for pass in 0..num_passes {
+        if let Some(orders) = custom_orders_8x8 {
+            // used_orders = 1 (only DCT8x8), encoded with selector=3 (Bits(13)).
+            w.write(2, 3)?;
+            w.write(13, 1)?;
+            // Decoder expects coeff-order channels in [X, Y, B]; `orders` is [Y, X, B].
+            let decoder_order = [orders[1], orders[0], orders[2]];
+            encode_coeff_orders(&mut w, &decoder_order)?;
+        } else {
+            // used_orders selector 2 = value 0 (natural order)
+            w.write(2, 2)?;
+        }
 
-    // Write Histograms header (tables only, no token data)
-    let uint_configs = vec![*uint_config; codes.len()];
-    crate::encode::entropy::huffman_encode::write_huffman_histograms(
-        &mut w,
-        context_map,
-        &uint_configs,
-        codes,
-    )?;
+        // Write Histograms header (tables only, no token data)
+        let codes = &codes_per_pass[pass.min(codes_per_pass.len().saturating_sub(1))];
+        let uint_config = uint_configs_per_pass
+            .get(pass)
+            .copied()
+            .unwrap_or_else(|| uint_configs_per_pass[0]);
+        let uint_configs = vec![uint_config; codes.len()];
+        crate::encode::entropy::huffman_encode::write_huffman_histograms(
+            &mut w,
+            context_map,
+            &uint_configs,
+            codes,
+        )?;
+    }
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -6575,6 +6911,7 @@ fn encode_hf_global_section_with_ans(
     uint_config: &crate::encode::entropy::HybridUintConfig,
     distributions: &[crate::encode::entropy::ans::AnsDistribution],
     custom_orders_8x8: Option<&[[usize; 64]; 3]>, // [Y, X, B]
+    num_passes: usize,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -6591,24 +6928,26 @@ fn encode_hf_global_section_with_ans(
         w.write(num_histo_bits as usize, 0)?;
     }
 
-    // Per-pass data (1 pass): used_orders + optional custom coeff orders.
-    if let Some(orders) = custom_orders_8x8 {
-        w.write(2, 3)?;
-        w.write(13, 1)?;
-        let decoder_order = [orders[1], orders[0], orders[2]];
-        encode_coeff_orders(&mut w, &decoder_order)?;
-    } else {
-        w.write(2, 2)?;
-    }
+    // Per-pass data.
+    for _pass in 0..num_passes {
+        if let Some(orders) = custom_orders_8x8 {
+            w.write(2, 3)?;
+            w.write(13, 1)?;
+            let decoder_order = [orders[1], orders[0], orders[2]];
+            encode_coeff_orders(&mut w, &decoder_order)?;
+        } else {
+            w.write(2, 2)?;
+        }
 
-    // Write ANS histograms header (tables only, no token data)
-    let uint_configs = vec![*uint_config; distributions.len()];
-    crate::encode::entropy::ans::write_ans_histograms(
-        &mut w,
-        context_map,
-        &uint_configs,
-        distributions,
-    )?;
+        // Write ANS histograms header (tables only, no token data)
+        let uint_configs = vec![*uint_config; distributions.len()];
+        crate::encode::entropy::ans::write_ans_histograms(
+            &mut w,
+            context_map,
+            &uint_configs,
+            distributions,
+        )?;
+    }
 
     w.byte_align_zero_pad()?;
     Ok(w.finish())
@@ -6794,7 +7133,7 @@ fn write_ac_histograms_and_tokens(
 
 /// Encode an HfGroup section: histogram_index + AC token data.
 fn encode_hf_group_tokens(
-    num_groups: usize,
+    num_histograms: usize,
     tokens: &[AcToken],
     encoded: &[crate::encode::entropy::HybridUintEncoded],
     context_map: &[u8],
@@ -6805,8 +7144,15 @@ fn encode_hf_group_tokens(
 
     let mut w = BitWriter::new();
 
-    // histogram_index: 0 (num_histograms = 1 -> 0 bits)
-    let _ = num_groups;
+    // histogram_index: 0
+    let num_histo_bits = if num_histograms <= 1 {
+        0
+    } else {
+        (32 - (num_histograms as u32 - 1).leading_zeros()) as usize
+    };
+    if num_histo_bits > 0 {
+        w.write(num_histo_bits, 0)?;
+    }
 
     for (token, enc) in tokens.iter().zip(encoded.iter()) {
         let cluster = context_map[token.context] as usize;
@@ -6827,7 +7173,7 @@ fn encode_hf_group_tokens(
 
 /// Encode an HfGroup section using ANS: histogram_index + ANS token stream.
 fn encode_hf_group_tokens_ans(
-    num_groups: usize,
+    num_histograms: usize,
     tokens: &[AcToken],
     encoded: &[crate::encode::entropy::HybridUintEncoded],
     context_map: &[u8],
@@ -6836,8 +7182,15 @@ fn encode_hf_group_tokens_ans(
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
-    // histogram_index: 0 (num_histograms = 1 -> 0 bits)
-    let _ = num_groups;
+    // histogram_index: 0
+    let num_histo_bits = if num_histograms <= 1 {
+        0
+    } else {
+        (32 - (num_histograms as u32 - 1).leading_zeros()) as usize
+    };
+    if num_histo_bits > 0 {
+        w.write(num_histo_bits, 0)?;
+    }
 
     let ans_tokens: Vec<crate::encode::entropy::ans::AnsToken> = tokens
         .iter()
@@ -6864,6 +7217,42 @@ fn encode_hf_group_tokens_ans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_effort_to_speed_tier_mapping_monotonic() {
+        // libjxl-style mapping: speed_tier = 10 - effort
+        assert_eq!(effort_to_speed_tier_index(1), 9);
+        assert_eq!(effort_to_speed_tier_index(7), 3);
+        assert_eq!(effort_to_speed_tier_index(9), 1);
+
+        for e in 1..9 {
+            let a = effort_params(e);
+            let b = effort_params(e + 1);
+            assert!(b.max_total_encodes >= a.max_total_encodes);
+            assert!(!a.enable_entropy_merge || b.enable_entropy_merge);
+            assert!(!a.enable_custom_coeff_orders || b.enable_custom_coeff_orders);
+        }
+    }
+
+    #[test]
+    fn test_choose_progressive_pass_plan() {
+        assert_eq!(
+            choose_progressive_pass_plan(false, false, 9, 1024, 768),
+            (1, vec![])
+        );
+        assert_eq!(
+            choose_progressive_pass_plan(true, true, 9, 1024, 768),
+            (1, vec![])
+        );
+        assert_eq!(
+            choose_progressive_pass_plan(true, false, 7, 1024, 768),
+            (2, vec![1])
+        );
+        assert_eq!(
+            choose_progressive_pass_plan(true, false, 9, 768, 512),
+            (3, vec![2, 1])
+        );
+    }
 
     #[test]
     fn test_distance_to_quant_params() {
@@ -8746,7 +9135,7 @@ mod tests {
             let mut x_chan = vec![0.0f32; npixels];
             let mut y_chan = vec![0.0f32; npixels];
             let mut b_chan = vec![0.0f32; npixels];
-            srgb_u8_to_xyb(&rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
+            srgb_u8_to_xyb(&rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan).unwrap();
             let b_minus_y_chan: Vec<f32> =
                 b_chan.iter().zip(&y_chan).map(|(&b, &y)| b - y).collect();
 
@@ -10017,6 +10406,7 @@ mod tests {
         let config = VarDctConfig {
             distance: 0.1,
             effort: 7,
+            progressive: false,
         };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
         eprintln!("Gradient codestream: {} bytes", cs.len());
@@ -10083,6 +10473,7 @@ mod tests {
             let config = VarDctConfig {
                 distance,
                 effort: 7,
+                progressive: false,
             };
             let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
             let (_n, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
@@ -10149,6 +10540,7 @@ mod tests {
             let config = VarDctConfig {
                 distance,
                 effort: 7,
+                progressive: false,
             };
             let cs = match encode_vardct_u8_rgb_codestream(&rgb, width, height, &config) {
                 Ok(cs) => cs,
@@ -10286,6 +10678,7 @@ mod tests {
         let config = VarDctConfig {
             distance: 2.0,
             effort: 7,
+            progressive: false,
         };
         let result = encode_vardct_u8_rgb(&rgb, width, height, &config);
         assert!(result.is_ok(), "encode failed: {:?}", result.err());
@@ -10309,6 +10702,7 @@ mod tests {
         let config = VarDctConfig {
             distance: 1.0,
             effort: 7,
+            progressive: false,
         };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
             .expect("multi-group encode should succeed");
@@ -10376,6 +10770,7 @@ mod tests {
             let config = VarDctConfig {
                 distance: 1.0,
                 effort: 7,
+                progressive: false,
             };
             let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
                 .expect(&format!("{label} encode failed"));
@@ -10422,6 +10817,7 @@ mod tests {
         let config = VarDctConfig {
             distance: 1.0,
             effort: 7,
+            progressive: false,
         };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
             .expect("257x257 multi-group encode should succeed");
@@ -10647,6 +11043,7 @@ mod animation_tests {
         let config = VarDctConfig {
             distance: 2.0,
             effort: 7,
+            progressive: false,
         };
         let data = encode_vardct_u8_rgba(&rgba, w, h, &config).unwrap();
         assert!(data.len() > 50);
@@ -10670,6 +11067,7 @@ mod animation_tests {
         let config = VarDctConfig {
             distance: 1.0,
             effort: 7,
+            progressive: false,
         };
         let data = encode_vardct_u8_rgba(&bin, w, h, &config).unwrap();
         std::fs::write("/tmp/dice_jxlrs.jxl", &data).unwrap();
@@ -10694,6 +11092,7 @@ mod animation_tests {
         let config = VarDctConfig {
             distance: 2.0,
             effort: 7,
+            progressive: false,
         };
         let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
         assert!(
@@ -10724,6 +11123,7 @@ mod animation_tests {
         let config = VarDctConfig {
             distance: 1.0,
             effort: 7,
+            progressive: false,
         };
         let data = encode_vardct_animation_u8_rgba(&frame_refs, w, h, &config).unwrap();
         std::fs::write("/tmp/anim_icos_rgba_jxlrs.jxl", &data).unwrap();
@@ -10755,6 +11155,7 @@ mod animation_tests {
         let config = VarDctConfig {
             distance: 1.0,
             effort: 7,
+            progressive: false,
         };
         let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
         std::fs::write("/tmp/anim_icos_jxlrs.jxl", &data).unwrap();

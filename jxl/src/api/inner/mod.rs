@@ -6,12 +6,13 @@
 #[cfg(test)]
 use crate::api::FrameCallback;
 use crate::{
-    api::{JxlFrameHeader, VisibleFrameInfo, VisibleFrameSeekTarget},
+    api::JxlFrameHeader,
     error::{Error, Result},
 };
 
 use super::{JxlBasicInfo, JxlColorProfile, JxlDecoderOptions, JxlPixelFormat};
-use crate::container::frame_index::FrameIndexBox;
+use crate::container::frame_index::{FrameIndexBox, VisibleFrameSeekTarget};
+use crate::jpeg::JpegReconstructionData;
 use box_parser::BoxParser;
 use codestream_parser::CodestreamParser;
 
@@ -145,9 +146,9 @@ impl JxlDecoderInner {
         self.box_parser.frame_index.as_ref()
     }
 
-    /// Returns visible frame info entries collected during parsing.
-    pub fn scanned_frames(&self) -> &[VisibleFrameInfo] {
-        &self.codestream_parser.scanned_frames
+    /// Returns JPEG reconstruction data parsed from a `jbrd` box, if present.
+    pub fn jpeg_reconstruction_data(&self) -> Option<&JpegReconstructionData> {
+        self.box_parser.jpeg_reconstruction.as_ref()
     }
 
     /// Resets frame-level state to prepare for decoding a new frame.
@@ -170,6 +171,11 @@ impl JxlDecoderInner {
             .reset_for_codestream_seek(seek_target.remaining_in_box);
         self.codestream_parser
             .start_new_frame(seek_target.visible_frames_to_skip);
+    }
+
+    /// Returns whether a `jbrd` JPEG reconstruction box was found.
+    pub fn has_jpeg_reconstruction(&self) -> bool {
+        self.box_parser.jpeg_reconstruction.is_some()
     }
 
     #[cfg(test)]
