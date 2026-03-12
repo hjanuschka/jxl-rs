@@ -518,6 +518,7 @@ fn apply_flat_region_quant_boost(
     height: usize,
     bw: usize,
     bh: usize,
+    strength: f32,
 ) -> Option<Vec<u8>> {
     let num_blocks = bw * bh;
     if num_blocks == 0 {
@@ -580,13 +581,14 @@ fn apply_flat_region_quant_boost(
                 }
             }
 
-            let factor = if r < 0.003 && !has_nonflat_neighbor {
+            let base_factor = if r < 0.003 && !has_nonflat_neighbor {
                 2.4
             } else if r < 0.006 {
                 1.6
             } else {
                 1.25
             };
+            let factor = 1.0 + (base_factor - 1.0) * strength;
 
             let boosted = (out[idx] as f32 * factor).round() as u32;
             let new_v = boosted.min(255) as u8;
@@ -827,11 +829,28 @@ fn encode_single_rgba_frame(
         }
     }
 
-    // Flat-region optimization candidate (line art / logos).
-    if let Some(flat_map) =
-        apply_flat_region_quant_boost(&raw_quant_map_candidates[1], &y_chan, width, height, bw, bh)
-    {
+    // Flat-region optimization candidates (line art / logos).
+    if let Some(flat_map) = apply_flat_region_quant_boost(
+        &raw_quant_map_candidates[1],
+        &y_chan,
+        width,
+        height,
+        bw,
+        bh,
+        1.0,
+    ) {
         raw_quant_map_candidates.push(flat_map);
+    }
+    if let Some(flat_map_aggr) = apply_flat_region_quant_boost(
+        &raw_quant_map_candidates[1],
+        &y_chan,
+        width,
+        height,
+        bw,
+        bh,
+        1.8,
+    ) {
+        raw_quant_map_candidates.push(flat_map_aggr);
     }
 
     // Compute per-pixel masking field for AC strategy loss estimation.
@@ -843,10 +862,11 @@ fn encode_single_rgba_frame(
     // per-block transform selection. The decoder applies gaborish smoothing,
     // so the viewer sees approximately the original opsin, not the sharpened version.
     let orig_y_chan = y_chan.clone();
+    let is_flat_graphic_pre = detect_flat_graphic(&y_chan, width, height, bw, bh);
 
     // 2. Apply inverse gaborish to opsin (libjxl: GaborishInverse after AQ).
-    //    Pre-sharpens so decoder-side gaborish smoothing recovers original.
-    let use_gab = config.distance >= 0.3;
+    //    For very flat graphics/logos, skip gab to avoid edge halo overhead.
+    let use_gab = config.distance >= 0.3 && !is_flat_graphic_pre;
     if use_gab {
         apply_inverse_gaborish(&mut [&mut x_chan, &mut y_chan, &mut b_chan], width, height);
     }
@@ -879,7 +899,7 @@ fn encode_single_rgba_frame(
     // Compute per-tile CfL maps (ytox and ytob).
     // Skip CfL optimization at near-lossless distances where the factor quantization
     // (1/84 granularity) would dominate error.
-    let (ytox_map, ytob_map) = if config.distance >= 0.5 {
+    let (ytox_map, ytob_map) = if config.distance >= 0.5 && !is_flat_graphic_pre {
         compute_cfl_maps(&dct_x, &dct_y, &dct_b, bw, bh)
     } else {
         let cr_size = bw.div_ceil(8) * bh.div_ceil(8);
@@ -889,7 +909,7 @@ fn encode_single_rgba_frame(
     // Evaluate candidates by exact encoded frame size.
     // Budget and heuristics depend on effort tier.
     let effort_cfg = effort_params(config.effort);
-    let is_flat_graphic = detect_flat_graphic(&y_chan, width, height, bw, bh);
+    let is_flat_graphic = is_flat_graphic_pre;
     let max_total_encodes = effort_cfg.max_total_encodes;
     let mut total_encodes = 0usize;
     let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());

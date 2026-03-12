@@ -147,7 +147,7 @@ Tested against jpegxl.info test images + Kodak dataset.
 |-------|-----------|-------------|-------------|--------|-----------|-----------|--------|
 | Unsplash Photo | 896x1080 | 403,256 | 395,134 | +2% | 33.9 | 33.4 | **+0.5** |
 | Dice | 800x600 | 27,383 | 22,045 | +24% | 45.0 | 44.8 | **+0.2** |
-| WebKit Logo P3 | 1000x1000 | 10,830 | 6,546 | +65% | 42.7 | 44.4 | -1.7 |
+| WebKit Logo P3 | 1000x1000 | 10,510 | 6,546 | +61% | 42.5 | 44.4 | -1.9 |
 | Kodak #01 | 768x512 | 130,170 | 125,196 | +4% | 38.1 | 38.1 | **0.0** |
 | Kodak #08 | 768x512 | 144,924 | 135,977 | +7% | 37.3 | 37.4 | -0.1 |
 | Kodak #13 | 768x512 | 152,070 | 155,927 | **-3%** | 35.8 | 36.2 | -0.4 |
@@ -158,14 +158,14 @@ Tested against jpegxl.info test images + Kodak dataset.
 Kodak #01 matched, Kodak #23 +0.6 dB). kodim13 still has the largest gap
 (-0.4 dB) but is 3% smaller than libjxl. DCT16x8/DCT8x16 rectangular merges
 added. AdjustQuantField sets merged blocks to MAX of constituents.
-WebKit logo improved substantially via flat-region transform candidate (+65% size), but still trails libjxl on this class.
+WebKit logo improved substantially via flat-region transform candidate (+61% size), but still trails libjxl on this class.
 
 ### Key remaining quality gaps
 
 1. **AQ distribution**: libjxl's AQ pipeline (with FindBestQuantizer feedback at
    kKitten speed, and better AdjustQuantField after merges) distributes bits more
    efficiently per-block, giving ~0.2-0.5 dB better quality at similar sizes.
-2. **WebKit logo**: improved from +253% to +65%, but still larger than libjxl.
+2. **WebKit logo**: improved from +253% to +61%, but still larger than libjxl.
    Remaining gap likely needs modular/palette-style treatment for ultra-flat regions.
 3. **Block context map**: libjxl uses `FindBestBlockEntropyModel` to create
    custom entropy contexts per block type, improving compression by 5-10%.
