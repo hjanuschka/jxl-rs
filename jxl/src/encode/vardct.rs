@@ -11,12 +11,12 @@
 use crate::encode::bit_writer::BitWriter;
 use crate::encode::container::wrap_codestream;
 use crate::encode::encodings::write_u32;
+use crate::encode::entropy::context_map::write_context_map;
 use crate::encode::entropy::huffman_encode::build_huffman_code;
 use crate::encode::headers::write_file_header;
 use crate::encode::toc::write_toc;
 use crate::encode::xyb::srgb_u8_to_xyb;
 use crate::error::Result;
-use crate::encode::entropy::context_map::write_context_map;
 use crate::frame::block_context_map::{self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT};
 use crate::headers::encodings::{U32, U32Coder};
 use jxl_transforms::{
@@ -180,7 +180,9 @@ fn compute_global_scale_and_quant(distance: f32, quant_median: f32) -> (u32, u32
 }
 
 fn compute_global_scale_and_quant_full(
-    distance: f32, quant_median: f32, quant_median_absd: f32,
+    distance: f32,
+    quant_median: f32,
+    quant_median_absd: f32,
 ) -> (u32, u32, u8) {
     const K_DC_QUANT: f32 = 1.095_924;
     const K_DC_QUANT_POW: f32 = 0.83;
@@ -225,7 +227,10 @@ fn apply_inverse_gaborish(channels: &mut [&mut [f32]; 3], width: usize, height: 
 }
 
 fn apply_inverse_gaborish_weighted(
-    channels: &mut [&mut [f32]; 3], width: usize, height: usize, weights: [f32; 3],
+    channels: &mut [&mut [f32]; 3],
+    width: usize,
+    height: usize,
+    weights: [f32; 3],
 ) {
     // libjxl inverse Gaborish kernel (symmetric 5x5).
     const K: [f32; 5] = [
@@ -251,15 +256,17 @@ fn apply_inverse_gaborish_weighted(
         let input = chan.to_vec();
         // Mirror boundary conditions, matching libjxl's Symmetric5 convolution.
         let mirror = |v: isize, max: isize| -> usize {
-            if v < 0 { (-v) as usize }
-            else if v >= max { (2 * max - 2 - v) as usize }
-            else { v as usize }
+            if v < 0 {
+                (-v) as usize
+            } else if v >= max {
+                (2 * max - 2 - v) as usize
+            } else {
+                v as usize
+            }
         };
         let w_i = width as isize;
         let h_i = height as isize;
-        let get = |x: isize, y: isize| -> f32 {
-            input[mirror(y, h_i) * width + mirror(x, w_i)]
-        };
+        let get = |x: isize, y: isize| -> f32 { input[mirror(y, h_i) * width + mirror(x, w_i)] };
 
         for y in 0..height {
             let iy = y as isize;
@@ -267,8 +274,8 @@ fn apply_inverse_gaborish_weighted(
                 let ix = x as isize;
                 let mut v = get(ix, iy) * w_center;
                 // Adjacent (r): 4 positions at distance 1 cardinal
-                v += (get(ix - 1, iy) + get(ix + 1, iy) + get(ix, iy - 1) + get(ix, iy + 1))
-                    * w_adj;
+                v +=
+                    (get(ix - 1, iy) + get(ix + 1, iy) + get(ix, iy - 1) + get(ix, iy + 1)) * w_adj;
                 // Diagonal (d): 4 positions at (1,1)
                 v += (get(ix - 1, iy - 1)
                     + get(ix + 1, iy - 1)
@@ -300,6 +307,90 @@ fn apply_inverse_gaborish_weighted(
     }
 }
 
+// Port of libjxl enc_frame.cc:SimplifyInvisible.
+// For lossy non-associated alpha, replace fully invisible (alpha==0) color
+// pixels with a local weighted blend of nearby pixels. This improves
+// compression and reduces color halos near transparency edges.
+fn simplify_invisible_channel(chan: &mut [f32], alpha: &[u8], width: usize, height: usize) {
+    for y in 0..height {
+        let row_off = y * width;
+        let prow_off = y.checked_sub(1).map(|yy| yy * width);
+        let nrow_off = (y + 1 < height).then_some((y + 1) * width);
+
+        for x in 0..width {
+            let idx = row_off + x;
+            if alpha[idx] != 0 {
+                continue;
+            }
+
+            let mut sum = 0.0f32;
+            let mut wsum = 0.0f32;
+
+            if x > 0 {
+                let left = chan[idx - 1];
+                sum += left;
+                wsum += 1.0;
+                if alpha[idx - 1] > 0 {
+                    sum += left;
+                    wsum += 1.0;
+                }
+            }
+
+            if x + 1 < width {
+                if let Some(po) = prow_off {
+                    sum += chan[po + x + 1];
+                    wsum += 1.0;
+                }
+                if alpha[idx + 1] > 0 {
+                    sum += 2.0 * chan[idx + 1];
+                    wsum += 2.0;
+                }
+                if let Some(po) = prow_off {
+                    if alpha[po + x + 1] > 0 {
+                        sum += 2.0 * chan[po + x + 1];
+                        wsum += 2.0;
+                    }
+                }
+                if let Some(no) = nrow_off {
+                    if alpha[no + x + 1] > 0 {
+                        sum += 2.0 * chan[no + x + 1];
+                        wsum += 2.0;
+                    }
+                }
+            }
+
+            if let Some(po) = prow_off {
+                if alpha[po + x] > 0 {
+                    sum += 2.0 * chan[po + x];
+                    wsum += 2.0;
+                }
+            }
+            if let Some(no) = nrow_off {
+                if alpha[no + x] > 0 {
+                    sum += 2.0 * chan[no + x];
+                    wsum += 2.0;
+                }
+            }
+
+            if wsum > 1.0 {
+                chan[idx] = sum / wsum;
+            }
+        }
+    }
+}
+
+fn simplify_invisible_xyb(
+    x: &mut [f32],
+    y: &mut [f32],
+    b: &mut [f32],
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+) {
+    simplify_invisible_channel(x, alpha, width, height);
+    simplify_invisible_channel(y, alpha, width, height);
+    simplify_invisible_channel(b, alpha, width, height);
+}
 
 /// Encode an sRGB u8 RGB image as a VarDCT JXL file (container-wrapped).
 pub fn encode_vardct_u8_rgb(
@@ -359,8 +450,10 @@ pub fn encode_vardct_animation_u8_rgb(
     let mut header_writer = BitWriter::new();
     crate::encode::headers::write_file_header_animated(
         &mut header_writer,
-        width as u32, height as u32,
-        tps_num, tps_den,
+        width as u32,
+        height as u32,
+        tps_num,
+        tps_den,
         0, // num_loops = 0 (infinite)
     )?;
     codestream.extend_from_slice(&header_writer.finish());
@@ -377,9 +470,7 @@ pub fn encode_vardct_animation_u8_rgb(
             duration: duration_ms,
             is_last,
         };
-        let frame_bytes = encode_single_rgb_frame(
-            rgb, width, height, config, Some(&anim),
-        )?;
+        let frame_bytes = encode_single_rgb_frame(rgb, width, height, config, Some(&anim))?;
         codestream.extend_from_slice(&frame_bytes);
     }
 
@@ -407,8 +498,11 @@ pub fn encode_vardct_animation_u8_rgba(
     let mut header_writer = BitWriter::new();
     crate::encode::headers::write_file_header_animated_with_alpha(
         &mut header_writer,
-        width as u32, height as u32,
-        tps_num, tps_den, 0,
+        width as u32,
+        height as u32,
+        tps_num,
+        tps_den,
+        0,
     )?;
     codestream.extend_from_slice(&header_writer.finish());
 
@@ -430,9 +524,8 @@ pub fn encode_vardct_animation_u8_rgba(
             duration: duration_ms,
             is_last,
         };
-        let frame_bytes = encode_single_rgba_frame(
-            &rgb, width, height, config, Some(&anim), Some(&alpha),
-        )?;
+        let frame_bytes =
+            encode_single_rgba_frame(&rgb, width, height, config, Some(&anim), Some(&alpha))?;
         codestream.extend_from_slice(&frame_bytes);
     }
 
@@ -484,6 +577,12 @@ fn encode_single_rgba_frame(
     let mut b_chan = vec![0.0f32; npixels];
     srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan);
 
+    // Match libjxl enc_frame.cc:SimplifyInvisible for lossy non-associated alpha.
+    // This only touches fully invisible pixels (alpha == 0).
+    if let Some(a) = alpha {
+        simplify_invisible_xyb(&mut x_chan, &mut y_chan, &mut b_chan, a, width, height);
+    }
+
     let bw = width.div_ceil(8);
     let bh = height.div_ceil(8);
     let num_blocks = bw * bh;
@@ -497,13 +596,20 @@ fn encode_single_rgba_frame(
     // compensates uniformly, closing PSNR gaps at the cost of ~5% larger files.
     let quant_ac = (0.765f32 * 1.15) / config.distance;
     let (adaptive_map, global_scale, quant_lf, aq_float_map) = build_adaptive_raw_quant_map_full(
-        &x_chan, &y_chan, &b_chan,
-        width, height, bw, bh, config.distance, quant_ac,
+        &x_chan,
+        &y_chan,
+        &b_chan,
+        width,
+        height,
+        bw,
+        bh,
+        config.distance,
+        quant_ac,
     );
     let (_, _, base_raw_quant) = distance_to_full_quant_params(config.distance);
     let raw_quant_map_candidates = vec![
         vec![base_raw_quant; bw * bh], // uniform candidate
-        adaptive_map,                   // libjxl-style adaptive candidate
+        adaptive_map,                  // libjxl-style adaptive candidate
     ];
 
     // Compute per-pixel masking field for AC strategy loss estimation.
@@ -520,11 +626,7 @@ fn encode_single_rgba_frame(
     //    Pre-sharpens so decoder-side gaborish smoothing recovers original.
     let use_gab = config.distance >= 0.3;
     if use_gab {
-        apply_inverse_gaborish(
-            &mut [&mut x_chan, &mut y_chan, &mut b_chan],
-            width,
-            height,
-        );
+        apply_inverse_gaborish(&mut [&mut x_chan, &mut y_chan, &mut b_chan], width, height);
     }
 
     // 3. CfL input for B channel in HF coding: in_b = b - y
@@ -595,20 +697,28 @@ fn encode_single_rgba_frame(
         // (entropy + information loss with perceptual masking).
         if bw >= 2 && bh >= 2 {
             let entropy_map = build_entropy_merge_transform_map(
-                &x_chan, &y_chan, &b_minus_y_chan,
-                width, height, bw, bh,
-                &quantized.ac_y, &quantized.ac_x, &quantized.ac_b,
-                global_scale, raw_quant_map,
-                &dequant_weights, x_dm_multiplier, b_dm_multiplier,
+                &x_chan,
+                &y_chan,
+                &b_minus_y_chan,
+                width,
+                height,
+                bw,
+                bh,
+                &quantized.ac_y,
+                &quantized.ac_x,
+                &quantized.ac_b,
+                global_scale,
+                raw_quant_map,
+                &dequant_weights,
+                x_dm_multiplier,
+                b_dm_multiplier,
                 config.distance,
                 &masking1x1,
                 &orig_y_chan,
                 &aq_float_map,
             );
             let default_map = build_default_transform_map(bw, bh);
-            if entropy_map != default_map
-                && !transform_map_candidates.contains(&entropy_map)
-            {
+            if entropy_map != default_map && !transform_map_candidates.contains(&entropy_map) {
                 transform_map_candidates.push(entropy_map);
             }
         }
@@ -622,9 +732,8 @@ fn encode_single_rgba_frame(
             // AdjustQuantField: for merged blocks, set quant to MAX of constituents.
             // This matches libjxl's behavior and ensures merged blocks use the
             // finest quantization step among their constituent 8x8 blocks.
-            let adj_quant = adjust_quant_field(
-                raw_quant_map, &transform_map, bw, bh, config.distance,
-            );
+            let adj_quant =
+                adjust_quant_field(raw_quant_map, &transform_map, bw, bh, config.distance);
             let quant_for_encode = &adj_quant;
 
             // Candidate A: legacy bootstrap behavior for non-8x8 transforms (all-zero AC).
@@ -833,9 +942,9 @@ fn compute_cfl_maps(
     for ty in 0..cr_h {
         for tx in 0..cr_w {
             let mut sum_yy_x = 0.0f64; // Y*Y weighted by X-channel quant
-            let mut sum_yx = 0.0f64;  // Y*X weighted by X-channel quant
+            let mut sum_yx = 0.0f64; // Y*X weighted by X-channel quant
             let mut sum_yy_b = 0.0f64; // Y*Y weighted by B-channel quant
-            let mut sum_yb = 0.0f64;  // Y*B weighted by B-channel quant
+            let mut sum_yb = 0.0f64; // Y*B weighted by B-channel quant
 
             // libjxl weights DCT coefficients by q * inv_dequant_matrix[k]
             // (the quantization strength). This ensures that coefficients
@@ -846,13 +955,13 @@ fn compute_cfl_maps(
                     let blk = by * bw + bx;
                     for k in 1..64 {
                         let y_for_x = dct_y[blk * 64 + k] as f64 * qw_x[k];
-                        let x_val   = dct_x[blk * 64 + k] as f64 * qw_x[k];
+                        let x_val = dct_x[blk * 64 + k] as f64 * qw_x[k];
                         let y_for_b = dct_y[blk * 64 + k] as f64 * qw_b[k];
-                        let b_val   = dct_b[blk * 64 + k] as f64 * qw_b[k];
+                        let b_val = dct_b[blk * 64 + k] as f64 * qw_b[k];
                         sum_yy_x += y_for_x * y_for_x;
-                        sum_yx   += y_for_x * x_val;
+                        sum_yx += y_for_x * x_val;
                         sum_yy_b += y_for_b * y_for_b;
-                        sum_yb   += y_for_b * b_val;
+                        sum_yb += y_for_b * b_val;
                     }
                 }
             }
@@ -871,8 +980,7 @@ fn compute_cfl_maps(
             // Adding distance_mul regularization:
             // factor = sum_cross / (sum_yy + regularizer)
             // where regularizer = num * distance_mul * 0.5 * K^2
-            let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8)
-                * ((tx * 8 + 8).min(bw) - tx * 8);
+            let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8) * ((tx * 8 + 8).min(bw) - tx * 8);
             let num_coeffs = (n_blocks * 63) as f64;
             // kDistanceMultiplierAC = 1e-3 (libjxl uses 1e-9 but with much
             // larger q*qm weights; we scale up to compensate)
@@ -1069,9 +1177,12 @@ fn fast_log2f(v: f32) -> f32 {
 
 /// GammaModulation from libjxl: adjusts mask based on opsin gamma.
 fn gamma_modulation(
-    bx: usize, by: usize,
-    xyb_x: &[f32], xyb_y: &[f32],
-    img_w: usize, img_h: usize,
+    bx: usize,
+    by: usize,
+    xyb_x: &[f32],
+    xyb_y: &[f32],
+    img_w: usize,
+    img_h: usize,
 ) -> f32 {
     const K_BIAS: f32 = 0.16;
     let mut overall_ratio = 0.0f32;
@@ -1093,15 +1204,16 @@ fn gamma_modulation(
 }
 
 /// HfModulation from libjxl: per-block HF activity from pixel gradients.
-fn hf_modulation(
-    bx: usize, by: usize,
-    xyb_y: &[f32], img_w: usize, img_h: usize,
-) -> f32 {
+fn hf_modulation(bx: usize, by: usize, xyb_y: &[f32], img_w: usize, img_h: usize) -> f32 {
     const VAL_CLAMP: f32 = 0.0206;
     let mut sum_y = 0.0f32;
     for dy in 0..8usize {
         let py = (by * 8 + dy).min(img_h - 1);
-        let py_next = if dy < 7 { (by * 8 + dy + 1).min(img_h - 1) } else { py };
+        let py_next = if dy < 7 {
+            (by * 8 + dy + 1).min(img_h - 1)
+        } else {
+            py
+        };
         for dx in 0..8usize {
             let px = (bx * 8 + dx).min(img_w - 1);
             let v = xyb_y[py * img_w + px];
@@ -1121,9 +1233,13 @@ fn hf_modulation(
 
 /// BlueModulation from libjxl: boosts quality for blue-dominant blocks.
 fn blue_modulation(
-    bx: usize, by: usize,
-    xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
-    img_w: usize, img_h: usize,
+    bx: usize,
+    by: usize,
+    xyb_x: &[f32],
+    xyb_y: &[f32],
+    xyb_b: &[f32],
+    img_w: usize,
+    img_h: usize,
 ) -> f32 {
     const K_LIMIT: f32 = 0.010474084867598155;
     const K_OFFSET: f32 = 0.0031994768654636393;
@@ -1158,8 +1274,12 @@ fn blue_modulation(
 /// then MaskingSqrt'd, downsampled 4x, and FuzzyErosion'd to get per-block
 /// aq_map values. Direct port of libjxl ComputeTile.
 fn compute_aq_map(
-    xyb_y: &[f32], img_w: usize, img_h: usize,
-    bw: usize, bh: usize, distance: f32,
+    xyb_y: &[f32],
+    img_w: usize,
+    img_h: usize,
+    bw: usize,
+    bh: usize,
+    distance: f32,
 ) -> Vec<f32> {
     let pw = bw * 8; // padded width (block-aligned)
     let ph = bh * 8;
@@ -1206,8 +1326,11 @@ fn compute_aq_map(
             let dy = y / 4;
             if dy < ds_h {
                 for qx in 0..ds_w {
-                    let avg = (row_buf[qx * 4] + row_buf[qx * 4 + 1]
-                             + row_buf[qx * 4 + 2] + row_buf[qx * 4 + 3]) * 0.25;
+                    let avg = (row_buf[qx * 4]
+                        + row_buf[qx * 4 + 1]
+                        + row_buf[qx * 4 + 2]
+                        + row_buf[qx * 4 + 3])
+                        * 0.25;
                     pre_erosion[dy * ds_w + qx] = avg;
                 }
             }
@@ -1222,7 +1345,11 @@ fn compute_aq_map(
     // FuzzyErosion weights from libjxl
     let mut k_mul_base = [0.125f32, 0.1, 0.09, 0.06];
     let k_mul_add = [0.0f32, -0.1, -0.09, -0.06];
-    let mul = if distance < 2.0 { (2.0 - distance) * 0.5 } else { 0.0 };
+    let mul = if distance < 2.0 {
+        (2.0 - distance) * 0.5
+    } else {
+        0.0
+    };
     let mut norm_sum = 0.0f32;
     for i in 0..4 {
         k_mul_base[i] += mul * k_mul_add[i];
@@ -1237,9 +1364,8 @@ fn compute_aq_map(
     ];
 
     let mut aq_map = vec![0.0f32; bw * bh];
-    let pe_get = |x: usize, y: usize| -> f32 {
-        pre_erosion[y.min(pe_h - 1) * pe_w + x.min(pe_w - 1)]
-    };
+    let pe_get =
+        |x: usize, y: usize| -> f32 { pre_erosion[y.min(pe_h - 1) * pe_w + x.min(pe_w - 1)] };
 
     for fy in 0..pe_h.min(bh * 2) {
         for fx in 0..pe_w.min(bw * 2) {
@@ -1252,14 +1378,20 @@ fn compute_aq_map(
 
             // Collect all 9 neighbors
             let mut vals = [
-                pe_get(x, y), pe_get(xm1, y), pe_get(xp1, y),
-                pe_get(xm1, ym1), pe_get(x, ym1), pe_get(xp1, ym1),
-                pe_get(xm1, yp1), pe_get(x, yp1), pe_get(xp1, yp1),
+                pe_get(x, y),
+                pe_get(xm1, y),
+                pe_get(xp1, y),
+                pe_get(xm1, ym1),
+                pe_get(x, ym1),
+                pe_get(xp1, ym1),
+                pe_get(xm1, yp1),
+                pe_get(x, yp1),
+                pe_get(xp1, yp1),
             ];
             // Sort to find 4 smallest
             vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let v = k_mul[0] * vals[0] + k_mul[1] * vals[1] +
-                    k_mul[2] * vals[2] + k_mul[3] * vals[3];
+            let v =
+                k_mul[0] * vals[0] + k_mul[1] * vals[1] + k_mul[2] * vals[2] + k_mul[3] * vals[3];
 
             let bx = fx / 2;
             let by = fy / 2;
@@ -1280,10 +1412,15 @@ fn compute_aq_map(
 /// HfModulation + BlueModulation, then exp2 scaling.
 fn apply_per_block_modulations(
     aq_map: &mut [f32],
-    xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
-    img_w: usize, img_h: usize,
-    bw: usize, bh: usize,
-    distance: f32, scale: f32,
+    xyb_x: &[f32],
+    xyb_y: &[f32],
+    xyb_b: &[f32],
+    img_w: usize,
+    img_h: usize,
+    bw: usize,
+    bh: usize,
+    distance: f32,
+    scale: f32,
 ) {
     let base_level = 0.48 * scale;
     let dampen = if distance >= 2.0 {
@@ -1312,9 +1449,14 @@ fn apply_per_block_modulations(
 /// Build per-block adaptive quant map using libjxl's full pipeline.
 /// Returns (raw_quant_map, global_scale, quant_lf).
 fn build_adaptive_raw_quant_map_full(
-    xyb_x: &[f32], xyb_y: &[f32], xyb_b: &[f32],
-    img_w: usize, img_h: usize,
-    bw: usize, bh: usize, distance: f32,
+    xyb_x: &[f32],
+    xyb_y: &[f32],
+    xyb_b: &[f32],
+    img_w: usize,
+    img_h: usize,
+    bw: usize,
+    bh: usize,
+    distance: f32,
     quant_ac: f32,
 ) -> (Vec<u8>, u32, u32, Vec<f32>) {
     let num_blocks = bw * bh;
@@ -1330,7 +1472,18 @@ fn build_adaptive_raw_quant_map_full(
     // Step 2: Apply per-block modulations (ComputeMask + Gamma + HF + Blue).
     // libjxl PerBlockModulations uses quant_ac as the `scale` parameter.
     let scale = quant_ac;
-    apply_per_block_modulations(&mut aq_map, xyb_x, xyb_y, xyb_b, img_w, img_h, bw, bh, distance, scale);
+    apply_per_block_modulations(
+        &mut aq_map,
+        xyb_x,
+        xyb_y,
+        xyb_b,
+        img_w,
+        img_h,
+        bw,
+        bh,
+        distance,
+        scale,
+    );
 
     // Step 3: Convert float aq_map to raw_quant (integer).
     // libjxl Squirrel path: ComputeGlobalScaleAndQuant(quant_dc, 0.39/d, 0)
@@ -1338,8 +1491,7 @@ fn build_adaptive_raw_quant_map_full(
     // Then SetQuantFieldRect converts each aq_map[i] to
     //   raw_quant = clamp(aq_map[i] * inv_global_scale + 0.5, 1, 255).
     let q_for_global_scale = 0.39 / distance;
-    let (global_scale, quant_lf, _) =
-        compute_global_scale_and_quant(distance, q_for_global_scale);
+    let (global_scale, quant_lf, _) = compute_global_scale_and_quant(distance, q_for_global_scale);
     let inv_global_scale = 65536.0 / global_scale as f32;
 
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
@@ -1361,7 +1513,8 @@ fn build_adaptive_raw_quant_map_full(
 fn adjust_quant_field(
     raw_quant_map: &[u8],
     transform_map: &[u8],
-    bw: usize, bh: usize,
+    bw: usize,
+    bh: usize,
     distance: f32,
 ) -> Vec<u8> {
     let mut adjusted = raw_quant_map.to_vec();
@@ -1432,8 +1585,6 @@ fn adjust_quant_field(
 
     adjusted
 }
-
-
 
 fn build_default_transform_map(bw: usize, bh: usize) -> Vec<u8> {
     vec![DCT8_TRANSFORM_ID | TRANSFORM_FIRST_BLOCK_FLAG; bw * bh]
@@ -2078,9 +2229,7 @@ fn dct_1d_n(input: &[f32], output: &mut [f32], n: usize) {
         let mut sum = 0.0f32;
         for i in 0..n {
             sum += input[i]
-                * (std::f32::consts::PI * (2 * i + 1) as f32 * k as f32
-                    / (2 * n) as f32)
-                    .cos();
+                * (std::f32::consts::PI * (2 * i + 1) as f32 * k as f32 / (2 * n) as f32).cos();
         }
         output[k] = sum * ac_scale;
     }
@@ -2429,15 +2578,12 @@ fn prepare_ac_for_transform_map_with_cache(
                 let dw_x = wx[coeff_index] * x_dm_multiplier;
                 let dw_y = wy[coeff_index];
                 let dw_b = wb[coeff_index] * b_dm_multiplier;
-                ac_x[storage_index] = quantize_ac(
-                    coeffs[0][coeff_index], global_scale, raw_quant, dw_x,
-                );
-                ac_y[storage_index] = quantize_ac(
-                    coeffs[1][coeff_index], global_scale, raw_quant, dw_y,
-                );
-                ac_b[storage_index] = quantize_ac(
-                    coeffs[2][coeff_index], global_scale, raw_quant, dw_b,
-                );
+                ac_x[storage_index] =
+                    quantize_ac(coeffs[0][coeff_index], global_scale, raw_quant, dw_x);
+                ac_y[storage_index] =
+                    quantize_ac(coeffs[1][coeff_index], global_scale, raw_quant, dw_y);
+                ac_b[storage_index] =
+                    quantize_ac(coeffs[2][coeff_index], global_scale, raw_quant, dw_b);
             }
         }
     }
@@ -2499,7 +2645,7 @@ fn estimate_transform_entropy_full(
     // But for the entropy term (which decides encoding), we need our actual scale.
     // Solution: use our actual scale for entropy, libjxl's scale for loss.
     let encode_scale = (global_scale as f32 * raw_quant as f32) / 65536.0;
-    let quant_norm16 = raw_quant as f32;  // libjxl's scale for loss term
+    let quant_norm16 = raw_quant as f32; // libjxl's scale for loss term
 
     let mut total_entropy = 0.0f32;
 
@@ -2520,7 +2666,9 @@ fn estimate_transform_entropy_full(
 
         for k in 1..coeff_count {
             let dw = dw_base[k] * dm_mul;
-            if dw.abs() < 1e-10 { continue; }
+            if dw.abs() < 1e-10 {
+                continue;
+            }
             let inv_dw = 1.0 / dw;
             // Use our actual encoding scale for quantization (entropy term)
             let val = coeffs[c][k] * encode_scale * inv_dw;
@@ -2540,8 +2688,8 @@ fn estimate_transform_entropy_full(
             1u32
         };
         total_entropy += cost_delta * entropy_v;
-        total_entropy += zeros_mul
-            * ((nbits + 17).next_power_of_two().trailing_zeros() as f32 + nbits as f32);
+        total_entropy +=
+            zeros_mul * ((nbits + 17).next_power_of_two().trailing_zeros() as f32 + nbits as f32);
 
         // libjxl: X channel penalty for large blocks (ringing in red-green)
         if c == 0 && num_blocks >= 2 {
@@ -2555,17 +2703,13 @@ fn estimate_transform_entropy_full(
     // Weight by perceptual masking field.
     if let Some((mask_data, mask_stride)) = masking1x1 {
         let mask_offsets: [f32; 3] = [12.0, 0.0, 4.0];
-        let channel_muls: [f64; 3] = [
-            8.2f64.powi(8),
-            1.0f64.powi(8),
-            1.03f64.powi(8),
-        ];
+        let channel_muls: [f64; 3] = [8.2f64.powi(8), 1.0f64.powi(8), 1.03f64.powi(8)];
 
         let mut total_loss = 0.0f64;
 
         for c in 0..3usize {
             // Compute quantization error in DCT domain:
-            // error[k] = dequant_weight * (round(val) - val) 
+            // error[k] = dequant_weight * (round(val) - val)
             // where val = coeff * encode_scale / dw
             // This is the actual error that the decoder will see.
             let mut error_coeffs = vec![0.0f32; coeff_count];
@@ -2577,7 +2721,9 @@ fn estimate_transform_entropy_full(
             };
             for k in 1..coeff_count {
                 let dw = dw_base[k] * dm_mul;
-                if dw.abs() < 1e-10 { continue; }
+                if dw.abs() < 1e-10 {
+                    continue;
+                }
                 let val = coeffs[c][k] * encode_scale / dw;
                 let rval = val.round();
                 // Dequantized value = rval * dw / encode_scale
@@ -2597,7 +2743,10 @@ fn estimate_transform_entropy_full(
 
             // Inverse-transform to get pixel-domain error
             let error_pixels = inverse_transform_error(
-                &error_coeffs, transform_id, block_w_pixels, block_h_pixels,
+                &error_coeffs,
+                transform_id,
+                block_w_pixels,
+                block_h_pixels,
             );
 
             let masku_off = mask_offsets[c];
@@ -2606,15 +2755,23 @@ fn estimate_transform_entropy_full(
             for py_local in 0..block_h_pixels {
                 for px_local in 0..block_w_pixels {
                     let local_idx = py_local * block_w_pixels + px_local;
-                    if local_idx >= error_pixels.len() { continue; }
+                    if local_idx >= error_pixels.len() {
+                        continue;
+                    }
                     let err = error_pixels[local_idx] as f64;
 
                     let px = pixel_x_origin + px_local;
                     let py = pixel_y_origin + py_local;
                     let mask_val = if py < mask_stride && px < mask_stride {
                         let midx = py * mask_stride + px;
-                        if midx < mask_data.len() { mask_data[midx] as f64 } else { 1.0 }
-                    } else { 1.0 };
+                        if midx < mask_data.len() {
+                            mask_data[midx] as f64
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    };
 
                     let masked = (mask_val + masku_off as f64) * err;
                     let m2 = masked * masked;
@@ -2629,9 +2786,8 @@ fn estimate_transform_entropy_full(
         }
 
         let num_pixels = (num_blocks * 64) as f64;
-        let loss_scalar = (total_loss / num_pixels).powf(1.0 / 8.0)
-            * num_pixels as f64
-            / quant_norm16 as f64;
+        let loss_scalar =
+            (total_loss / num_pixels).powf(1.0 / 8.0) * num_pixels as f64 / quant_norm16 as f64;
         total_entropy += info_loss_multiplier * loss_scalar as f32;
     }
 
@@ -2642,14 +2798,11 @@ fn estimate_transform_entropy_full(
 /// Inverse transform for all 3 channels of an 8x8 block (any special transform type).
 /// Returns [x_pixels, y_pixels, b_pixels], each 64 floats.
 #[allow(dead_code)]
-fn inverse_transform_8x8_all_channels(
-    transform_id: u8,
-    coeffs: &[Vec<f32>; 3],
-) -> [Vec<f32>; 3] {
+fn inverse_transform_8x8_all_channels(transform_id: u8, coeffs: &[Vec<f32>; 3]) -> [Vec<f32>; 3] {
     use jxl_transforms::transform_map::HfTransformType;
 
-    let transform = HfTransformType::from_usize(transform_id as usize)
-        .unwrap_or(HfTransformType::DCT);
+    let transform =
+        HfTransformType::from_usize(transform_id as usize).unwrap_or(HfTransformType::DCT);
 
     let mut result = [vec![0.0f32; 64], vec![0.0f32; 64], vec![0.0f32; 64]];
     for c in 0..3 {
@@ -2667,13 +2820,10 @@ fn inverse_transform_8x8_all_channels(
 
 /// Inverse transform a single channel of 8x8 coefficients to pixels.
 #[allow(dead_code)]
-fn inverse_transform_8x8_single_channel(
-    transform_id: u8,
-    coeffs: &[f32; 64],
-) -> [f32; 64] {
+fn inverse_transform_8x8_single_channel(transform_id: u8, coeffs: &[f32; 64]) -> [f32; 64] {
     use jxl_transforms::transform_map::HfTransformType;
-    let transform = HfTransformType::from_usize(transform_id as usize)
-        .unwrap_or(HfTransformType::DCT);
+    let transform =
+        HfTransformType::from_usize(transform_id as usize).unwrap_or(HfTransformType::DCT);
     let mut lf = [coeffs[0]];
     let mut hf = [0.0f32; 64];
     hf.copy_from_slice(coeffs);
@@ -2690,7 +2840,9 @@ fn inverse_transform_error(
     block_h: usize,
 ) -> Vec<f32> {
     let n = block_w * block_h;
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
 
     if transform_id == DCT8_TRANSFORM_ID || is_special_8x8_transform_id(transform_id) {
         // For 8x8: use idct2d_8
@@ -2749,7 +2901,7 @@ fn inverse_transform_error(
 fn build_entropy_merge_transform_map(
     pixel_x: &[f32],
     pixel_y: &[f32],
-    pixel_b: &[f32],  // b_minus_y for CfL-adjusted comparison
+    pixel_b: &[f32], // b_minus_y for CfL-adjusted comparison
     width: usize,
     height: usize,
     bw: usize,
@@ -2763,8 +2915,8 @@ fn build_entropy_merge_transform_map(
     x_dm_multiplier: f32,
     b_dm_multiplier: f32,
     _distance: f32,
-    _masking1x1: &[f32], // per-pixel masking field (for future loss term)
-    _orig_y: &[f32],      // original Y channel (pre-inverse-gaborish) for MSE
+    _masking1x1: &[f32],   // per-pixel masking field (for future loss term)
+    _orig_y: &[f32],       // original Y channel (pre-inverse-gaborish) for MSE
     _aq_float_map: &[f32], // float quant field (libjxl's quant_norm16)
 ) -> Vec<u8> {
     let mut map = build_default_transform_map(bw, bh);
@@ -2834,18 +2986,35 @@ fn build_entropy_merge_transform_map(
             // DCT16X8: 8 cols (1 block), 16 rows (2 blocks)
             let coeffs = compute_forward_transform_coeffs(
                 DCT16X8_TRANSFORM_ID,
-                pixel_x, pixel_y, pixel_b,
-                width, height, bx, by, 8, 16,
+                pixel_x,
+                pixel_y,
+                pixel_b,
+                width,
+                height,
+                bx,
+                by,
+                8,
+                16,
             );
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
             for c in 0..3usize {
                 let dw_base = &dct8x16_weights[c * 128..(c + 1) * 128];
-                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
-                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                let dm_mul = match c {
+                    0 => x_dm_multiplier,
+                    1 => 1.0,
+                    _ => b_dm_multiplier,
+                };
+                let chan_w = match c {
+                    0 => 0.3f32,
+                    1 => 1.0,
+                    _ => 0.3,
+                };
                 for k in 1..128 {
                     let dw = dw_base[k] * dm_mul;
-                    if dw.abs() < 1e-10 { continue; }
+                    if dw.abs() < 1e-10 {
+                        continue;
+                    }
                     let q = (coeffs[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
@@ -2893,18 +3062,35 @@ fn build_entropy_merge_transform_map(
             // DCT8X16: 16 cols (2 blocks), 8 rows (1 block)
             let coeffs = compute_forward_transform_coeffs(
                 DCT8X16_TRANSFORM_ID,
-                pixel_x, pixel_y, pixel_b,
-                width, height, bx, by, 16, 8,
+                pixel_x,
+                pixel_y,
+                pixel_b,
+                width,
+                height,
+                bx,
+                by,
+                16,
+                8,
             );
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
             for c in 0..3usize {
                 let dw_base = &dct8x16_weights[c * 128..(c + 1) * 128];
-                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
-                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                let dm_mul = match c {
+                    0 => x_dm_multiplier,
+                    1 => 1.0,
+                    _ => b_dm_multiplier,
+                };
+                let chan_w = match c {
+                    0 => 0.3f32,
+                    1 => 1.0,
+                    _ => 0.3,
+                };
                 for k in 1..128 {
                     let dw = dw_base[k] * dm_mul;
-                    if dw.abs() < 1e-10 { continue; }
+                    if dw.abs() < 1e-10 {
+                        continue;
+                    }
                     let q = (coeffs[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
@@ -2930,12 +3116,12 @@ fn build_entropy_merge_transform_map(
             let by = by2 * 2;
 
             // All 4 blocks must still be DCT8 (not already rect-merged)
-            let all_dct8 = [
-                (by, bx), (by, bx+1), (by+1, bx), (by+1, bx+1)
-            ].iter().all(|&(r, c)| {
-                map[r * bw + c] == (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID)
-            });
-            if !all_dct8 { continue; }
+            let all_dct8 = [(by, bx), (by, bx + 1), (by + 1, bx), (by + 1, bx + 1)]
+                .iter()
+                .all(|&(r, c)| map[r * bw + c] == (TRANSFORM_FIRST_BLOCK_FLAG | DCT8_TRANSFORM_ID));
+            if !all_dct8 {
+                continue;
+            }
 
             // Guard: skip merge if raw_quant values vary too much across the
             // 2x2 group. This prevents merging a smooth block with an edge
@@ -2977,18 +3163,35 @@ fn build_entropy_merge_transform_map(
 
             let coeffs = compute_forward_transform_coeffs(
                 DCT16_TRANSFORM_ID,
-                pixel_x, pixel_y, pixel_b,
-                width, height, bx, by, 16, 16,
+                pixel_x,
+                pixel_y,
+                pixel_b,
+                width,
+                height,
+                bx,
+                by,
+                16,
+                16,
             );
             let scale16 = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e16 = 0.0f32;
             for c in 0..3usize {
                 let dw_base = &dct16_weights[c * 256..(c + 1) * 256];
-                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
-                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                let dm_mul = match c {
+                    0 => x_dm_multiplier,
+                    1 => 1.0,
+                    _ => b_dm_multiplier,
+                };
+                let chan_w = match c {
+                    0 => 0.3f32,
+                    1 => 1.0,
+                    _ => 0.3,
+                };
                 for k in 1..256 {
                     let dw = dw_base[k] * dm_mul;
-                    if dw.abs() < 1e-10 { continue; }
+                    if dw.abs() < 1e-10 {
+                        continue;
+                    }
                     let q = (coeffs[c][k] * scale16 / dw).round();
                     e16 += q.abs().sqrt() * chan_w;
                 }
@@ -3015,12 +3218,16 @@ fn build_entropy_merge_transform_map(
                 let by = by4 * 4;
 
                 // Check: all 4 constituent DCT16 blocks must already be DCT16.
-                let all_dct16 = (0..2).all(|dy| (0..2).all(|dx| {
-                    let idx = (by + dy * 2) * bw + (bx + dx * 2);
-                    map[idx] & 0x3F == DCT16_TRANSFORM_ID
-                        && map[idx] & TRANSFORM_FIRST_BLOCK_FLAG != 0
-                }));
-                if !all_dct16 { continue; }
+                let all_dct16 = (0..2).all(|dy| {
+                    (0..2).all(|dx| {
+                        let idx = (by + dy * 2) * bw + (bx + dx * 2);
+                        map[idx] & 0x3F == DCT16_TRANSFORM_ID
+                            && map[idx] & TRANSFORM_FIRST_BLOCK_FLAG != 0
+                    })
+                });
+                if !all_dct16 {
+                    continue;
+                }
 
                 // Sum of 4x DCT16 entropies (full model).
                 let mut e16_sum = 0.0f32;
@@ -3030,20 +3237,42 @@ fn build_entropy_merge_transform_map(
                         let by16 = by + dy * 2;
                         let coeffs = compute_forward_transform_coeffs(
                             DCT16_TRANSFORM_ID,
-                            pixel_x, pixel_y, pixel_b,
-                            width, height, bx16, by16, 16, 16,
+                            pixel_x,
+                            pixel_y,
+                            pixel_b,
+                            width,
+                            height,
+                            bx16,
+                            by16,
+                            16,
+                            16,
                         );
-                        let rq16: u32 = (0..2).flat_map(|ddy| (0..2).map(move |ddx|
-                            raw_quant_map[(by16 + ddy) * bw + (bx16 + ddx)] as u32
-                        )).max().unwrap();
+                        let rq16: u32 = (0..2)
+                            .flat_map(|ddy| {
+                                (0..2).map(move |ddx| {
+                                    raw_quant_map[(by16 + ddy) * bw + (bx16 + ddx)] as u32
+                                })
+                            })
+                            .max()
+                            .unwrap();
                         let scale16 = (global_scale as f32 * rq16 as f32) / 65536.0;
                         for c in 0..3usize {
                             let dw_base = &dct16_weights[c * 256..(c + 1) * 256];
-                            let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
-                            let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                            let dm_mul = match c {
+                                0 => x_dm_multiplier,
+                                1 => 1.0,
+                                _ => b_dm_multiplier,
+                            };
+                            let chan_w = match c {
+                                0 => 0.3f32,
+                                1 => 1.0,
+                                _ => 0.3,
+                            };
                             for k in 1..256 {
                                 let dw = dw_base[k] * dm_mul;
-                                if dw.abs() < 1e-10 { continue; }
+                                if dw.abs() < 1e-10 {
+                                    continue;
+                                }
                                 let q = (coeffs[c][k] * scale16 / dw).round();
                                 e16_sum += q.abs().sqrt() * chan_w;
                             }
@@ -3067,18 +3296,35 @@ fn build_entropy_merge_transform_map(
 
                 let coeffs = compute_forward_transform_coeffs(
                     DCT32_TRANSFORM_ID,
-                    pixel_x, pixel_y, pixel_b,
-                    width, height, bx, by, 32, 32,
+                    pixel_x,
+                    pixel_y,
+                    pixel_b,
+                    width,
+                    height,
+                    bx,
+                    by,
+                    32,
+                    32,
                 );
                 let scale32 = (global_scale as f32 * rq32 as f32) / 65536.0;
                 let mut e32 = 0.0f32;
                 for c in 0..3usize {
                     let dw_base = &dct32_weights[c * 1024..(c + 1) * 1024];
-                    let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
-                    let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                    let dm_mul = match c {
+                        0 => x_dm_multiplier,
+                        1 => 1.0,
+                        _ => b_dm_multiplier,
+                    };
+                    let chan_w = match c {
+                        0 => 0.3f32,
+                        1 => 1.0,
+                        _ => 0.3,
+                    };
                     for k in 1..1024 {
                         let dw = dw_base[k] * dm_mul;
-                        if dw.abs() < 1e-10 { continue; }
+                        if dw.abs() < 1e-10 {
+                            continue;
+                        }
                         let q = (coeffs[c][k] * scale32 / dw).round();
                         e32 += q.abs().sqrt() * chan_w;
                     }
@@ -3877,12 +4123,7 @@ fn default_dct8x8_dequant_weights() -> &'static [f32] {
 /// For forward quantization (ignoring quant bias):
 ///   quantized = round(ac_float * raw_quant / (dequant_weight[k] * inv_global_scale))
 ///             = round(ac_float * raw_quant * global_scale / (dequant_weight[k] * 2^16))
-fn quantize_ac(
-    ac_float: f32,
-    global_scale: u32,
-    raw_quant: u32,
-    dequant_weight: f32,
-) -> i32 {
+fn quantize_ac(ac_float: f32, global_scale: u32, raw_quant: u32, dequant_weight: f32) -> i32 {
     if dequant_weight.abs() < 1e-10 {
         return 0;
     }
@@ -3895,7 +4136,6 @@ fn quantize_ac(
 /// Low dequant weight = visually important = small dead-zone (preserve detail).
 /// High dequant weight = less important = large dead-zone (save bytes).
 /// Returns dead-zone given the dequant_weight for the coefficient.
-
 
 /// Animation parameters for a single frame.
 struct AnimFrameParams {
@@ -3925,10 +4165,25 @@ fn encode_vardct_frame(
     use_gab: bool,
 ) -> Result<Vec<u8>> {
     encode_vardct_frame_inner(
-        width, height, bw, bh, global_scale, quant_lf,
-        dc_y, dc_x, dc_b, ac_x, ac_y, ac_b,
-        raw_quant_map, transform_map, ytox_map, ytob_map,
-        use_gab, None, true, // no animation, include file header
+        width,
+        height,
+        bw,
+        bh,
+        global_scale,
+        quant_lf,
+        dc_y,
+        dc_x,
+        dc_b,
+        ac_x,
+        ac_y,
+        ac_b,
+        raw_quant_map,
+        transform_map,
+        ytox_map,
+        ytob_map,
+        use_gab,
+        None,
+        true, // no animation, include file header
         None, // no alpha
     )
 }
@@ -3965,7 +4220,11 @@ fn encode_vardct_frame_inner(
     if include_file_header {
         // Codestream header
         if has_alpha {
-            crate::encode::headers::write_file_header_with_alpha(&mut writer, width as u32, height as u32)?;
+            crate::encode::headers::write_file_header_with_alpha(
+                &mut writer,
+                width as u32,
+                height as u32,
+            )?;
         } else {
             write_file_header(&mut writer, width as u32, height as u32, true, false)?;
         }
@@ -3975,13 +4234,16 @@ fn encode_vardct_frame_inner(
     writer.byte_align_zero_pad()?;
 
     // Frame header (VarDCT)
-    write_vardct_frame_header_full(&mut writer, &FrameHeaderConfig {
-        use_gab,
-        num_extra_channels,
-        have_animation: anim_params.is_some(),
-        duration: anim_params.map_or(0, |ap| ap.duration),
-        is_last: anim_params.map_or(true, |ap| ap.is_last),
-    })?;
+    write_vardct_frame_header_full(
+        &mut writer,
+        &FrameHeaderConfig {
+            use_gab,
+            num_extra_channels,
+            have_animation: anim_params.is_some(),
+            duration: anim_params.map_or(0, |ap| ap.duration),
+            is_last: anim_params.map_or(true, |ap| ap.is_last),
+        },
+    )?;
 
     // Group layout
     let group_dim_blocks = 32usize; // 256 pixels / 8
@@ -4046,21 +4308,23 @@ fn encode_vardct_frame_inner(
         // Pre-compute alpha tiles for multi-group encoding
         let alpha_tiles: Vec<Option<(Vec<i32>, usize, usize)>> = if let Some(alpha_data) = alpha {
             let group_dim = 256usize;
-            (0..num_groups).map(|g| {
-                let gx = g % num_groups_x;
-                let gy = g / num_groups_x;
-                let px0 = gx * group_dim;
-                let py0 = gy * group_dim;
-                let pw = (px0 + group_dim).min(width) - px0;
-                let ph = (py0 + group_dim).min(height) - py0;
-                let mut tile = vec![0i32; pw * ph];
-                for y in 0..ph {
-                    for x in 0..pw {
-                        tile[y * pw + x] = alpha_data[(py0 + y) * width + (px0 + x)] as i32;
+            (0..num_groups)
+                .map(|g| {
+                    let gx = g % num_groups_x;
+                    let gy = g / num_groups_x;
+                    let px0 = gx * group_dim;
+                    let py0 = gy * group_dim;
+                    let pw = (px0 + group_dim).min(width) - px0;
+                    let ph = (py0 + group_dim).min(height) - py0;
+                    let mut tile = vec![0i32; pw * ph];
+                    for y in 0..ph {
+                        for x in 0..pw {
+                            tile[y * pw + x] = alpha_data[(py0 + y) * width + (px0 + x)] as i32;
+                        }
                     }
-                }
-                Some((tile, pw, ph))
-            }).collect()
+                    Some((tile, pw, ph))
+                })
+                .collect()
         } else {
             vec![None; num_groups]
         };
@@ -4119,7 +4383,12 @@ fn encode_vardct_frame_inner(
         // --- Phase 2: Write sections ---
 
         // LfGlobal
-        sections.push(encode_lf_global_section(global_scale, quant_lf, block_ctx.as_ref(), has_alpha)?);
+        sections.push(encode_lf_global_section(
+            global_scale,
+            quant_lf,
+            block_ctx.as_ref(),
+            has_alpha,
+        )?);
 
         // LfGroups (use LF group dimensions)
         for g in 0..num_lf_groups {
@@ -4198,7 +4467,9 @@ fn encode_vardct_frame_inner(
                 )?;
                 let mut hf_groups = Vec::with_capacity(num_groups);
                 for g in 0..num_groups {
-                    let at = alpha_tiles[g].as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h));
+                    let at = alpha_tiles[g]
+                        .as_ref()
+                        .map(|(d, w, h)| (d.as_slice(), *w, *h));
                     hf_groups.push(encode_hf_group_tokens_ans(
                         num_groups,
                         &group_tokens[g],
@@ -4222,7 +4493,9 @@ fn encode_vardct_frame_inner(
                 encode_hf_global_section_with_code(num_groups, &context_map, &uint_config, &codes)?;
             let mut hf_groups = Vec::with_capacity(num_groups);
             for g in 0..num_groups {
-                let at = alpha_tiles[g].as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h));
+                let at = alpha_tiles[g]
+                    .as_ref()
+                    .map(|(d, w, h)| (d.as_slice(), *w, *h));
                 hf_groups.push(encode_hf_group_tokens(
                     num_groups,
                     &group_tokens[g],
@@ -4360,7 +4633,13 @@ fn tokenize_hf_region(
             for (ci, &c) in channel_indices.iter().enumerate() {
                 let ac = ac_channels[ci];
                 let block_ctx = if let (Some(rqm), Some(bci)) = (raw_quant_map, block_ctx_info) {
-                    custom_block_context(c, shape_id, rqm[global_idx] as u32, &bci.qf_thresholds, &bci.context_map)
+                    custom_block_context(
+                        c,
+                        shape_id,
+                        rqm[global_idx] as u32,
+                        &bci.qf_thresholds,
+                        &bci.context_map,
+                    )
                 } else {
                     default_block_context(c, shape_id, 0)
                 };
@@ -4370,8 +4649,7 @@ fn tokenize_hf_region(
                     let blk_coeffs = &ac[global_idx * 64..(global_idx + 1) * 64];
                     // Map channel index to order index:
                     // ci=0->Y (order[0]), ci=1->X (order[1]), ci=2->B (order[2])
-                    let order_for_chan =
-                        custom_orders_8x8.map(|orders| &orders[ci]);
+                    let order_for_chan = custom_orders_8x8.map(|orders| &orders[ci]);
                     let nz = tokenize_block_8x8(
                         blk_coeffs,
                         c,
@@ -4727,8 +5005,7 @@ fn encode_coeff_orders(
     for e in &encoded {
         freqs[e.token as usize] += 1;
     }
-    let code =
-        build_huffman_code(&freqs).ok_or(crate::error::Error::InvalidHuffman)?;
+    let code = build_huffman_code(&freqs).ok_or(crate::error::Error::InvalidHuffman)?;
 
     use crate::encode::entropy::huffman_encode::{write_huffman_histograms, write_huffman_symbol};
     write_huffman_histograms(w, &context_map, &[uint_config], &[code.clone()])?;
@@ -4811,15 +5088,20 @@ fn tokenize_block_8x8(
 
 /// Compute block context using a custom BlockContextMap.
 fn custom_block_context(
-    channel: usize, shape_id: usize, qf: u32,
-    qf_thresholds: &[u32], context_map: &[u8],
+    channel: usize,
+    shape_id: usize,
+    qf: u32,
+    qf_thresholds: &[u32],
+    context_map: &[u8],
 ) -> usize {
     let ch_remap = if channel < 2 { channel ^ 1 } else { 2 };
     let num_orders = 13;
     let shape_id = shape_id.min(num_orders - 1);
     let mut qf_idx = 0usize;
     for t in qf_thresholds {
-        if qf > *t { qf_idx += 1; }
+        if qf > *t {
+            qf_idx += 1;
+        }
     }
     // No lf_thresholds -> num_lf_contexts = 1, lf_idx = 0
     let idx = ch_remap * num_orders + shape_id;
@@ -4991,14 +5273,22 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
 }
 
 /// Legacy wrapper: no extra channels, no animation, is_last=true.
-fn write_vardct_frame_header(writer: &mut BitWriter, _width: u32, _height: u32, use_gab: bool) -> Result<()> {
-    write_vardct_frame_header_full(writer, &FrameHeaderConfig {
-        use_gab,
-        num_extra_channels: 0,
-        have_animation: false,
-        duration: 0,
-        is_last: true,
-    })
+fn write_vardct_frame_header(
+    writer: &mut BitWriter,
+    _width: u32,
+    _height: u32,
+    use_gab: bool,
+) -> Result<()> {
+    write_vardct_frame_header_full(
+        writer,
+        &FrameHeaderConfig {
+            use_gab,
+            num_extra_channels: 0,
+            have_animation: false,
+            duration: 0,
+            is_last: true,
+        },
+    )
 }
 
 /// Legacy wrapper for animation: no extra channels.
@@ -5010,24 +5300,22 @@ fn write_vardct_frame_header_animated(
     duration: u32,
     is_last: bool,
 ) -> Result<()> {
-    write_vardct_frame_header_full(writer, &FrameHeaderConfig {
-        use_gab,
-        num_extra_channels: 0,
-        have_animation: true,
-        duration,
-        is_last,
-    })
+    write_vardct_frame_header_full(
+        writer,
+        &FrameHeaderConfig {
+            use_gab,
+            num_extra_channels: 0,
+            have_animation: true,
+            duration,
+            is_last,
+        },
+    )
 }
 
 fn duration_coder() -> crate::headers::encodings::U32Coder {
     use crate::headers::encodings::{U32, U32Coder};
     // u2S(0, 1, Bits(8), Bits(32))
-    U32Coder::Select(
-        U32::Val(0),
-        U32::Val(1),
-        U32::Bits(8),
-        U32::Bits(32),
-    )
+    U32Coder::Select(U32::Val(0), U32::Val(1), U32::Bits(8), U32::Bits(32))
 }
 
 /// Encode all frame data as a single section (for single-group images).
@@ -5159,9 +5447,8 @@ fn encode_single_group_section(
 
     // === HfGlobal + HfGroup0: AC coefficients ===
     // Compute optimal coefficient order for 8x8 DCT
-    let custom_orders = compute_optimal_coeff_orders_8x8(
-        ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh,
-    );
+    let custom_orders =
+        compute_optimal_coeff_orders_8x8(ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh);
     let use_custom_order = custom_orders != [natural_coeff_order_8x8(); 3];
 
     // Tokenize all blocks' AC coefficients
@@ -5186,7 +5473,7 @@ fn encode_single_group_section(
         } else {
             None
         },
-        None,  // no custom block context for single-group
+        None, // no custom block context for single-group
         None,
     )?;
 
@@ -5220,9 +5507,9 @@ fn encode_single_group_section(
 /// Encode the LfGlobal section.
 /// Custom block context map parameters.
 struct CustomBlockCtx {
-    qf_thresholds: Vec<u32>,      // quant field thresholds
-    context_map: Vec<u8>,         // context map entries
-    num_contexts: usize,          // max(context_map) + 1
+    qf_thresholds: Vec<u32>, // quant field thresholds
+    context_map: Vec<u8>,    // context map entries
+    num_contexts: usize,     // max(context_map) + 1
 }
 
 /// Compute an optimized block context map (port of libjxl's FindBestBlockEntropyModel).
@@ -5281,9 +5568,8 @@ fn compute_block_context_map(
 
     // Start with the default map structure (39 entries) replicated for 2 qf segments
     const DEFAULT_CTX_MAP: [u8; 39] = [
-        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
-        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
-        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, 7,
+        8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
     ];
     // Y uses contexts 0-6 (7 unique), X uses 7-14 (8 unique), B same as X
     // For qf split: Y-low=0-6, Y-high=7-13 (shifted by 7), X/B use shared 14-15
@@ -5306,11 +5592,13 @@ fn compute_block_context_map(
                 } else {
                     base_ctx
                 };
-                let out_idx = ch_remap * num_orders * num_qf_segments
-                    + order * num_qf_segments + qf_seg;
+                let out_idx =
+                    ch_remap * num_orders * num_qf_segments + order * num_qf_segments + qf_seg;
                 if out_idx < map_size {
                     context_map[out_idx] = ctx;
-                    if ctx > max_ctx { max_ctx = ctx; }
+                    if ctx > max_ctx {
+                        max_ctx = ctx;
+                    }
                 }
             }
         }
@@ -6064,7 +6352,8 @@ fn write_ac_histograms_and_tokens(
     // Build context map candidates once using the base uint_config.
     let base_uint = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
     let base_encoded: Vec<_> = tokens.iter().map(|t| base_uint.encode(t.value)).collect();
-    let base_alphabet = (base_encoded.iter().map(|e| e.token).max().unwrap_or(0) as usize + 1).max(1);
+    let base_alphabet =
+        (base_encoded.iter().map(|e| e.token).max().unwrap_or(0) as usize + 1).max(1);
 
     let mut context_map_candidates =
         build_ac_context_map_candidates(num_ac_contexts, &context_counts);
@@ -6219,9 +6508,7 @@ fn encode_hf_group_tokens(
 
     // Write modular alpha data after AC tokens, before byte-alignment
     if let Some((tile_data, tw, th)) = alpha_tile {
-        crate::encode::modular_encode::encode_modular_signed_stream(
-            &mut w, tw, th, 1, tile_data,
-        )?;
+        crate::encode::modular_encode::encode_modular_signed_stream(&mut w, tw, th, 1, tile_data)?;
     }
 
     w.byte_align_zero_pad()?;
@@ -6257,9 +6544,7 @@ fn encode_hf_group_tokens_ans(
 
     // Write modular alpha data after AC tokens, before byte-alignment
     if let Some((tile_data, tw, th)) = alpha_tile {
-        crate::encode::modular_encode::encode_modular_signed_stream(
-            &mut w, tw, th, 1, tile_data,
-        )?;
+        crate::encode::modular_encode::encode_modular_signed_stream(&mut w, tw, th, 1, tile_data)?;
     }
 
     w.byte_align_zero_pad()?;
@@ -6372,16 +6657,34 @@ mod tests {
         }
 
         let quant_ac_low = 0.79 / 0.8;
-        let (low_dist_map, _, _, _) =
-            build_adaptive_raw_quant_map_full(&xyb_x, &xyb_y, &xyb_b, img_w, img_h, bw, bh, 0.8, quant_ac_low);
+        let (low_dist_map, _, _, _) = build_adaptive_raw_quant_map_full(
+            &xyb_x,
+            &xyb_y,
+            &xyb_b,
+            img_w,
+            img_h,
+            bw,
+            bh,
+            0.8,
+            quant_ac_low,
+        );
         assert!(
             low_dist_map.iter().all(|&q| q == low_dist_map[0]),
             "distance gating should keep raw_quant uniform at d<1"
         );
 
         let quant_ac_high = 0.79 / 2.0;
-        let (high_dist_map, _, _, _) =
-            build_adaptive_raw_quant_map_full(&xyb_x, &xyb_y, &xyb_b, img_w, img_h, bw, bh, 2.0, quant_ac_high);
+        let (high_dist_map, _, _, _) = build_adaptive_raw_quant_map_full(
+            &xyb_x,
+            &xyb_y,
+            &xyb_b,
+            img_w,
+            img_h,
+            bw,
+            bh,
+            2.0,
+            quant_ac_high,
+        );
         assert_eq!(high_dist_map.len(), num_blocks);
         assert!(high_dist_map.iter().all(|&q| q >= 1));
         assert!(
@@ -7524,9 +7827,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7578,9 +7895,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7632,9 +7963,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7685,9 +8030,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7738,9 +8097,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7791,9 +8164,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7844,9 +8231,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7897,9 +8298,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -7956,9 +8371,23 @@ mod tests {
             )
             .unwrap();
 
-            let tokens =
-                tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                    .unwrap();
+            let tokens = tokenize_hf_region(
+                &ac_x,
+                &ac_y,
+                &ac_b,
+                &transform_map,
+                bw,
+                0,
+                0,
+                bw,
+                bh,
+                15,
+                0,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             assert!(tokens.iter().any(|t| t.value > 0));
         }
     }
@@ -8157,9 +8586,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8216,9 +8659,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8275,9 +8732,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8337,9 +8808,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8399,9 +8884,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8461,9 +8960,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8523,9 +9036,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8585,9 +9112,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8647,9 +9188,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8709,9 +9264,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8771,9 +9340,23 @@ mod tests {
         )
         .unwrap();
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8807,9 +9390,23 @@ mod tests {
             }
         }
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8843,9 +9440,23 @@ mod tests {
             }
         }
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -8879,9 +9490,23 @@ mod tests {
             }
         }
 
-        let tokens =
-            tokenize_hf_region(&ac_x, &ac_y, &ac_b, &transform_map, bw, 0, 0, bw, bh, 15, 0, None, None, None)
-                .unwrap();
+        let tokens = tokenize_hf_region(
+            &ac_x,
+            &ac_y,
+            &ac_b,
+            &transform_map,
+            bw,
+            0,
+            0,
+            bw,
+            bh,
+            15,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(tokens.iter().any(|t| t.value > 0));
     }
 
@@ -9546,7 +10171,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod inverse_transform_tests {
     use super::*;
@@ -9563,15 +10187,29 @@ mod inverse_transform_tests {
         }
         let coeffs = compute_forward_transform_coeffs(
             DCT2X2_TRANSFORM_ID,
-            &pixels[0], &pixels[1], &pixels[2],
-            8, 8, 0, 0, 8, 8,
+            &pixels[0],
+            &pixels[1],
+            &pixels[2],
+            8,
+            8,
+            0,
+            0,
+            8,
+            8,
         );
         let recon = inverse_transform_8x8_all_channels(DCT2X2_TRANSFORM_ID, &coeffs);
         for c in 0..3 {
-            let max_err = pixels[c].iter().zip(recon[c].iter())
+            let max_err = pixels[c]
+                .iter()
+                .zip(recon[c].iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_err < 0.05, "DCT2X2 roundtrip channel {}: max_err={}", c, max_err);
+            assert!(
+                max_err < 0.05,
+                "DCT2X2 roundtrip channel {}: max_err={}",
+                c,
+                max_err
+            );
         }
     }
 
@@ -9587,15 +10225,29 @@ mod inverse_transform_tests {
         }
         let coeffs = compute_forward_transform_coeffs(
             IDENTITY_TRANSFORM_ID,
-            &pixels[0], &pixels[1], &pixels[2],
-            8, 8, 0, 0, 8, 8,
+            &pixels[0],
+            &pixels[1],
+            &pixels[2],
+            8,
+            8,
+            0,
+            0,
+            8,
+            8,
         );
         let recon = inverse_transform_8x8_all_channels(IDENTITY_TRANSFORM_ID, &coeffs);
         for c in 0..3 {
-            let max_err = pixels[c].iter().zip(recon[c].iter())
+            let max_err = pixels[c]
+                .iter()
+                .zip(recon[c].iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_err < 0.05, "IDENTITY roundtrip channel {}: max_err={}", c, max_err);
+            assert!(
+                max_err < 0.05,
+                "IDENTITY roundtrip channel {}: max_err={}",
+                c,
+                max_err
+            );
         }
     }
 
@@ -9614,8 +10266,15 @@ mod inverse_transform_tests {
         // Forward DCT8
         let coeffs = compute_forward_transform_coeffs(
             DCT8_TRANSFORM_ID,
-            &pixels[0], &pixels[1], &pixels[2],
-            8, 8, 0, 0, 8, 8,
+            &pixels[0],
+            &pixels[1],
+            &pixels[2],
+            8,
+            8,
+            0,
+            0,
+            8,
+            8,
         );
 
         // Inverse
@@ -9623,10 +10282,17 @@ mod inverse_transform_tests {
 
         // Compare
         for c in 0..3 {
-            let max_err = pixels[c].iter().zip(recon[c].iter())
+            let max_err = pixels[c]
+                .iter()
+                .zip(recon[c].iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_err < 0.01, "DCT8 roundtrip channel {}: max_err={}", c, max_err);
+            assert!(
+                max_err < 0.01,
+                "DCT8 roundtrip channel {}: max_err={}",
+                c,
+                max_err
+            );
         }
     }
 }
@@ -9642,9 +10308,9 @@ mod animation_tests {
         let h = 16usize;
         let mut rgba = vec![0u8; w * h * 4];
         for i in 0..w * h {
-            rgba[i * 4] = 255;     // R
-            rgba[i * 4 + 1] = 0;   // G
-            rgba[i * 4 + 2] = 0;   // B
+            rgba[i * 4] = 255; // R
+            rgba[i * 4 + 1] = 0; // G
+            rgba[i * 4 + 2] = 0; // B
             rgba[i * 4 + 3] = ((i * 255) / (w * h - 1)) as u8; // gradient alpha
         }
         let config = VarDctConfig { distance: 2.0 };
@@ -9659,7 +10325,10 @@ mod animation_tests {
         // Load dice RGBA (800x600, multi-group)
         let bin = match std::fs::read("/tmp/dice_rgba.bin") {
             Ok(b) => b,
-            Err(_) => { eprintln!("Skipping test_encode_rgba_dice: /tmp/dice_rgba.bin not found"); return; }
+            Err(_) => {
+                eprintln!("Skipping test_encode_rgba_dice: /tmp/dice_rgba.bin not found");
+                return;
+            }
         };
         let w = 800usize;
         let h = 600usize;
@@ -9678,15 +10347,20 @@ mod animation_tests {
         // 3 frames: red, green, blue
         for c in 0..3u8 {
             let mut rgb = vec![0u8; w * h * 3];
-            for i in 0..w*h {
-                rgb[i*3 + c as usize] = 255;
+            for i in 0..w * h {
+                rgb[i * 3 + c as usize] = 255;
             }
             frames.push((rgb, 100u32));
         }
-        let frame_refs: Vec<(&[u8], u32)> = frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
+        let frame_refs: Vec<(&[u8], u32)> =
+            frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
         let config = VarDctConfig { distance: 2.0 };
         let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
-        assert!(data.len() > 100, "animation too small: {} bytes", data.len());
+        assert!(
+            data.len() > 100,
+            "animation too small: {} bytes",
+            data.len()
+        );
         std::fs::write("/tmp/anim_test.jxl", &data).unwrap();
         eprintln!("Animation: {} bytes, 3 frames 16x16", data.len());
     }
@@ -9705,11 +10379,18 @@ mod animation_tests {
             let end = start + frame_size;
             frames.push((bin[start..end].to_vec(), 50u32));
         }
-        let frame_refs: Vec<(&[u8], u32)> = frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
+        let frame_refs: Vec<(&[u8], u32)> =
+            frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
         let config = VarDctConfig { distance: 1.0 };
         let data = encode_vardct_animation_u8_rgba(&frame_refs, w, h, &config).unwrap();
         std::fs::write("/tmp/anim_icos_rgba_jxlrs.jxl", &data).unwrap();
-        eprintln!("Icos RGBA animation: {} bytes, {} frames {}x{}", data.len(), n, w, h);
+        eprintln!(
+            "Icos RGBA animation: {} bytes, {} frames {}x{}",
+            data.len(),
+            n,
+            w,
+            h
+        );
     }
 
     #[test]
@@ -9726,10 +10407,17 @@ mod animation_tests {
             let end = start + frame_size;
             frames.push((bin[start..end].to_vec(), 50u32)); // 50ms = 20fps
         }
-        let frame_refs: Vec<(&[u8], u32)> = frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
+        let frame_refs: Vec<(&[u8], u32)> =
+            frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
         let config = VarDctConfig { distance: 1.0 };
         let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
         std::fs::write("/tmp/anim_icos_jxlrs.jxl", &data).unwrap();
-        eprintln!("Icos animation: {} bytes, {} frames {}x{} (ref libjxl: 341449)", data.len(), n, w, h);
+        eprintln!(
+            "Icos animation: {} bytes, {} frames {}x{} (ref libjxl: 341449)",
+            data.len(),
+            n,
+            w,
+            h
+        );
     }
 }
