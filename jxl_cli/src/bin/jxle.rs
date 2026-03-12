@@ -81,51 +81,153 @@ struct Opt {
     raw_rgba8_input: Option<PathBuf>,
 }
 
-/// Encode animation from a directory of sorted PPM frames.
+/// Encode animation from a directory of sorted frames.
+///
+/// Supported directory modes:
+/// - .ppm frames (P6/P5): encoded as RGB animation
+/// - .png frames: encoded as RGBA animation (alpha preserved)
 fn encode_animation_from_dir(opt: &Opt, dir: &PathBuf) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .wrap_err_with(|| format!("Failed to read directory {:?}", dir))?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let name = e.file_name().to_string_lossy().to_lowercase();
-            name.ends_with(".ppm")
+            name.ends_with(".ppm") || name.ends_with(".png")
         })
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
     if entries.is_empty() {
-        return Err(color_eyre::eyre::eyre!("No .ppm files found in {:?}", dir));
+        return Err(color_eyre::eyre::eyre!(
+            "No .ppm or .png files found in {:?}",
+            dir
+        ));
     }
 
-    eprintln!("Found {} PPM frames in {:?}", entries.len(), dir);
+    let first_ext = entries[0]
+        .path()
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let all_same_ext = entries.iter().all(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .eq_ignore_ascii_case(&first_ext)
+    });
+    if !all_same_ext {
+        return Err(color_eyre::eyre::eyre!(
+            "Mixed frame extensions in {:?}; use either all .ppm or all .png",
+            dir
+        ));
+    }
 
-    let mut frames_data: Vec<(Vec<u8>, u32)> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
+
+    let output = opt.output.clone().unwrap_or_else(|| {
+        let mut p = dir.clone();
+        p.set_extension("jxl");
+        p
+    });
+
+    if first_ext == "png" {
+        eprintln!("Found {} PNG frames in {:?}", entries.len(), dir);
+        let mut frames_data: Vec<(Vec<u8>, u32)> = Vec::new();
+
+        for (i, entry) in entries.iter().enumerate() {
+            let (w, h, rgba) = read_png_rgba(&entry.path())?;
+            if i == 0 {
+                width = w;
+                height = h;
+            } else if w != width || h != height {
+                return Err(color_eyre::eyre::eyre!(
+                    "Frame {} has different size {}x{} (expected {}x{})",
+                    i,
+                    w,
+                    h,
+                    width,
+                    height
+                ));
+            }
+            frames_data.push((rgba, opt.frame_duration_ms));
+        }
+
+        let frame_refs: Vec<(&[u8], u32)> = frames_data
+            .iter()
+            .map(|(d, ms)| (d.as_slice(), *ms))
+            .collect();
+
+        use jxl::encode::vardct::{VarDctConfig, encode_vardct_animation_u8_rgba};
+        let config = VarDctConfig {
+            distance: opt.distance,
+        };
+        let bytes =
+            encode_vardct_animation_u8_rgba(&frame_refs, width as usize, height as usize, &config)
+                .map_err(|e| color_eyre::eyre::eyre!("Animation RGBA encode failed: {e:?}"))?;
+
+        std::fs::write(&output, &bytes)
+            .wrap_err_with(|| format!("Failed to write {:?}", output))?;
+
+        eprintln!(
+            "{:?} -> {:?}: {}x{}, {} frames, {} bytes (VarDCT RGBA animation, d={:.2}, {}ms/frame)",
+            dir,
+            output,
+            width,
+            height,
+            frames_data.len(),
+            bytes.len(),
+            opt.distance,
+            opt.frame_duration_ms
+        );
+        return Ok(());
+    }
+
+    // PPM animation (RGB)
+    eprintln!("Found {} PPM frames in {:?}", entries.len(), dir);
+    let mut frames_data: Vec<(Vec<u8>, u32)> = Vec::new();
 
     for (i, entry) in entries.iter().enumerate() {
         let pnm = read_pnm(&entry.path())?;
         match pnm {
-            PnmImage::Rgb8 { width: w, height: h, data } => {
+            PnmImage::Rgb8 {
+                width: w,
+                height: h,
+                data,
+            } => {
                 if i == 0 {
                     width = w;
                     height = h;
                 } else if w != width || h != height {
                     return Err(color_eyre::eyre::eyre!(
                         "Frame {} has different size {}x{} (expected {}x{})",
-                        i, w, h, width, height
+                        i,
+                        w,
+                        h,
+                        width,
+                        height
                     ));
                 }
                 frames_data.push((data, opt.frame_duration_ms));
             }
-            PnmImage::Gray8 { width: w, height: h, data } => {
+            PnmImage::Gray8 {
+                width: w,
+                height: h,
+                data,
+            } => {
                 if i == 0 {
                     width = w;
                     height = h;
                 } else if w != width || h != height {
                     return Err(color_eyre::eyre::eyre!(
                         "Frame {} has different size {}x{} (expected {}x{})",
-                        i, w, h, width, height
+                        i,
+                        w,
+                        h,
+                        width,
+                        height
                     ));
                 }
                 // Convert gray to RGB
@@ -140,28 +242,31 @@ fn encode_animation_from_dir(opt: &Opt, dir: &PathBuf) -> Result<()> {
         }
     }
 
-    let frame_refs: Vec<(&[u8], u32)> = frames_data.iter()
+    let frame_refs: Vec<(&[u8], u32)> = frames_data
+        .iter()
         .map(|(d, ms)| (d.as_slice(), *ms))
         .collect();
 
     use jxl::encode::vardct::{VarDctConfig, encode_vardct_animation_u8_rgb};
-    let config = VarDctConfig { distance: opt.distance };
-    let bytes = encode_vardct_animation_u8_rgb(&frame_refs, width as usize, height as usize, &config)
-        .map_err(|e| color_eyre::eyre::eyre!("Animation encode failed: {e:?}"))?;
+    let config = VarDctConfig {
+        distance: opt.distance,
+    };
+    let bytes =
+        encode_vardct_animation_u8_rgb(&frame_refs, width as usize, height as usize, &config)
+            .map_err(|e| color_eyre::eyre::eyre!("Animation RGB encode failed: {e:?}"))?;
 
-    let output = opt.output.clone().unwrap_or_else(|| {
-        let mut p = dir.clone();
-        p.set_extension("jxl");
-        p
-    });
-
-    std::fs::write(&output, &bytes)
-        .wrap_err_with(|| format!("Failed to write {:?}", output))?;
+    std::fs::write(&output, &bytes).wrap_err_with(|| format!("Failed to write {:?}", output))?;
 
     eprintln!(
         "{:?} -> {:?}: {}x{}, {} frames, {} bytes (VarDCT animation, d={:.2}, {}ms/frame)",
-        dir, output, width, height, frames_data.len(), bytes.len(),
-        opt.distance, opt.frame_duration_ms
+        dir,
+        output,
+        width,
+        height,
+        frames_data.len(),
+        bytes.len(),
+        opt.distance,
+        opt.frame_duration_ms
     );
 
     Ok(())
@@ -275,6 +380,80 @@ fn read_pnm(path: &PathBuf) -> Result<PnmImage> {
     }
 }
 
+fn read_png_rgba(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>)> {
+    use png::{BitDepth, ColorType, Transformations};
+
+    let file = std::fs::File::open(path)
+        .wrap_err_with(|| format!("Failed to open PNG frame {:?}", path))?;
+    let reader = std::io::BufReader::new(file);
+    let mut decoder = png::Decoder::new(reader);
+    decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
+
+    let mut reader = decoder
+        .read_info()
+        .wrap_err_with(|| format!("Failed to read PNG info {:?}", path))?;
+    let out_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| color_eyre::eyre::eyre!("PNG output buffer size unknown for {:?}", path))?;
+    let mut buf = vec![0u8; out_size];
+    let info = reader
+        .next_frame(&mut buf)
+        .wrap_err_with(|| format!("Failed to decode PNG frame {:?}", path))?;
+
+    if info.bit_depth != BitDepth::Eight {
+        return Err(color_eyre::eyre::eyre!(
+            "Only 8-bit PNG frames are supported in animation mode, got {:?} for {:?}",
+            info.bit_depth,
+            path
+        ));
+    }
+
+    let data = &buf[..info.buffer_size()];
+    let npixels = (info.width as usize) * (info.height as usize);
+    let mut rgba = vec![0u8; npixels * 4];
+
+    match info.color_type {
+        ColorType::Rgba => {
+            rgba.copy_from_slice(data);
+        }
+        ColorType::Rgb => {
+            for i in 0..npixels {
+                rgba[i * 4] = data[i * 3];
+                rgba[i * 4 + 1] = data[i * 3 + 1];
+                rgba[i * 4 + 2] = data[i * 3 + 2];
+                rgba[i * 4 + 3] = 255;
+            }
+        }
+        ColorType::Grayscale => {
+            for i in 0..npixels {
+                let g = data[i];
+                rgba[i * 4] = g;
+                rgba[i * 4 + 1] = g;
+                rgba[i * 4 + 2] = g;
+                rgba[i * 4 + 3] = 255;
+            }
+        }
+        ColorType::GrayscaleAlpha => {
+            for i in 0..npixels {
+                let g = data[i * 2];
+                let a = data[i * 2 + 1];
+                rgba[i * 4] = g;
+                rgba[i * 4 + 1] = g;
+                rgba[i * 4 + 2] = g;
+                rgba[i * 4 + 3] = a;
+            }
+        }
+        ColorType::Indexed => {
+            return Err(color_eyre::eyre::eyre!(
+                "Unexpected indexed PNG output after EXPAND for {:?}",
+                path
+            ));
+        }
+    }
+
+    Ok((info.width, info.height, rgba))
+}
+
 fn main() -> Result<()> {
     let opt = Opt::parse();
     let enc = JxlEncoder::default();
@@ -378,25 +557,38 @@ fn main() -> Result<()> {
     if let Some(rgba_path) = &opt.raw_rgba8_input {
         let width = opt.width.expect("--width required for --raw-rgba8-input");
         let height = opt.height.expect("--height required for --raw-rgba8-input");
-        let rgba = std::fs::read(rgba_path)
-            .wrap_err_with(|| format!("Failed to read {:?}", rgba_path))?;
+        let rgba =
+            std::fs::read(rgba_path).wrap_err_with(|| format!("Failed to read {:?}", rgba_path))?;
         let expected = (width as usize) * (height as usize) * 4;
         if rgba.len() != expected {
             return Err(color_eyre::eyre::eyre!(
                 "RGBA file size {} != expected {} ({}x{}x4)",
-                rgba.len(), expected, width, height
+                rgba.len(),
+                expected,
+                width,
+                height
             ));
         }
         use jxl::encode::vardct::{VarDctConfig, encode_vardct_u8_rgba};
-        let config = VarDctConfig { distance: opt.distance };
+        let config = VarDctConfig {
+            distance: opt.distance,
+        };
         let bytes = encode_vardct_u8_rgba(&rgba, width as usize, height as usize, &config)
             .map_err(|e| color_eyre::eyre::eyre!("RGBA encode failed: {e:?}"))?;
-        let output = opt.output.clone().unwrap_or_else(|| PathBuf::from("output.jxl"));
+        let output = opt
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("output.jxl"));
         std::fs::write(&output, &bytes)
             .wrap_err_with(|| format!("Failed to write {:?}", output))?;
         eprintln!(
             "{:?} -> {:?}: {}x{} RGBA, {} bytes (VarDCT+alpha, d={:.2})",
-            rgba_path, output, width, height, bytes.len(), opt.distance
+            rgba_path,
+            output,
+            width,
+            height,
+            bytes.len(),
+            opt.distance
         );
         return Ok(());
     }
