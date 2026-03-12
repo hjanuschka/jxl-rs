@@ -766,6 +766,43 @@ struct QuantizedVardct {
 /// Compute per-tile CfL maps (ytox_map and ytob_map) via least-squares regression.
 /// Returns (ytox_map, ytob_map), each cr_w * cr_h values.
 /// Actual factors: base_correlation_x + x_factor/84 for X, base_correlation_b + b_factor/84 for B.
+/// libjxl's towards_zero shrinkage for CfL multipliers.
+/// Reduces oscillations by pulling small values to zero.
+const TOWARDS_ZERO: f64 = 2.6;
+
+/// Approximate quantization weights for CfL regression.
+/// libjxl multiplies DCT coefficients by q * inv_dequant_matrix[k].
+/// The inv_dequant_matrix is ~1/dequant_weight, which is high for DC and
+/// low-frequency coefficients, dropping off for HF. We approximate this
+/// with 1/(1 + distance_from_dc). This weights low-frequency AC
+/// coefficients more heavily, matching libjxl's behavior.
+static CFL_QUANT_WEIGHTS: [f32; 64] = {
+    let mut w = [0.0f32; 64];
+    let mut ky = 0;
+    while ky < 8 {
+        let mut kx = 0;
+        while kx < 8 {
+            let k = ky * 8 + kx;
+            // Manhattan distance from DC, scaled to approximate quant weight
+            let dist = (ky + kx) as f32;
+            w[k] = 1.0 / (1.0 + dist * dist * 0.25);
+            kx += 1;
+        }
+        ky += 1;
+    }
+    w
+};
+
+fn towards_zero_shrink(x: f64, threshold: f64) -> f64 {
+    if x >= threshold {
+        x - threshold
+    } else if x <= -threshold {
+        x + threshold
+    } else {
+        0.0
+    }
+}
+
 fn compute_cfl_maps(
     dct_x: &[f32],
     dct_y: &[f32],
@@ -773,6 +810,20 @@ fn compute_cfl_maps(
     bw: usize,
     bh: usize,
 ) -> (Vec<i32>, Vec<i32>) {
+    // Get DCT8 dequant weights for weighting CfL regression.
+    // Table 0 (Dct) has 3*64 = 192 entries: [0..64]=Y, [64..128]=X, [128..192]=B.
+    // libjxl uses InvMatrix(strategy, channel) which returns 1/dequant_weight.
+    // We use the raw dequant weights as multipliers: 1/dw = quant weight.
+    let dw_table = crate::frame::quant_weights::DequantMatrices::get_library_table(0);
+    // Invert to get quant weights (high for positions that get quantized hard)
+    let mut qw_x = [0.0f64; 64];
+    let mut qw_b = [0.0f64; 64];
+    for k in 0..64 {
+        // dw_table contains dequant weights. InvMatrix = 1/dw.
+        // CfL multiplies by InvMatrix (= 1/dw = quant weight).
+        qw_x[k] = 1.0 / (dw_table[64 + k] as f64).max(1e-10);
+        qw_b[k] = 1.0 / (dw_table[128 + k] as f64).max(1e-10);
+    }
     const K_COLOR_FACTOR: f32 = 84.0;
     let cr_w = bw.div_ceil(8);
     let cr_h = bh.div_ceil(8);
@@ -781,34 +832,66 @@ fn compute_cfl_maps(
 
     for ty in 0..cr_h {
         for tx in 0..cr_w {
-            let mut sum_yy = 0.0f64;
-            let mut sum_yx = 0.0f64;
-            let mut sum_yb = 0.0f64;
+            let mut sum_yy_x = 0.0f64; // Y*Y weighted by X-channel quant
+            let mut sum_yx = 0.0f64;  // Y*X weighted by X-channel quant
+            let mut sum_yy_b = 0.0f64; // Y*Y weighted by B-channel quant
+            let mut sum_yb = 0.0f64;  // Y*B weighted by B-channel quant
 
+            // libjxl weights DCT coefficients by q * inv_dequant_matrix[k]
+            // (the quantization strength). This ensures that coefficients
+            // which will be quantized to zero don't influence the CfL
+            // regression. Critical for images with large uniform areas.
             for by in (ty * 8)..((ty + 1) * 8).min(bh) {
                 for bx in (tx * 8)..((tx + 1) * 8).min(bw) {
                     let blk = by * bw + bx;
                     for k in 1..64 {
-                        let y = dct_y[blk * 64 + k] as f64;
-                        let x = dct_x[blk * 64 + k] as f64;
-                        let b = dct_b[blk * 64 + k] as f64;
-                        sum_yy += y * y;
-                        sum_yx += y * x;
-                        sum_yb += y * b;
+                        let y_for_x = dct_y[blk * 64 + k] as f64 * qw_x[k];
+                        let x_val   = dct_x[blk * 64 + k] as f64 * qw_x[k];
+                        let y_for_b = dct_y[blk * 64 + k] as f64 * qw_b[k];
+                        let b_val   = dct_b[blk * 64 + k] as f64 * qw_b[k];
+                        sum_yy_x += y_for_x * y_for_x;
+                        sum_yx   += y_for_x * x_val;
+                        sum_yy_b += y_for_b * y_for_b;
+                        sum_yb   += y_for_b * b_val;
                     }
                 }
             }
 
-            if sum_yy > 1e-10 {
-                // X channel: base_correlation_x = 0, so x_factor = round(optimal_factor * 84)
-                let optimal_x = sum_yx / sum_yy;
-                let x_factor = (optimal_x * K_COLOR_FACTOR as f64).round() as i32;
-                ytox_map[ty * cr_w + tx] = x_factor.clamp(-127, 127);
+            // libjxl's FindBestMultiplier fast path:
+            // x = -sum(a*b) / (sum(a*a) + num * distance_mul * 0.5)
+            // where a = y_coeff / COLOR_FACTOR, b = base * y_coeff - target_coeff
+            // Our formulation: optimal = sum_yx / sum_yy
+            // Then convert to integer factor and apply towards_zero shrinkage.
 
-                // B channel: base_correlation_b = 1.0
-                let optimal_b = sum_yb / sum_yy;
-                let b_factor = ((optimal_b - 1.0) * K_COLOR_FACTOR as f64).round() as i32;
-                ytob_map[ty * cr_w + tx] = b_factor.clamp(-127, 127);
+            // libjxl FindBestMultiplier fast path:
+            // x = -sum(a*b) / (sum(a*a) + num * distance_mul * 0.5)
+            // where a = y * qw / COLOR_FACTOR
+            //       b = base * y * qw - target * qw
+            // We reformulate: optimal = sum_yx / sum_yy is the raw ratio.
+            // Adding distance_mul regularization:
+            // factor = sum_cross / (sum_yy + regularizer)
+            // where regularizer = num * distance_mul * 0.5 * K^2
+            let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8)
+                * ((tx * 8 + 8).min(bw) - tx * 8);
+            let num_coeffs = (n_blocks * 63) as f64;
+            // kDistanceMultiplierAC = 1e-3 (libjxl uses 1e-9 but with much
+            // larger q*qm weights; we scale up to compensate)
+            let dist_mul = 1e-3;
+
+            // X channel: base_correlation_x = 0
+            let reg_x = num_coeffs * dist_mul * 0.5;
+            if sum_yy_x + reg_x > 1e-10 {
+                let x_raw = (sum_yx / (sum_yy_x + reg_x)) * K_COLOR_FACTOR as f64;
+                let x_shrunk = towards_zero_shrink(x_raw, TOWARDS_ZERO);
+                ytox_map[ty * cr_w + tx] = (x_shrunk.round() as i32).clamp(-127, 127);
+            }
+
+            // B channel: base_correlation_b = 1.0
+            let reg_b = num_coeffs * dist_mul * 0.5;
+            if sum_yy_b + reg_b > 1e-10 {
+                let b_raw = ((sum_yb / (sum_yy_b + reg_b)) - 1.0) * K_COLOR_FACTOR as f64;
+                let b_shrunk = towards_zero_shrink(b_raw, TOWARDS_ZERO);
+                ytob_map[ty * cr_w + tx] = (b_shrunk.round() as i32).clamp(-127, 127);
             }
         }
     }
@@ -5353,9 +5436,9 @@ fn encode_lf_group_section(
         for x in 0..gw {
             let src = (y0 + y) * bw + (x0 + x);
             let dst = y * gw + x;
-            dc_data[dst] = dc_y[src];
-            dc_data[npixels + dst] = dc_x[src];
-            dc_data[2 * npixels + dst] = dc_b[src];
+            dc_data[dst] = dc_y[src]; // Channel 0: Y
+            dc_data[npixels + dst] = dc_x[src]; // Channel 1: X
+            dc_data[2 * npixels + dst] = dc_b[src]; // Channel 2: B
         }
     }
     crate::encode::modular_encode::encode_modular_signed_stream(&mut w, gw, gh, 3, &dc_data)?;

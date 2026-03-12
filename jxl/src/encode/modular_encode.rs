@@ -308,29 +308,6 @@ pub fn write_tree_token_stream(writer: &mut BitWriter, stream: &TokenStream) -> 
 ///
 /// Gradient (ClampedGradient): pred = left + top - topleft, clamped to [min(left,top), max(left,top)].
 /// This matches JXL predictor 5.
-fn compute_gradient_residuals(data: &[i32], width: usize, height: usize) -> Vec<i32> {
-    let mut residuals = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            let val = data[y * width + x];
-            let left = if x > 0 { data[y * width + x - 1] } else { 0 };
-            let top = if y > 0 { data[(y - 1) * width + x] } else { 0 };
-            let topleft = if x > 0 && y > 0 {
-                data[(y - 1) * width + x - 1]
-            } else {
-                0
-            };
-            // ClampedGradient: gradient clamped to [min(left,top), max(left,top)]
-            let grad = left as i64 + top as i64 - topleft as i64;
-            let lo = left.min(top) as i64;
-            let hi = left.max(top) as i64;
-            let pred = grad.clamp(lo, hi) as i32;
-            residuals.push(val - pred);
-        }
-    }
-    residuals
-}
-
 /// Encode a multi-channel signed integer modular stream.
 ///
 /// `data` contains `num_channels` channels stored sequentially,
@@ -361,11 +338,59 @@ pub fn encode_modular_signed_stream(
     let channel_size = width * height;
     let zero_cost: u64 = data.iter().map(|&v| pack_signed(v) as u64).sum();
 
+    // Helper: compute left/top/topleft matching the decoder's fallback chain.
+    // The decoder (predict.rs PredictionData::get_with_neighbors) uses:
+    //   left: x>0 -> row[y][x-1]; else y>0 -> row[y-1][0]; else 0
+    //   top:  y>0 -> row[y-1][x]; else -> left
+    //   topleft: ... (complex, see get_with_neighbors)
+    let get_left = |ch: &[i32], x: usize, y: usize| -> i32 {
+        if x > 0 {
+            ch[y * width + x - 1]
+        } else if y > 0 {
+            ch[(y - 1) * width + 0]
+        } else {
+            0
+        }
+    };
+    let get_top = |ch: &[i32], x: usize, y: usize| -> i32 {
+        if y > 0 {
+            ch[(y - 1) * width + x]
+        } else {
+            get_left(ch, x, y)
+        }
+    };
+    let get_topleft = |ch: &[i32], x: usize, y: usize| -> i32 {
+        if x > 0 {
+            if y > 0 {
+                ch[(y - 1) * width + x - 1]
+            } else {
+                get_left(ch, x, y)
+            }
+        } else if y > 0 {
+            get_left(ch, x, y)
+        } else {
+            0
+        }
+    };
+
     // Gradient predictor (5): ClampedGradient
     let mut grad_residuals = Vec::with_capacity(data.len());
     for c in 0..num_channels {
         let ch = &data[c * channel_size..(c + 1) * channel_size];
-        grad_residuals.extend(compute_gradient_residuals(ch, width, height));
+        for y in 0..height {
+            for x in 0..width {
+                let val = ch[y * width + x];
+                let left = get_left(ch, x, y) as i64;
+                let top = get_top(ch, x, y) as i64;
+                let topleft = get_topleft(ch, x, y) as i64;
+                let min = left.min(top);
+                let max = left.max(top);
+                let grad = left + top - topleft;
+                let grad_clamp_max = if topleft < min { max } else { grad };
+                let pred = if topleft > max { min } else { grad_clamp_max };
+                grad_residuals.push(val - pred as i32);
+            }
+        }
     }
     let grad_cost: u64 = grad_residuals
         .iter()
@@ -379,7 +404,7 @@ pub fn encode_modular_signed_stream(
         for y in 0..height {
             for x in 0..width {
                 let val = ch[y * width + x];
-                let left = if x > 0 { ch[y * width + x - 1] } else { 0 };
+                let left = get_left(ch, x, y);
                 left_residuals.push(val - left);
             }
         }
@@ -396,7 +421,7 @@ pub fn encode_modular_signed_stream(
         for y in 0..height {
             for x in 0..width {
                 let val = ch[y * width + x];
-                let top = if y > 0 { ch[(y - 1) * width + x] } else { 0 };
+                let top = get_top(ch, x, y);
                 top_residuals.push(val - top);
             }
         }
