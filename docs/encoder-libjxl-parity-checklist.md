@@ -106,7 +106,8 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
 
 ### Not yet implemented
 
-- `[ ]` Advanced format features (progressive, animation, metadata boxes, JPEG reconstruction).
+- `[~]` Advanced format features (progressive, metadata boxes, JPEG reconstruction).
+  - Done: animation encoding (RGB + RGBA), per-frame duration, alpha extra channel path.
 - `[ ]` Patches/splines/noise tools.
 - `[ ]` Iterative `FindBestQuantization` butteraugli feedback loop (Kitten speed and slower).
 - `[x]` DCT16x8/8x16 rectangular merges (entropy-based, group-boundary-safe).
@@ -116,8 +117,12 @@ Reach practical 1:1 encoder parity with libjxl, with only one intentional differ
   custom LfGlobal encoding), but currently disabled -- overhead exceeds savings
   without per-block transform variety.
 - `[ ]` Modular transforms (palette, squeeze, RCT).
-- `[ ]` Effort tiers (mapping effort 1-9 to heuristic complexity).
-- `[ ]` Alpha/16-bit/HDR input support.
+- `[~]` Effort tiers (mapping effort 1-9 to heuristic complexity).
+  - Done: VarDCT effort wiring (1-9) controls encode budget and entropy-merge search.
+  - Remaining: finer-grained gating for all heuristics and tuned presets vs libjxl.
+- `[~]` Alpha/16-bit/HDR input support.
+  - Done: alpha (single-frame RGBA and RGBA animation).
+  - Remaining: 16-bit/HDR input path.
 
 ### Investigated and resolved (not needed)
 
@@ -198,11 +203,11 @@ Includes all 7 test images with side-by-side jxl-rs vs libjxl decoded output.
 | P17 | Quant field generation | [x] | `encode/vardct.rs` | M6, M7 |
 | P18 | Coefficient tokenization | [~] | `encode/vardct.rs` | M6 |
 | P19 | Progressive pass emission | [ ] | none | M8 |
-| P20 | Animation and frame refs | [ ] | none | M8 |
+| P20 | Animation and frame refs | [~] | `encode/vardct.rs`, `jxl_cli/src/bin/jxle.rs` | M8 |
 | P21 | Patches/splines/noise | [ ] | none | M8 |
 | P22 | Metadata boxes | [ ] | none | M8 |
 | P23 | JPEG reconstruction | [ ] | none | M8 |
-| P24 | Effort presets | [ ] | none | M7 |
+| P24 | Effort presets | [~] | `encode/vardct.rs`, `jxl_cli/src/bin/jxle.rs` | M7 |
 | P25 | Parallel encode scheduling | [ ] | none | M5, M7 |
 | P26 | Conformance test harness | [~] | unit tests + fuzz | M9 |
 | P27 | CLI parity | [~] | `jxl_cli/src/bin/jxle.rs` | M4, M9 |
@@ -254,6 +259,8 @@ Includes all 7 test images with side-by-side jxl-rs vs libjxl decoded output.
 - [x] E03 Quant field generation pipeline (full libjxl Squirrel-speed AQ port).
 - [x] E04 LF/HF coefficient tokenization and entropy coding.
 - [~] E05 Quality tuning heuristics and effort tiers.
+  - Done: effort 1-9 wiring for VarDCT candidate budget + entropy-merge activation.
+  - Remaining: full libjxl-like preset mapping across all heuristics.
 - [x] E06 Inverse Gaborish pre-sharpening (libjxl `GaborishInverse` port).
 - [x] E07 EPF (Edge-Preserving Filter) enabled with default parameters.
 
