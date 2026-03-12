@@ -5200,8 +5200,11 @@ fn encode_single_group_section(
         // value 1 needs Bits(13) = selector 3
         w.write(2, 3)?; // selector 3 = Bits(13)
         w.write(13, 1)?; // value = 1 (only DCT8x8)
-        // Encode the permutation for 3 channels
-        encode_coeff_orders(&mut w, &custom_orders)?;
+        // Encode the permutation for 3 channels.
+        // Decoder reads in order c=0,1,2 = X,Y,B, but our compute returns [Y,X,B].
+        // Reorder to match decoder expectations: [X, Y, B].
+        let decoder_order = [custom_orders[1], custom_orders[0], custom_orders[2]];
+        encode_coeff_orders(&mut w, &decoder_order)?;
     } else {
         // used_orders: selector 2 = no custom orders (value 0)
         w.write(2, 2)?;
