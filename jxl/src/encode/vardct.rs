@@ -471,6 +471,46 @@ fn boost_quant_on_alpha_edges(
 // Flat-region optimization for line-art / logo-like inputs.
 // Adds an additional quant-map candidate that spends fewer bits on large,
 // very flat interiors while keeping edge blocks less affected.
+fn detect_flat_graphic(
+    y_chan: &[f32],
+    width: usize,
+    height: usize,
+    bw: usize,
+    bh: usize,
+) -> bool {
+    let num_blocks = bw * bh;
+    if num_blocks == 0 {
+        return false;
+    }
+
+    let mut very_flat = 0usize;
+    let mut high_detail = 0usize;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+            for yy in (by * 8)..((by * 8 + 8).min(height)) {
+                let row = yy * width;
+                for xx in (bx * 8)..((bx * 8 + 8).min(width)) {
+                    let v = y_chan[row + xx];
+                    min_v = min_v.min(v);
+                    max_v = max_v.max(v);
+                }
+            }
+            let r = max_v - min_v;
+            if r < 0.004 {
+                very_flat += 1;
+            }
+            if r > 0.03 {
+                high_detail += 1;
+            }
+        }
+    }
+
+    very_flat * 100 >= num_blocks * 45 && high_detail * 100 <= num_blocks * 20
+}
+
 fn apply_flat_region_quant_boost(
     raw_quant_map: &[u8],
     y_chan: &[f32],
@@ -849,6 +889,7 @@ fn encode_single_rgba_frame(
     // Evaluate candidates by exact encoded frame size.
     // Budget and heuristics depend on effort tier.
     let effort_cfg = effort_params(config.effort);
+    let is_flat_graphic = detect_flat_graphic(&y_chan, width, height, bw, bh);
     let max_total_encodes = effort_cfg.max_total_encodes;
     let mut total_encodes = 0usize;
     let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());
@@ -868,14 +909,16 @@ fn encode_single_rgba_frame(
             &ytox_map,
             &ytob_map,
         );
-        let mut transform_map_candidates = build_transform_map_candidates_from_quantized_ac(
-            &quantized.ac_x,
-            &quantized.ac_y,
-            &quantized.ac_b,
-            bw,
-            bh,
-            config.distance,
-        );
+        let mut transform_map_candidates =
+            build_transform_map_candidates_from_quantized_ac_with_flags(
+                &quantized.ac_x,
+                &quantized.ac_y,
+                &quantized.ac_b,
+                bw,
+                bh,
+                config.distance,
+                is_flat_graphic,
+            );
         // Entropy-based DCT16/32 merge using full libjxl EstimateEntropy model
         // (entropy + information loss with perceptual masking).
         if effort_cfg.enable_entropy_merge && bw >= 2 && bh >= 2 {
@@ -3897,6 +3940,26 @@ fn build_transform_map_candidates_from_quantized_ac(
     bh: usize,
     distance: f32,
 ) -> Vec<Vec<u8>> {
+    build_transform_map_candidates_from_quantized_ac_with_flags(
+        ac_x, ac_y, ac_b, bw, bh, distance, false,
+    )
+}
+
+fn build_transform_map_candidates_from_quantized_ac_with_flags(
+    ac_x: &[i32],
+    ac_y: &[i32],
+    ac_b: &[i32],
+    bw: usize,
+    bh: usize,
+    distance: f32,
+    prefer_large_transforms_for_flat: bool,
+) -> Vec<Vec<u8>> {
+    let distance = if prefer_large_transforms_for_flat {
+        distance.max(2.5)
+    } else {
+        distance
+    };
+
     let default_map = build_default_transform_map(bw, bh);
     if distance < 1.5 {
         // At low distances, only use default (DCT8). The entropy-based DCT16
