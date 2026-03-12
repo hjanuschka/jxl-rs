@@ -173,6 +173,9 @@ WebKit logo remains a pathological case (+253% size, needs modular encoding).
    quantization error weighted by masking field, L8 norm) prevents quality-destroying
    merges on sharp edges. Infrastructure is in place but inactive due to our
    forward transform normalization producing near-zero quantization residuals.
+5. **Flat-region compression**: first flat-region quant-map candidate landed,
+   but WebKit logo still far from libjxl size; needs deeper modular/palette-style
+   treatment to close the gap.
 
 ### Sampler page
 
@@ -259,7 +262,8 @@ Includes all 7 test images with side-by-side jxl-rs vs libjxl decoded output.
 - [x] E03 Quant field generation pipeline (full libjxl Squirrel-speed AQ port).
 - [x] E04 LF/HF coefficient tokenization and entropy coding.
 - [~] E05 Quality tuning heuristics and effort tiers.
-  - Done: effort 1-9 wiring for VarDCT candidate budget + entropy-merge activation.
+  - Done: effort 1-9 wiring for VarDCT candidate budget + entropy-merge activation;
+    custom coeff-order activation gated to higher effort tiers.
   - Remaining: full libjxl-like preset mapping across all heuristics.
 - [x] E06 Inverse Gaborish pre-sharpening (libjxl `GaborishInverse` port).
 - [x] E07 EPF (Edge-Preserving Filter) enabled with default parameters.
