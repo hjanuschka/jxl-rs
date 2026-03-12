@@ -137,11 +137,43 @@ fn token_shape_order(shape_id: usize) -> Option<&'static [usize]> {
 pub struct VarDctConfig {
     /// Quality distance parameter. Lower = better quality. 1.0 = visually lossless.
     pub distance: f32,
+    /// Effort tier in [1..=9], where higher values spend more CPU for better R-D.
+    pub effort: u8,
 }
 
 impl Default for VarDctConfig {
     fn default() -> Self {
-        Self { distance: 1.0 }
+        Self {
+            distance: 1.0,
+            effort: 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EffortParams {
+    max_total_encodes: usize,
+    enable_entropy_merge: bool,
+    enable_custom_coeff_orders: bool,
+}
+
+fn effort_params(effort: u8) -> EffortParams {
+    let e = effort.clamp(1, 9);
+    let max_total_encodes = match e {
+        1 => 4,
+        2 => 6,
+        3 => 8,
+        4 => 12,
+        5 => 16,
+        6 => 24,
+        7 => 32,
+        8 => 40,
+        _ => 56,
+    };
+    EffortParams {
+        max_total_encodes,
+        enable_entropy_merge: e >= 4,
+        enable_custom_coeff_orders: e >= 6,
     }
 }
 
@@ -392,6 +424,142 @@ fn simplify_invisible_xyb(
     simplify_invisible_channel(b, alpha, width, height);
 }
 
+// Heuristic: spend more bits on blocks that mix transparent and opaque pixels.
+// This targets RGBA edge halos ("glow") by reducing color quantization error
+// exactly where alpha compositing is most sensitive.
+fn boost_quant_on_alpha_edges(
+    raw_quant_map: &mut [u8],
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    bw: usize,
+    bh: usize,
+) {
+    debug_assert_eq!(raw_quant_map.len(), bw * bh);
+    debug_assert_eq!(alpha.len(), width * height);
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut has_nonzero = false;
+            let mut has_nonopaque = false;
+            let y0 = by * 8;
+            let x0 = bx * 8;
+
+            for yy in y0..(y0 + 8).min(height) {
+                let row = yy * width;
+                for xx in x0..(x0 + 8).min(width) {
+                    let a = alpha[row + xx];
+                    if a > 0 {
+                        has_nonzero = true;
+                    }
+                    if a < 255 {
+                        has_nonopaque = true;
+                    }
+                }
+            }
+
+            // Mixed block: contains both visible and non-opaque pixels.
+            if has_nonzero && has_nonopaque {
+                let idx = by * bw + bx;
+                let boosted = (raw_quant_map[idx] as f32 * 3.00).round() as u32;
+                raw_quant_map[idx] = boosted.min(255) as u8;
+            }
+        }
+    }
+}
+
+// Flat-region optimization for line-art / logo-like inputs.
+// Adds an additional quant-map candidate that spends fewer bits on large,
+// very flat interiors while keeping edge blocks less affected.
+fn apply_flat_region_quant_boost(
+    raw_quant_map: &[u8],
+    y_chan: &[f32],
+    width: usize,
+    height: usize,
+    bw: usize,
+    bh: usize,
+) -> Option<Vec<u8>> {
+    let num_blocks = bw * bh;
+    if num_blocks == 0 {
+        return None;
+    }
+
+    let mut ranges = vec![0.0f32; num_blocks];
+    let mut very_flat = 0usize;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+            for yy in (by * 8)..((by * 8 + 8).min(height)) {
+                let row = yy * width;
+                for xx in (bx * 8)..((bx * 8 + 8).min(width)) {
+                    let v = y_chan[row + xx];
+                    min_v = min_v.min(v);
+                    max_v = max_v.max(v);
+                }
+            }
+            let r = max_v - min_v;
+            let idx = by * bw + bx;
+            ranges[idx] = r;
+            if r < 0.004 {
+                very_flat += 1;
+            }
+        }
+    }
+
+    // Activate only when the image is dominantly flat.
+    if very_flat * 100 < num_blocks * 45 {
+        return None;
+    }
+
+    let mut out = raw_quant_map.to_vec();
+    let mut boosted_any = false;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let idx = by * bw + bx;
+            let r = ranges[idx];
+
+            if r >= 0.010 {
+                continue;
+            }
+
+            // Keep edge-adjacent blocks milder to avoid haloing.
+            let mut has_nonflat_neighbor = false;
+            for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+                let nx = bx as isize + dx;
+                let ny = by as isize + dy;
+                if nx < 0 || ny < 0 || nx >= bw as isize || ny >= bh as isize {
+                    continue;
+                }
+                let nidx = ny as usize * bw + nx as usize;
+                if ranges[nidx] >= 0.012 {
+                    has_nonflat_neighbor = true;
+                    break;
+                }
+            }
+
+            let factor = if r < 0.003 && !has_nonflat_neighbor {
+                2.4
+            } else if r < 0.006 {
+                1.6
+            } else {
+                1.25
+            };
+
+            let boosted = (out[idx] as f32 * factor).round() as u32;
+            let new_v = boosted.min(255) as u8;
+            if new_v != out[idx] {
+                boosted_any = true;
+                out[idx] = new_v;
+            }
+        }
+    }
+
+    if boosted_any { Some(out) } else { None }
+}
+
 /// Encode an sRGB u8 RGB image as a VarDCT JXL file (container-wrapped).
 pub fn encode_vardct_u8_rgb(
     rgb: &[u8],
@@ -607,10 +775,24 @@ fn encode_single_rgba_frame(
         quant_ac,
     );
     let (_, _, base_raw_quant) = distance_to_full_quant_params(config.distance);
-    let raw_quant_map_candidates = vec![
+    let mut raw_quant_map_candidates = vec![
         vec![base_raw_quant; bw * bh], // uniform candidate
         adaptive_map,                  // libjxl-style adaptive candidate
     ];
+
+    // For RGBA input, improve color fidelity on translucent edges.
+    if let Some(a) = alpha {
+        for map in &mut raw_quant_map_candidates {
+            boost_quant_on_alpha_edges(map, a, width, height, bw, bh);
+        }
+    }
+
+    // Flat-region optimization candidate (line art / logos).
+    if let Some(flat_map) =
+        apply_flat_region_quant_boost(&raw_quant_map_candidates[1], &y_chan, width, height, bw, bh)
+    {
+        raw_quant_map_candidates.push(flat_map);
+    }
 
     // Compute per-pixel masking field for AC strategy loss estimation.
     // Must be computed on ORIGINAL opsin (before inverse gaborish),
@@ -665,8 +847,9 @@ fn encode_single_rgba_frame(
     };
 
     // Evaluate candidates by exact encoded frame size.
-    // Budget: limit total encode evaluations to avoid combinatorial blowup.
-    const MAX_TOTAL_ENCODES: usize = 32;
+    // Budget and heuristics depend on effort tier.
+    let effort_cfg = effort_params(config.effort);
+    let max_total_encodes = effort_cfg.max_total_encodes;
     let mut total_encodes = 0usize;
     let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());
     for raw_quant_map in &raw_quant_map_candidates {
@@ -695,7 +878,7 @@ fn encode_single_rgba_frame(
         );
         // Entropy-based DCT16/32 merge using full libjxl EstimateEntropy model
         // (entropy + information loss with perceptual masking).
-        if bw >= 2 && bh >= 2 {
+        if effort_cfg.enable_entropy_merge && bw >= 2 && bh >= 2 {
             let entropy_map = build_entropy_merge_transform_map(
                 &x_chan,
                 &y_chan,
@@ -726,7 +909,7 @@ fn encode_single_rgba_frame(
         let mut best_frame = None;
         let mut best_size = usize::MAX;
         for transform_map in transform_map_candidates {
-            if total_encodes >= MAX_TOTAL_ENCODES {
+            if total_encodes >= max_total_encodes {
                 break;
             }
             // AdjustQuantField: for merged blocks, set quant to MAX of constituents.
@@ -764,6 +947,7 @@ fn encode_single_rgba_frame(
                 anim_params,
                 anim_params.is_none(), // include file header only for standalone images
                 alpha,
+                config.effort,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -773,7 +957,7 @@ fn encode_single_rgba_frame(
 
             total_encodes += 1;
 
-            let frame = if has_supported_nonzero_transform && total_encodes < MAX_TOTAL_ENCODES {
+            let frame = if has_supported_nonzero_transform && total_encodes < max_total_encodes {
                 // Candidate B: non-zero coefficient path for supported larger transforms.
                 let (ac_x_for_map, ac_y_for_map, ac_b_for_map) =
                     prepare_ac_for_transform_map_with_cache(
@@ -815,6 +999,7 @@ fn encode_single_rgba_frame(
                     anim_params,
                     anim_params.is_none(),
                     alpha,
+                    config.effort,
                 )?;
 
                 total_encodes += 1;
@@ -834,7 +1019,7 @@ fn encode_single_rgba_frame(
         if let Some(frame) = best_frame {
             candidate_frames.push(frame);
         }
-        if total_encodes >= MAX_TOTAL_ENCODES {
+        if total_encodes >= max_total_encodes {
             break;
         }
     }
@@ -4185,6 +4370,7 @@ fn encode_vardct_frame(
         None,
         true, // no animation, include file header
         None, // no alpha
+        7,
     )
 }
 
@@ -4212,6 +4398,7 @@ fn encode_vardct_frame_inner(
     anim_params: Option<&AnimFrameParams>,
     include_file_header: bool,
     alpha: Option<&[u8]>,
+    effort: u8,
 ) -> Result<Vec<u8>> {
     let has_alpha = alpha.is_some();
     let num_extra_channels = if has_alpha { 1u32 } else { 0 };
@@ -4274,6 +4461,7 @@ fn encode_vardct_frame_inner(
             ytox_map,
             ytob_map,
             alpha,
+            effort,
         )?;
 
         write_toc(&mut writer, &[section.len() as u32])?;
@@ -5338,6 +5526,7 @@ fn encode_single_group_section(
     ytox_map: &[i32],
     ytob_map: &[i32],
     alpha: Option<&[u8]>, // u8 alpha channel, width*height pixels
+    effort: u8,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
@@ -5449,7 +5638,7 @@ fn encode_single_group_section(
     // Compute optimal coefficient order for 8x8 DCT
     let custom_orders =
         compute_optimal_coeff_orders_8x8(ac_y, ac_x, ac_b, transform_map, bw, 0, 0, bw, bh);
-    let use_custom_order = custom_orders != [natural_coeff_order_8x8(); 3];
+    let use_custom_order = effort >= 6 && custom_orders != [natural_coeff_order_8x8(); 3];
 
     // Tokenize all blocks' AC coefficients
     let num_contexts = 15; // default BlockContextMap has 15 block contexts
@@ -9704,7 +9893,10 @@ mod tests {
             }
         }
         // Use low distance for AC detail
-        let config = VarDctConfig { distance: 0.1 };
+        let config = VarDctConfig {
+            distance: 0.1,
+            effort: 7,
+        };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
         eprintln!("Gradient codestream: {} bytes", cs.len());
 
@@ -9767,7 +9959,10 @@ mod tests {
             (1.0, "default"),
             (3.0, "low"),
         ] {
-            let config = VarDctConfig { distance };
+            let config = VarDctConfig {
+                distance,
+                effort: 7,
+            };
             let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config).unwrap();
             let (_n, frames) = crate::api::tests::decode(&cs, usize::MAX, true, false, None)
                 .expect("decode should succeed");
@@ -9830,7 +10025,10 @@ mod tests {
 
         // Test multiple distances
         for distance in [1.0f32, 0.5] {
-            let config = VarDctConfig { distance };
+            let config = VarDctConfig {
+                distance,
+                effort: 7,
+            };
             let cs = match encode_vardct_u8_rgb_codestream(&rgb, width, height, &config) {
                 Ok(cs) => cs,
                 Err(e) => panic!("Encoding failed: {e:?}"),
@@ -9964,7 +10162,10 @@ mod tests {
                 rgb[i + 2] = 128;
             }
         }
-        let config = VarDctConfig { distance: 2.0 };
+        let config = VarDctConfig {
+            distance: 2.0,
+            effort: 7,
+        };
         let result = encode_vardct_u8_rgb(&rgb, width, height, &config);
         assert!(result.is_ok(), "encode failed: {:?}", result.err());
     }
@@ -9984,7 +10185,10 @@ mod tests {
             }
         }
 
-        let config = VarDctConfig { distance: 1.0 };
+        let config = VarDctConfig {
+            distance: 1.0,
+            effort: 7,
+        };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
             .expect("multi-group encode should succeed");
         eprintln!("512x512 multi-group codestream: {} bytes", cs.len());
@@ -10048,7 +10252,10 @@ mod tests {
                 }
             }
 
-            let config = VarDctConfig { distance: 1.0 };
+            let config = VarDctConfig {
+                distance: 1.0,
+                effort: 7,
+            };
             let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
                 .expect(&format!("{label} encode failed"));
             eprintln!("{label}: {} bytes", cs.len());
@@ -10091,7 +10298,10 @@ mod tests {
             }
         }
 
-        let config = VarDctConfig { distance: 1.0 };
+        let config = VarDctConfig {
+            distance: 1.0,
+            effort: 7,
+        };
         let cs = encode_vardct_u8_rgb_codestream(&rgb, width, height, &config)
             .expect("257x257 multi-group encode should succeed");
         eprintln!("257x257 multi-group codestream: {} bytes", cs.len());
@@ -10313,7 +10523,10 @@ mod animation_tests {
             rgba[i * 4 + 2] = 0; // B
             rgba[i * 4 + 3] = ((i * 255) / (w * h - 1)) as u8; // gradient alpha
         }
-        let config = VarDctConfig { distance: 2.0 };
+        let config = VarDctConfig {
+            distance: 2.0,
+            effort: 7,
+        };
         let data = encode_vardct_u8_rgba(&rgba, w, h, &config).unwrap();
         assert!(data.len() > 50);
         std::fs::write("/tmp/test_rgba.jxl", &data).unwrap();
@@ -10333,7 +10546,10 @@ mod animation_tests {
         let w = 800usize;
         let h = 600usize;
         assert_eq!(bin.len(), w * h * 4);
-        let config = VarDctConfig { distance: 1.0 };
+        let config = VarDctConfig {
+            distance: 1.0,
+            effort: 7,
+        };
         let data = encode_vardct_u8_rgba(&bin, w, h, &config).unwrap();
         std::fs::write("/tmp/dice_jxlrs.jxl", &data).unwrap();
         eprintln!("Dice RGBA: {} bytes, {}x{}", data.len(), w, h);
@@ -10354,7 +10570,10 @@ mod animation_tests {
         }
         let frame_refs: Vec<(&[u8], u32)> =
             frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
-        let config = VarDctConfig { distance: 2.0 };
+        let config = VarDctConfig {
+            distance: 2.0,
+            effort: 7,
+        };
         let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
         assert!(
             data.len() > 100,
@@ -10381,7 +10600,10 @@ mod animation_tests {
         }
         let frame_refs: Vec<(&[u8], u32)> =
             frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
-        let config = VarDctConfig { distance: 1.0 };
+        let config = VarDctConfig {
+            distance: 1.0,
+            effort: 7,
+        };
         let data = encode_vardct_animation_u8_rgba(&frame_refs, w, h, &config).unwrap();
         std::fs::write("/tmp/anim_icos_rgba_jxlrs.jxl", &data).unwrap();
         eprintln!(
@@ -10409,7 +10631,10 @@ mod animation_tests {
         }
         let frame_refs: Vec<(&[u8], u32)> =
             frames.iter().map(|(d, ms)| (d.as_slice(), *ms)).collect();
-        let config = VarDctConfig { distance: 1.0 };
+        let config = VarDctConfig {
+            distance: 1.0,
+            effort: 7,
+        };
         let data = encode_vardct_animation_u8_rgb(&frame_refs, w, h, &config).unwrap();
         std::fs::write("/tmp/anim_icos_jxlrs.jxl", &data).unwrap();
         eprintln!(

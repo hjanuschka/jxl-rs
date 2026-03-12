@@ -108,11 +108,11 @@ fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<TokenStream> {
         // Single leaf: property=0 (leaf marker), predictor, offset, mult_log, mult_bits
         let (offset, predictor) = leaves[0];
         tree_values.extend_from_slice(&[
-            0,                        // property = 0 (leaf)
-            predictor,                // predictor
-            pack_signed(offset),      // offset
-            0,                        // multiplier_log = 0
-            0,                        // multiplier_bits = 0
+            0,                   // property = 0 (leaf)
+            predictor,           // predictor
+            pack_signed(offset), // offset
+            0,                   // multiplier_log = 0
+            0,                   // multiplier_bits = 0
         ]);
     } else {
         // Multi-leaf tree: split by channel property.
@@ -139,26 +139,26 @@ fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<TokenStream> {
             if i == leaves.len() - 1 {
                 // Last leaf
                 let (offset, predictor) = leaves[i];
-                tree_values.push(0);  // leaf
+                tree_values.push(0); // leaf
                 tree_values.push(predictor);
                 tree_values.push(pack_signed(offset));
-                tree_values.push(0);  // multiplier_log
-                tree_values.push(0);  // multiplier_bits
+                tree_values.push(0); // multiplier_log
+                tree_values.push(0); // multiplier_bits
             } else {
                 // Decision node: split on channel < (i+1)
                 // property index for "channel" = 0 in the WP predictor properties list
                 // In the encoded tree, property value = (actual_property_index + 1)
                 // Channel is property 0 in JXL modular, so encoded as 1
-                tree_values.push(1);                    // property = channel (0+1=1)
+                tree_values.push(1); // property = channel (0+1=1)
                 tree_values.push(pack_signed(i as i32)); // splitval = i (channel < i+1 means channel == i)
 
                 // Left child is the leaf for channel i
                 let (offset, predictor) = leaves[i];
-                tree_values.push(0);  // leaf
+                tree_values.push(0); // leaf
                 tree_values.push(predictor);
                 tree_values.push(pack_signed(offset));
-                tree_values.push(0);  // multiplier_log
-                tree_values.push(0);  // multiplier_bits
+                tree_values.push(0); // multiplier_log
+                tree_values.push(0); // multiplier_bits
 
                 // Right child continues to next iteration
             }
@@ -333,10 +333,8 @@ pub fn encode_modular_signed_stream(
 
     let uint_config = HybridUintConfig::new(4, 1, 2);
 
-    // Estimate cost with multiple predictors and pick the best.
-    // We use sum of pack_signed(residual) as a proxy for entropy.
+    // Try multiple predictors and pick the best by actual encoded byte size.
     let channel_size = width * height;
-    let zero_cost: u64 = data.iter().map(|&v| pack_signed(v) as u64).sum();
 
     // Helper: compute left/top/topleft matching the decoder's fallback chain.
     // The decoder (predict.rs PredictionData::get_with_neighbors) uses:
@@ -392,11 +390,6 @@ pub fn encode_modular_signed_stream(
             }
         }
     }
-    let grad_cost: u64 = grad_residuals
-        .iter()
-        .map(|&v| pack_signed(v) as u64)
-        .sum();
-
     // Left predictor (1)
     let mut left_residuals = Vec::with_capacity(data.len());
     for c in 0..num_channels {
@@ -409,11 +402,6 @@ pub fn encode_modular_signed_stream(
             }
         }
     }
-    let left_cost: u64 = left_residuals
-        .iter()
-        .map(|&v| pack_signed(v) as u64)
-        .sum();
-
     // Top predictor (2)
     let mut top_residuals = Vec::with_capacity(data.len());
     for c in 0..num_channels {
@@ -426,38 +414,37 @@ pub fn encode_modular_signed_stream(
             }
         }
     }
-    let top_cost: u64 = top_residuals
-        .iter()
-        .map(|&v| pack_signed(v) as u64)
-        .sum();
+    // Pick predictor by exact encoded size (regression-safe).
+    let candidates: [(u32, &[i32]); 4] = [
+        (0, data),
+        (5, &grad_residuals),
+        (1, &left_residuals),
+        (2, &top_residuals),
+    ];
 
-    // Pick the best
-    let mut best_cost = zero_cost;
     let mut best_predictor = 0u32;
-    let mut best_residuals: Option<Vec<i32>> = None;
+    let mut best_idx = 0usize;
+    let mut best_size = usize::MAX;
 
-    if grad_cost < best_cost {
-        best_cost = grad_cost;
-        best_predictor = 5;
-        best_residuals = Some(grad_residuals);
+    for (idx, (predictor, values)) in candidates.iter().enumerate() {
+        let mut tmp = BitWriter::new();
+        write_modular_section_huffman(&mut tmp, 0, *predictor, values, uint_config, false)?;
+        let sz = tmp.finish().len();
+        if sz < best_size {
+            best_size = sz;
+            best_predictor = *predictor;
+            best_idx = idx;
+        }
     }
-    if left_cost < best_cost {
-        best_cost = left_cost;
-        best_predictor = 1;
-        best_residuals = Some(left_residuals);
-    }
-    if top_cost < best_cost {
-        best_cost = top_cost;
-        best_predictor = 2;
-        best_residuals = Some(top_residuals);
-    }
-    let _ = best_cost;
 
-    if let Some(residuals) = best_residuals {
-        write_modular_section_huffman(writer, 0, best_predictor, &residuals, uint_config, false)
-    } else {
-        write_modular_section_huffman(writer, 0, 0, data, uint_config, false)
-    }
+    write_modular_section_huffman(
+        writer,
+        0,
+        best_predictor,
+        candidates[best_idx].1,
+        uint_config,
+        false,
+    )
 }
 
 #[cfg(test)]
