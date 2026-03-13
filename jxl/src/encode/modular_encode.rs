@@ -237,6 +237,18 @@ pub fn write_modular_section_huffman(
 ///
 /// Same structure as write_modular_section_huffman but uses ANS instead of Huffman
 /// for the residual data. Tree is still Huffman (tiny, overhead negligible).
+/// Public wrapper for ANS modular section encoding, used by vardct HF metadata.
+pub fn write_modular_section_ans_pub(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+    signed_residuals: &[i32],
+    uint_config: HybridUintConfig,
+    use_global_tree: bool,
+) -> Result<()> {
+    write_modular_section_ans(writer, offset, predictor, signed_residuals, uint_config, use_global_tree)
+}
+
 fn write_modular_section_ans(
     writer: &mut BitWriter,
     offset: i32,
