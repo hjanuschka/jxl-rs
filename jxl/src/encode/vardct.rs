@@ -191,7 +191,7 @@ fn effort_params(effort: u8) -> EffortParams {
         // Enable entropy-merge heuristics from Hare-and-slower style tiers.
         enable_entropy_merge: speed_tier <= 5,
         // Enable custom coefficient orders from Squirrel-and-slower tiers.
-        enable_custom_coeff_orders: speed_tier <= 3,
+        enable_custom_coeff_orders: false, // try disabling to reduce overhead
         max_total_encodes,
     }
 }
