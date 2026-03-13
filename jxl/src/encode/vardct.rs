@@ -5683,7 +5683,7 @@ fn encode_vardct_frame_inner(
                     .iter()
                     .flat_map(|e| e.iter().copied())
                     .collect();
-            for max_c in [2, 4, 8, 16, 32] {
+            for max_c in [1, 2, 3, 4, 6, 8, 10, 16, 32] {
                 if max_c <= num_ac_contexts {
                     let greedy_map = build_greedy_clustered_context_map(
                         num_ac_contexts,
