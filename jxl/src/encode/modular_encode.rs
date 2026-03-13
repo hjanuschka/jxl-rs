@@ -383,7 +383,7 @@ fn write_modular_section_ans(
 /// Uses a multi-leaf tree that splits by channel, giving each channel its own
 /// entropy context. This can be more efficient when channels have different
 /// distributions (e.g., Y vs X vs B in DC data).
-fn write_modular_section_ans_perchannel(
+pub fn write_modular_section_ans_perchannel(
     writer: &mut BitWriter,
     predictor: u32,
     signed_residuals: &[i32],
@@ -663,12 +663,35 @@ pub fn encode_modular_signed_stream(
             }
         }
     }
+    // Select predictor (4): matches decoder's predict.rs select() exactly
+    // p = left + top - topleft; if |p - left| < |p - top|: left else: top
+    let mut select_residuals = Vec::with_capacity(data.len());
+    for c in 0..num_channels {
+        let ch = &data[c * channel_size..(c + 1) * channel_size];
+        for y in 0..height {
+            for x in 0..width {
+                let val = ch[y * width + x];
+                let left = get_left(ch, x, y) as i64;
+                let top = get_top(ch, x, y) as i64;
+                let topleft = get_topleft(ch, x, y) as i64;
+                let p = left + top - topleft;
+                let pred = if (p - left).abs() < (p - top).abs() {
+                    left
+                } else {
+                    top
+                };
+                select_residuals.push(val - pred as i32);
+            }
+        }
+    }
+
     // Pick predictor by exact encoded size (regression-safe).
-    let candidates: [(u32, &[i32]); 4] = [
+    let candidates: [(u32, &[i32]); 5] = [
         (0, data),
         (5, &grad_residuals),
         (1, &left_residuals),
         (2, &top_residuals),
+        (4, &select_residuals),
     ];
 
     let mut best_predictor = 0u32;
