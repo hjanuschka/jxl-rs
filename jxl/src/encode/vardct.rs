@@ -5843,46 +5843,23 @@ fn encode_hf_metadata_modular(
     // Channels:
     //   ch0: ytox_map         (cr_w * cr_h)
     //   ch1: ytob_map         (cr_w * cr_h)
-    //   ch2: transform_image  (count * 2)
+    //   ch2: transform_image  (count * 2)  -- width=count, height=2
     //   ch3: epf_map          (bw * bh)
     let total = cr_w * cr_h + cr_w * cr_h + count * 2 + bw * bh;
     assert_eq!(data.len(), total);
 
-    // Encode as a regular modular section. Try both Huffman and ANS, pick smaller.
-    // HF metadata contains mixed-size channels (ytox, ytob, transform, epf).
-    // Use zero predictor (data is already raw values, no spatial prediction benefit).
-    let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
-
-    // Estimate Huffman size
-    let mut huff_est = BitWriter::new();
-    crate::encode::modular_encode::write_modular_section_huffman(
-        &mut huff_est, 0, 0, data, uint_config, false,
-    )?;
-    let huff_size = huff_est.total_bits_written();
-
-    // Estimate ANS size (only for non-trivial data)
-    let use_ans = if data.len() >= 64 {
-        let mut ans_est = BitWriter::new();
-        if crate::encode::modular_encode::write_modular_section_ans_pub(
-            &mut ans_est, 0, 0, data, uint_config, false,
-        ).is_ok() {
-            ans_est.total_bits_written() < huff_size
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if use_ans {
-        crate::encode::modular_encode::write_modular_section_ans_pub(
-            w, 0, 0, data, uint_config, false,
-        )
-    } else {
-        crate::encode::modular_encode::write_modular_section_huffman(
-            w, 0, 0, data, uint_config, false,
-        )
-    }
+    // Use multi-channel modular encoding with proper 2D dimensions for each channel.
+    // This enables spatial prediction (Left, Top, Gradient, Select) within each
+    // channel, which is important for CfL maps and EPF maps that have 2D correlation.
+    let channel_specs = [
+        (cr_w, cr_h),    // ch0: ytox_map
+        (cr_w, cr_h),    // ch1: ytob_map
+        (count, 2),      // ch2: transform_image (count x 2)
+        (bw, bh),        // ch3: epf_map
+    ];
+    crate::encode::modular_encode::encode_modular_multichannel_stream(
+        w, &channel_specs, data,
+    )
 }
 
 // ==================== AC coefficient tokenization ====================
