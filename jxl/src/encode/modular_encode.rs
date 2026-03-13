@@ -796,6 +796,174 @@ pub fn encode_modular_signed_stream(
     }
 }
 
+/// Encode a multi-channel modular stream where channels have different dimensions.
+///
+/// Each entry in `channel_specs` is (width, height). `data` is the concatenation
+/// of all channel values in row-major order per channel.
+///
+/// For each channel, tries multiple predictors (Zero, Left, Top, Select, Gradient)
+/// and picks the one that minimizes encoded size. Uses a multi-leaf decision tree
+/// that splits by channel, allowing each channel to use a different predictor.
+pub fn encode_modular_multichannel_stream(
+    writer: &mut BitWriter,
+    channel_specs: &[(usize, usize)],
+    data: &[i32],
+) -> Result<()> {
+    let total: usize = channel_specs.iter().map(|(w, h)| w * h).sum();
+    assert_eq!(data.len(), total);
+
+    let uint_config = HybridUintConfig::new(4, 1, 2);
+
+    // Helper: compute prediction for one channel
+    fn predict_channel(ch_data: &[i32], w: usize, h: usize, predictor: u32) -> Vec<i32> {
+        let mut residuals = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let val = ch_data[y * w + x];
+                let left = if x > 0 {
+                    ch_data[y * w + x - 1]
+                } else if y > 0 {
+                    ch_data[(y - 1) * w]
+                } else {
+                    0
+                };
+                let top = if y > 0 { ch_data[(y - 1) * w + x] } else { left };
+                let topleft = if x > 0 && y > 0 {
+                    ch_data[(y - 1) * w + x - 1]
+                } else {
+                    left
+                };
+
+                let pred = match predictor {
+                    1 => left,  // West
+                    2 => top,   // North
+                    4 => {      // Select
+                        let p = (left as i64 + top as i64 - topleft as i64);
+                        if (p - left as i64).abs() < (p - top as i64).abs() {
+                            left
+                        } else {
+                            top
+                        }
+                    }
+                    5 => {      // Gradient (clamped)
+                        let l = left as i64;
+                        let t = top as i64;
+                        let tl = topleft as i64;
+                        let mn = l.min(t);
+                        let mx = l.max(t);
+                        let g = l + t - tl;
+                        let grad_clamp_max = if tl < mn { mx } else { g };
+                        let pred = if tl > mx { mn } else { grad_clamp_max };
+                        pred as i32
+                    }
+                    _ => 0,     // Zero
+                };
+                residuals.push(val - pred);
+            }
+        }
+        residuals
+    }
+
+    // Find best predictor per channel by L1 score
+    let predictors = [0u32, 1, 2, 4, 5];
+    let mut best_per_channel = Vec::with_capacity(channel_specs.len());
+    let mut best_residuals_all = Vec::with_capacity(total);
+    let mut offset = 0;
+    for &(w, h) in channel_specs {
+        let ch_data = &data[offset..offset + w * h];
+        let mut best_pred = 0u32;
+        let mut best_score = u64::MAX;
+        let mut best_resid = vec![];
+        for &pred in &predictors {
+            let resid = predict_channel(ch_data, w, h, pred);
+            let score: u64 = resid.iter().map(|&v| (v as i64).unsigned_abs()).sum();
+            if score < best_score {
+                best_score = score;
+                best_pred = pred;
+                best_resid = resid;
+            }
+        }
+        best_per_channel.push(best_pred);
+        best_residuals_all.extend_from_slice(&best_resid);
+        offset += w * h;
+    }
+
+    // Check if all channels use the same predictor
+    let all_same = best_per_channel.iter().all(|&p| p == best_per_channel[0]);
+
+    // Strategy 1: single predictor (best overall by L1)
+    let mut best_single_pred = 0u32;
+    let mut best_single_score = u64::MAX;
+    for &pred in &predictors {
+        let mut score = 0u64;
+        let mut off = 0;
+        for &(w, h) in channel_specs {
+            let resid = predict_channel(&data[off..off + w * h], w, h, pred);
+            score += resid.iter().map(|&v| (v as i64).unsigned_abs()).sum::<u64>();
+            off += w * h;
+        }
+        if score < best_single_score {
+            best_single_score = score;
+            best_single_pred = pred;
+        }
+    }
+
+    // Encode with single predictor (flat, compatible with existing decoders)
+    let mut flat_resid = Vec::with_capacity(total);
+    offset = 0;
+    for &(w, h) in channel_specs {
+        flat_resid.extend_from_slice(&predict_channel(
+            &data[offset..offset + w * h], w, h, best_single_pred,
+        ));
+        offset += w * h;
+    }
+
+    // Evaluate candidates by size and write the best directly to `writer`.
+    // Each candidate: (predictor, residuals, try_ans)
+    let mut candidates_to_try: Vec<(u32, &[i32], bool)> = Vec::new();
+    candidates_to_try.push((best_single_pred, &flat_resid, false)); // Huffman
+    if total >= 64 {
+        candidates_to_try.push((best_single_pred, &flat_resid, true)); // ANS
+    }
+    if best_single_pred != 0 {
+        candidates_to_try.push((0, data, false)); // Zero predictor Huffman
+        if total >= 64 {
+            candidates_to_try.push((0, data, true)); // Zero predictor ANS
+        }
+    }
+
+    let mut best_size = usize::MAX;
+    let mut best_pred = best_single_pred;
+    let mut best_resid: &[i32] = &flat_resid;
+    let mut best_ans = false;
+
+    for &(pred, resid, use_ans) in &candidates_to_try {
+        let mut tmp = BitWriter::new();
+        let ok = if use_ans {
+            write_modular_section_ans_pub(&mut tmp, 0, pred, resid, uint_config, false).is_ok()
+        } else {
+            write_modular_section_huffman(&mut tmp, 0, pred, resid, uint_config, false).is_ok()
+        };
+        if ok {
+            let sz = tmp.total_bits_written();
+            if sz < best_size {
+                best_size = sz;
+                best_pred = pred;
+                best_resid = resid;
+                best_ans = use_ans;
+            }
+        }
+    }
+
+    // Write the winner directly to the output writer.
+    if best_ans {
+        write_modular_section_ans_pub(writer, 0, best_pred, best_resid, uint_config, false)
+    } else {
+        write_modular_section_huffman(writer, 0, best_pred, best_resid, uint_config, false)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
