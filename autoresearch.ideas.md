@@ -1,29 +1,41 @@
 # Autoresearch Ideas (deferred)
 
-## Entropy Coding (DONE - ANS implemented)
-- ~~Add ANS support for modular DC encoding~~ DONE: massive win (20.81->13.87)
-- ~~ANS for HF metadata~~ DONE: mean_size 3.04%->0.89%
-- Competitive HybridUint config selection for modular streams (try multiple configs like libjxl's kBest/kFast modes)
-- Try ANS with multiple histogram clusters for modular DC (per-channel histograms via multi-leaf tree with separate context indices). Current implementation uses single histogram for all channels.
+## Webkit PSNR Gap (-1.87 dB, 37.5 penalty) -- ROOT CAUSE IDENTIFIED
+- Both our encoder and libjxl produce DC-only output for Webkit (AC all zero)
+- Our gs=5111/qlf=17 gives PSNR 42.90; libjxl gs=8813/qlf=10 gives 44.77
+- When we use libjxl's exact gs=8813/qlf=10, our PSNR DROPS to 40.13!
+- 4.64 dB gap between our encoder and libjxl at SAME quant params
+- Per-block analysis shows systematic G channel +2.0 and B channel +0.9 offset
+- This is NOT from global_scale, EPF, gaborish, or HybridUint configs
+- Must be from: (1) XYB conversion difference, (2) DCT precision, (3) CfL implementation
+- TODO: Add debug logging to dump raw XYB DC values for single block and compare
+- TODO: Check if libjxl's OpsinAbsorbance premul_absorb differs from our forward matrix
 
-## Quantization / Global Scale
-- The Webkit PSNR gap (-1.87 dB, 37.5 penalty) is caused by global_scale=5111 (from 0.39/d AQ path) making AC quantization trivially coarse. Even rq=1 produces scale=0.078/dw -- everything rounds to zero. libjxl Falcon path uses 0.79/d giving gs=8630 and preserves AC detail. Attempted separate Falcon encode path but quant calibration was wrong (produced -4.6 dB). This is the biggest remaining gap (37.5 of 50.86 total penalty).
-- Need a properly calibrated combined global_scale: high enough for AC detail but balanced for DC. Maybe use 0.55/d as compromise?
-- The softer_rq candidate (base-1) improves size by ~4.7% at cost of 0.18 dB PSNR -- net beneficial under current scoring.
+## Entropy Coding (DONE - ANS + per-channel implemented)
+- ~~Add ANS support for modular DC encoding~~ DONE
+- ~~ANS for HF metadata~~ DONE
+- ~~Per-channel ANS histograms for DC~~ DONE: parity 10.17->10.04
+- Try per-channel ANS for HF metadata (4 channels with different sizes -- needs variable-size channel support)
+- Try ANS with histogram clustering for modular DC (group similar channels)
 
-## Per-Image Analysis
-- Current best (parity_score=10.17): Webkit=37.48 pen, kodim08=7.10, kodim13=4.39, kodim01=1.87, zoltan=0.02
-- Webkit dominates penalty (74% of total). All other images are near parity.
-- For Webkit: AC coefficients are ALL zero. File is 18% smaller than libjxl. Penalty is 100% from PSNR.
-- For photos: PSNR gaps (-0.06 to -0.36 dB) come from aggressive uniform rq=5 candidate winning over AQ.
+## Quantization Improvements
+- The softer_rq candidate (base-1) helps size but costs PSNR. Under parity scoring (20x PSNR weight), better to optimize for PSNR when size is already below libjxl.
+- RD-optimized candidate selection: weight encoded_size + lambda*distortion instead of pure size
+- extra_dc_precision=1: doubles DC granularity without changing global_scale. Need to plumb through quantize_vardct_blocks.
 
-## Transform / EPF
-- EPF iters: tested matching libjxl (2->1 at d=1.0). Slight PSNR regression because our quant was tuned for 2 iters.
-- Dead-zone removal: no effect (subsumed by round()).
-- libjxl at Falcon only uses DCT8x8 (no merge heuristic). Our effort-7 uses complex merge logic.
+## Per-Image Analysis (current best: parity_score=10.04)
+- Webkit: 37.48 pen (-1.87 dB PSNR, -18% size) -- fundamentally different encode pipeline issue
+- kodim08: 7.10 pen (-0.35 dB PSNR)
+- kodim13: 4.39 pen (-0.22 dB PSNR)
+- kodim01: now <=0.64 pen (size parity or better after per-channel ANS)
+- zoltan: 0.02 pen (at parity)
 
-## Promising unexplored
-- Try intermediate global_scale (0.55/d instead of 0.39/d) for flat graphics only
-- Try per-block adaptive quant using the AQ map with global_scale matched to its median
-- Improve histogram clustering (entropy-based distance metrics matching enc_cluster.cc)
-- Try weighted predictor (predictor 14 in JXL spec) for modular DC
+## Tried and Failed
+- Competitive HybridUint config selection: no improvement, (4,2,0) already optimal
+- x_qm_scale change (3->2): regression, photo PSNR worsened
+- Falcon global_scale for flat graphics: regression (-4.64 dB) due to unknown encode pipeline issue
+- New predictors (Select, Average): decoder mismatch (inverted left/right convention)
+- Higher rq candidates: never win size competition
+- EPF iters change (2->1): slight regression, quant tuned for 2 iters
+- Dead-zone removal: no effect
+- Disabling gaborish globally: massive regression (quant tuned for gab)
