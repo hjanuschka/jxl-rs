@@ -1,6 +1,6 @@
 # Autoresearch Ideas (deferred)
 
-## Current Status: parity_score=2.46 (commit 354169f)
+## Current Status: parity_score=2.38 (commit 64736a9, 15+ experiments)
 
 ## Per-Image Breakdown (ep=1, gs=5111)
 - Webkit: 0 penalty (SOLVED via extra_dc_precision=1)
@@ -42,6 +42,18 @@
   better zero-run encoding.
 
 ## Tried and Failed (do NOT retry)
+- quant_ac multiplier 1.0: massive PSNR regression (-1.68 dB)
+- quant_ac multiplier 1.15: -0.83 dB worst PSNR, parity 4.98
+- quant_ac multiplier 1.22/1.30/1.35: no effect (gs unchanged, same rq levels)
+- Dead zone threshold 0.52/0.56: worse PSNR (-0.43 dB), files smaller but parity 3.29
+- Dead zone threshold 0.58/0.64 (libjxl match): massive PSNR regression, parity 7.79
+- Bias-aware AC quantization (AdjustQuantBias thresholds 0.465): no change, scale too fine
+- CfL dist_mul 1e-9 (was 1e-3): no change, regularizer negligible at both scales
+- CfL weights with dm_multiplier: no change (x_dm=0.8 negligible, b_dm=1.0)
+- Remove softer_rq candidate: +8.9% max size kills parity (6.72)
+- Fix base_rq to match actual gs: PSNR +0.40 but +8.9% size, parity 6.72
+- Add matched-gs rq candidates: never win size competition, 50% slower
+- Add finer_rq=base+1 candidate: never wins size competition
 - quant_ac multiplier changes (1.15, 1.30): no effect (only affects adaptive candidate)
 - x_qm_scale 3->2: regression, photo PSNR worsened
 - gs=8813 + ep=0: massive regression (Webkit -4.64 dB)
