@@ -956,8 +956,13 @@ fn encode_single_rgba_frame(
         quant_ac,
     );
     let (_, _, base_raw_quant) = distance_to_full_quant_params(config.distance);
+    // Add uniform candidates at multiple quant levels. The RD selection (smallest file)
+    // will pick the most aggressive one that produces near-optimal quality.
+    // Lower raw_quant = less quantization = higher quality but larger files.
+    let softer_rq = (base_raw_quant as u16).saturating_sub(1).max(1) as u8;
     let mut raw_quant_map_candidates = vec![
-        vec![base_raw_quant; bw * bh], // uniform candidate
+        vec![base_raw_quant; bw * bh], // uniform candidate (standard)
+        vec![softer_rq; bw * bh],      // uniform candidate (softer quant)
         adaptive_map,                  // libjxl-style adaptive candidate
     ];
 
