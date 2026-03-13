@@ -1078,6 +1078,9 @@ fn encode_single_rgba_frame(
     let is_flat_graphic = is_flat_graphic_pre;
     let max_total_encodes = effort_cfg.max_total_encodes;
     let mut total_encodes = 0usize;
+    // Extra DC precision: doubles DC quantization granularity per level.
+    // Level 1 halves the DC quantization step for better PSNR at small size cost.
+    let extra_dc_precision: u32 = 2;
     let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());
     for raw_quant_map in &raw_quant_map_candidates {
         let quantized = quantize_vardct_blocks(
@@ -1094,6 +1097,7 @@ fn encode_single_rgba_frame(
             bw,
             &ytox_map,
             &ytob_map,
+            extra_dc_precision,
         );
         let mut transform_map_candidates =
             build_transform_map_candidates_from_quantized_ac_with_flags(
@@ -1178,6 +1182,7 @@ fn encode_single_rgba_frame(
                 alpha,
                 config.effort,
                 config.progressive,
+                extra_dc_precision,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -1231,6 +1236,7 @@ fn encode_single_rgba_frame(
                     alpha,
                     config.effort,
                     config.progressive,
+                    extra_dc_precision,
                 )?;
 
                 total_encodes += 1;
@@ -1592,6 +1598,7 @@ fn quantize_vardct_blocks(
     bw: usize,
     ytox_map: &[i32],
     ytob_map: &[i32],
+    extra_dc_precision: u32,
 ) -> QuantizedVardct {
     if std::env::var("JXL_ENC_SIMD")
         .map(|v| v.eq_ignore_ascii_case("assisted"))
@@ -1618,6 +1625,7 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
+                        extra_dc_precision,
                     );
                 }
             }
@@ -1639,6 +1647,7 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
+                        extra_dc_precision,
                     );
                 }
             }
@@ -1660,6 +1669,7 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
+                        extra_dc_precision,
                     );
                 }
             }
@@ -1681,6 +1691,7 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
+                        extra_dc_precision,
                     );
                 }
             }
@@ -1716,9 +1727,12 @@ fn quantize_vardct_blocks(
         let cfl_dc_y = raw_dc_y; // in_y = dc_y
         let cfl_dc_b = raw_dc_b - raw_dc_y; // in_b = dc_b - dc_y (y_to_b_lf=1.0)
 
-        dc_x[blk] = quantize_dc(cfl_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
-        dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
-        dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
+        dc_x[blk] =
+            quantize_dc_with_ep(cfl_dc_x, global_scale, quant_lf, inv_lf_quant[0], extra_dc_precision);
+        dc_y[blk] =
+            quantize_dc_with_ep(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1], extra_dc_precision);
+        dc_b[blk] =
+            quantize_dc_with_ep(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2], extra_dc_precision);
 
         // AC: apply CfL decorrelation with per-tile ytox and ytob factors.
         for k in 1..64 {
@@ -1761,6 +1775,7 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
     bw: usize,
     ytox_map: &[i32],
     ytob_map: &[i32],
+    extra_dc_precision: u32,
 ) -> QuantizedVardct {
     const K_COLOR_FACTOR: f32 = 84.0;
     let num_blocks = raw_quant_map.len();
@@ -1789,9 +1804,12 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
         let raw_dc_b = dct_b[blk * 64];
         let cfl_dc_b = raw_dc_b - raw_dc_y;
 
-        dc_x[blk] = quantize_dc(raw_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
-        dc_y[blk] = quantize_dc(raw_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
-        dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
+        dc_x[blk] =
+            quantize_dc_with_ep(raw_dc_x, global_scale, quant_lf, inv_lf_quant[0], extra_dc_precision);
+        dc_y[blk] =
+            quantize_dc_with_ep(raw_dc_y, global_scale, quant_lf, inv_lf_quant[1], extra_dc_precision);
+        dc_b[blk] =
+            quantize_dc_with_ep(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2], extra_dc_precision);
 
         let ytox_vec = D::F32Vec::splat(d, ytox_ratio);
         let ytob_vec = D::F32Vec::splat(d, ytob_ratio);
@@ -5148,7 +5166,19 @@ fn forward_dct_channel(
 ///   quantized = round(dc_float * global_scale * quant_lf / (2^16 * LF_QUANT[c]))
 ///             = round(dc_float * global_scale * quant_lf * INV_LF_QUANT[c] / 2^16)
 fn quantize_dc(dc_float: f32, global_scale: u32, quant_lf: u32, inv_lf_quant: f32) -> i32 {
-    let scale = (global_scale as f32) * (quant_lf as f32) * inv_lf_quant / (1u32 << 16) as f32;
+    quantize_dc_with_ep(dc_float, global_scale, quant_lf, inv_lf_quant, 0)
+}
+
+fn quantize_dc_with_ep(
+    dc_float: f32,
+    global_scale: u32,
+    quant_lf: u32,
+    inv_lf_quant: f32,
+    extra_precision: u32,
+) -> i32 {
+    let ep_mul = (1u32 << extra_precision) as f32;
+    let scale =
+        (global_scale as f32) * (quant_lf as f32) * inv_lf_quant * ep_mul / (1u32 << 16) as f32;
     (dc_float * scale).round() as i32
 }
 
@@ -5234,6 +5264,7 @@ fn encode_vardct_frame(
         None, // no alpha
         7,
         false,
+        0, // extra_dc_precision
     )
 }
 
@@ -5263,6 +5294,7 @@ fn encode_vardct_frame_inner(
     alpha: Option<&[u8]>,
     effort: u8,
     progressive: bool,
+    extra_dc_precision: u32,
 ) -> Result<Vec<u8>> {
     let has_alpha = alpha.is_some();
     let num_extra_channels = if has_alpha { 1u32 } else { 0 };
@@ -5331,6 +5363,7 @@ fn encode_vardct_frame_inner(
             ytob_map,
             alpha,
             effort,
+            extra_dc_precision,
         )?;
 
         write_toc(&mut writer, &[section.len() as u32])?;
@@ -5578,6 +5611,7 @@ fn encode_vardct_frame_inner(
                 transform_map,
                 ytox_map,
                 ytob_map,
+                extra_dc_precision,
             )?);
         }
 
@@ -6684,6 +6718,7 @@ fn encode_single_group_section(
     ytob_map: &[i32],
     alpha: Option<&[u8]>, // u8 alpha channel, width*height pixels
     effort: u8,
+    extra_dc_precision: u32,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
@@ -6716,8 +6751,8 @@ fn encode_single_group_section(
     }
 
     // === LfGroup0: VarDCT DC ===
-    // extra_precision = 0 (2 bits)
-    w.write(2, 0)?;
+    // extra_precision (2 bits)
+    w.write(2, extra_dc_precision as u64)?;
     // DC coefficients as modular (3 channels: Y, X, B order as per decode_vardct_lf)
     // The decoder creates channels in order: [shrink_rect(1), shrink_rect(0), shrink_rect(2)]
     // which for non-subsampled is [Y_chan, X_chan, B_chan]
@@ -7052,6 +7087,7 @@ fn encode_lf_group_section(
     transform_map: &[u8],
     ytox_map: &[i32],
     ytob_map: &[i32],
+    extra_dc_precision: u32,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -7063,8 +7099,8 @@ fn encode_lf_group_section(
     assert_eq!(transform_map.len(), bw * bh);
 
     // === VarDCT LF: DC coefficients ===
-    // extra_precision = 0 (2 bits)
-    w.write(2, 0)?;
+    // extra_precision (2 bits)
+    w.write(2, extra_dc_precision as u64)?;
 
     // DC as modular (3 channels: Y, X, B order matching decoder's decode_vardct_lf)
     let npixels = gw * gh;
@@ -8047,6 +8083,7 @@ mod tests {
             bw,
             &ytox_map,
             &ytob_map,
+            0,
         );
 
         let simd = quantize_vardct_blocks_simd_assisted(
@@ -8064,6 +8101,7 @@ mod tests {
             bw,
             &ytox_map,
             &ytob_map,
+            0,
         );
 
         assert_eq!(scalar.dc_x, simd.dc_x);
@@ -10136,6 +10174,7 @@ mod tests {
                 bw,
                 &ytox_map,
                 &ytob_map,
+                0,
             );
 
             let mut transform_map = build_default_transform_map(bw, bh);
