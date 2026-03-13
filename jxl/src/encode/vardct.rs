@@ -14,11 +14,13 @@ use crate::encode::encodings::write_u32;
 use crate::encode::entropy::context_map::write_context_map;
 use crate::encode::entropy::huffman_encode::build_huffman_code;
 use crate::encode::headers::write_file_header;
+use crate::encode::simd::{EncoderSimdBackend, detect_encoder_simd_backend};
 use crate::encode::toc::write_toc;
-use crate::encode::xyb::srgb_u8_to_xyb;
+use crate::encode::xyb::srgb_u8_to_xyb_auto;
 use crate::error::Result;
 use crate::frame::block_context_map::{self, NON_ZERO_BUCKETS, ZERO_DENSITY_CONTEXT_COUNT};
 use crate::headers::encodings::{U32, U32Coder};
+use jxl_simd::{F32SimdVec, I32SimdVec, SimdDescriptor, SimdMask};
 use jxl_transforms::{
     dct2d_8_scalar,
     transform::transform_to_pixels,
@@ -503,7 +505,9 @@ fn alpha_psnr_db(orig: &[u8], cand: &[u8]) -> f32 {
 fn estimate_alpha_modular_bytes(alpha: &[u8], width: usize, height: usize) -> Result<usize> {
     let mut w = BitWriter::new();
     let alpha_i32: Vec<i32> = alpha.iter().map(|&a| a as i32).collect();
-    crate::encode::modular_encode::encode_modular_signed_stream(&mut w, width, height, 1, &alpha_i32)?;
+    crate::encode::modular_encode::encode_modular_signed_stream(
+        &mut w, width, height, 1, &alpha_i32,
+    )?;
     w.byte_align_zero_pad()?;
     Ok(w.finish().len())
 }
@@ -919,7 +923,7 @@ fn encode_single_rgba_frame(
     let mut x_chan = vec![0.0f32; npixels];
     let mut y_chan = vec![0.0f32; npixels];
     let mut b_chan = vec![0.0f32; npixels];
-    srgb_u8_to_xyb(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan)?;
+    srgb_u8_to_xyb_auto(rgb, width, height, &mut x_chan, &mut y_chan, &mut b_chan)?;
 
     // Match libjxl enc_frame.cc:SimplifyInvisible for lossy non-associated alpha.
     // This only touches fully invisible pixels (alpha == 0).
@@ -1326,6 +1330,49 @@ fn compute_cfl_maps(
     bw: usize,
     bh: usize,
 ) -> (Vec<i32>, Vec<i32>) {
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
+    {
+        match detect_encoder_simd_backend() {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    return compute_cfl_maps_simd_assisted(d, dct_x, dct_y, dct_b, bw, bh);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    return compute_cfl_maps_simd_assisted(d, dct_x, dct_y, dct_b, bw, bh);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    return compute_cfl_maps_simd_assisted(d, dct_x, dct_y, dct_b, bw, bh);
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    return compute_cfl_maps_simd_assisted(d, dct_x, dct_y, dct_b, bw, bh);
+                }
+            }
+        }
+    }
+
+    compute_cfl_maps_scalar(dct_x, dct_y, dct_b, bw, bh)
+}
+
+fn compute_cfl_maps_scalar(
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    bw: usize,
+    bh: usize,
+) -> (Vec<i32>, Vec<i32>) {
     // Get DCT8 dequant weights for weighting CfL regression.
     // Table 0 (Dct) has 3*64 = 192 entries: [0..64]=Y, [64..128]=X, [128..192]=B.
     // libjxl uses InvMatrix(strategy, channel) which returns 1/dequant_weight.
@@ -1414,6 +1461,118 @@ fn compute_cfl_maps(
     (ytox_map, ytob_map)
 }
 
+fn compute_cfl_maps_simd_assisted<D: SimdDescriptor>(
+    d: D,
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    bw: usize,
+    bh: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    let dw_table = crate::frame::quant_weights::DequantMatrices::get_library_table(0);
+    let mut qw_x = [0.0f32; 64];
+    let mut qw_b = [0.0f32; 64];
+    for k in 0..64 {
+        qw_x[k] = 1.0 / dw_table[64 + k].max(1e-10);
+        qw_b[k] = 1.0 / dw_table[128 + k].max(1e-10);
+    }
+
+    const K_COLOR_FACTOR: f32 = 84.0;
+    let cr_w = bw.div_ceil(8);
+    let cr_h = bh.div_ceil(8);
+    let mut ytox_map = vec![0i32; cr_w * cr_h];
+    let mut ytob_map = vec![0i32; cr_w * cr_h];
+
+    let lanes = D::F32Vec::LEN;
+    let mut tmp_x = vec![0.0f32; lanes];
+    let mut tmp_y = vec![0.0f32; lanes];
+    let mut tmp_b = vec![0.0f32; lanes];
+    let mut tmp_qx = vec![0.0f32; lanes];
+    let mut tmp_qb = vec![0.0f32; lanes];
+    let mut lane_yx = vec![0.0f32; lanes];
+    let mut lane_xw = vec![0.0f32; lanes];
+    let mut lane_yb = vec![0.0f32; lanes];
+    let mut lane_bw = vec![0.0f32; lanes];
+
+    for ty in 0..cr_h {
+        for tx in 0..cr_w {
+            let mut sum_yy_x = 0.0f64;
+            let mut sum_yx = 0.0f64;
+            let mut sum_yy_b = 0.0f64;
+            let mut sum_yb = 0.0f64;
+
+            for by in (ty * 8)..((ty + 1) * 8).min(bh) {
+                for bx in (tx * 8)..((tx + 1) * 8).min(bw) {
+                    let blk = by * bw + bx;
+                    let blk_off = blk * 64;
+                    let mut k0 = 1usize;
+                    while k0 < 64 {
+                        let chunk = (64 - k0).min(lanes);
+                        for lane in 0..chunk {
+                            let k = k0 + lane;
+                            tmp_x[lane] = dct_x[blk_off + k];
+                            tmp_y[lane] = dct_y[blk_off + k];
+                            tmp_b[lane] = dct_b[blk_off + k];
+                            tmp_qx[lane] = qw_x[k];
+                            tmp_qb[lane] = qw_b[k];
+                        }
+                        for lane in chunk..lanes {
+                            tmp_x[lane] = 0.0;
+                            tmp_y[lane] = 0.0;
+                            tmp_b[lane] = 0.0;
+                            tmp_qx[lane] = 0.0;
+                            tmp_qb[lane] = 0.0;
+                        }
+
+                        let vy = D::F32Vec::load(d, &tmp_y);
+                        let vx = D::F32Vec::load(d, &tmp_x);
+                        let vb = D::F32Vec::load(d, &tmp_b);
+                        let qx = D::F32Vec::load(d, &tmp_qx);
+                        let qb = D::F32Vec::load(d, &tmp_qb);
+
+                        (vy * qx).store(&mut lane_yx);
+                        (vx * qx).store(&mut lane_xw);
+                        (vy * qb).store(&mut lane_yb);
+                        (vb * qb).store(&mut lane_bw);
+
+                        for lane in 0..chunk {
+                            let y_for_x = lane_yx[lane] as f64;
+                            let x_val = lane_xw[lane] as f64;
+                            let y_for_b = lane_yb[lane] as f64;
+                            let b_val = lane_bw[lane] as f64;
+                            sum_yy_x += y_for_x * y_for_x;
+                            sum_yx += y_for_x * x_val;
+                            sum_yy_b += y_for_b * y_for_b;
+                            sum_yb += y_for_b * b_val;
+                        }
+                        k0 += lanes;
+                    }
+                }
+            }
+
+            let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8) * ((tx * 8 + 8).min(bw) - tx * 8);
+            let num_coeffs = (n_blocks * 63) as f64;
+            let dist_mul = 1e-3;
+
+            let reg_x = num_coeffs * dist_mul * 0.5;
+            if sum_yy_x + reg_x > 1e-10 {
+                let x_raw = (sum_yx / (sum_yy_x + reg_x)) * K_COLOR_FACTOR as f64;
+                let x_shrunk = towards_zero_shrink(x_raw, TOWARDS_ZERO);
+                ytox_map[ty * cr_w + tx] = (x_shrunk.round() as i32).clamp(-127, 127);
+            }
+
+            let reg_b = num_coeffs * dist_mul * 0.5;
+            if sum_yy_b + reg_b > 1e-10 {
+                let b_raw = ((sum_yb / (sum_yy_b + reg_b)) - 1.0) * K_COLOR_FACTOR as f64;
+                let b_shrunk = towards_zero_shrink(b_raw, TOWARDS_ZERO);
+                ytob_map[ty * cr_w + tx] = (b_shrunk.round() as i32).clamp(-127, 127);
+            }
+        }
+    }
+
+    (ytox_map, ytob_map)
+}
+
 fn quantize_vardct_blocks(
     dct_x: &[f32],
     dct_y: &[f32],
@@ -1429,6 +1588,100 @@ fn quantize_vardct_blocks(
     ytox_map: &[i32],
     ytob_map: &[i32],
 ) -> QuantizedVardct {
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
+    {
+        let backend = detect_encoder_simd_backend();
+        match backend {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    return quantize_vardct_blocks_simd_assisted(
+                        d,
+                        dct_x,
+                        dct_y,
+                        dct_b,
+                        global_scale,
+                        quant_lf,
+                        raw_quant_map,
+                        inv_lf_quant,
+                        dequant_weights,
+                        x_dm_multiplier,
+                        b_dm_multiplier,
+                        bw,
+                        ytox_map,
+                        ytob_map,
+                    );
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    return quantize_vardct_blocks_simd_assisted(
+                        d,
+                        dct_x,
+                        dct_y,
+                        dct_b,
+                        global_scale,
+                        quant_lf,
+                        raw_quant_map,
+                        inv_lf_quant,
+                        dequant_weights,
+                        x_dm_multiplier,
+                        b_dm_multiplier,
+                        bw,
+                        ytox_map,
+                        ytob_map,
+                    );
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    return quantize_vardct_blocks_simd_assisted(
+                        d,
+                        dct_x,
+                        dct_y,
+                        dct_b,
+                        global_scale,
+                        quant_lf,
+                        raw_quant_map,
+                        inv_lf_quant,
+                        dequant_weights,
+                        x_dm_multiplier,
+                        b_dm_multiplier,
+                        bw,
+                        ytox_map,
+                        ytob_map,
+                    );
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    return quantize_vardct_blocks_simd_assisted(
+                        d,
+                        dct_x,
+                        dct_y,
+                        dct_b,
+                        global_scale,
+                        quant_lf,
+                        raw_quant_map,
+                        inv_lf_quant,
+                        dequant_weights,
+                        x_dm_multiplier,
+                        b_dm_multiplier,
+                        bw,
+                        ytox_map,
+                        ytob_map,
+                    );
+                }
+            }
+        }
+    }
+
     const K_COLOR_FACTOR: f32 = 84.0;
     let num_blocks = raw_quant_map.len();
     let cr_w = bw.div_ceil(8);
@@ -1475,6 +1728,124 @@ fn quantize_vardct_blocks(
             qx[blk * 64 + k] = quantize_ac(ac_x, global_scale, raw_quant, dw_x);
             qy[blk * 64 + k] = quantize_ac(ac_y, global_scale, raw_quant, dw_y);
             qb[blk * 64 + k] = quantize_ac(ac_b, global_scale, raw_quant, dw_b);
+        }
+    }
+
+    QuantizedVardct {
+        dc_x,
+        dc_y,
+        dc_b,
+        ac_x: qx,
+        ac_y: qy,
+        ac_b: qb,
+    }
+}
+
+fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
+    d: D,
+    dct_x: &[f32],
+    dct_y: &[f32],
+    dct_b: &[f32],
+    global_scale: u32,
+    quant_lf: u32,
+    raw_quant_map: &[u8],
+    inv_lf_quant: &[f32; 3],
+    dequant_weights: &[f32],
+    x_dm_multiplier: f32,
+    b_dm_multiplier: f32,
+    bw: usize,
+    ytox_map: &[i32],
+    ytob_map: &[i32],
+) -> QuantizedVardct {
+    const K_COLOR_FACTOR: f32 = 84.0;
+    let num_blocks = raw_quant_map.len();
+    let cr_w = bw.div_ceil(8);
+    let mut dc_x = vec![0i32; num_blocks];
+    let mut dc_y = vec![0i32; num_blocks];
+    let mut dc_b = vec![0i32; num_blocks];
+    let mut qx = vec![0i32; num_blocks * 64];
+    let mut qy = vec![0i32; num_blocks * 64];
+    let mut qb = vec![0i32; num_blocks * 64];
+
+    let lanes = D::F32Vec::LEN;
+    for blk in 0..num_blocks {
+        let raw_quant = raw_quant_map[blk] as u32;
+        let bx = blk % bw;
+        let by = blk / bw;
+        let tx = bx / 8;
+        let ty = by / 8;
+        let x_factor = ytox_map[ty * cr_w + tx];
+        let b_factor = ytob_map[ty * cr_w + tx];
+        let ytox_ratio = x_factor as f32 / K_COLOR_FACTOR;
+        let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
+
+        let raw_dc_x = dct_x[blk * 64];
+        let raw_dc_y = dct_y[blk * 64];
+        let raw_dc_b = dct_b[blk * 64];
+        let cfl_dc_b = raw_dc_b - raw_dc_y;
+
+        dc_x[blk] = quantize_dc(raw_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
+        dc_y[blk] = quantize_dc(raw_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
+        dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
+
+        let ytox_vec = D::F32Vec::splat(d, ytox_ratio);
+        let ytob_vec = D::F32Vec::splat(d, ytob_ratio);
+
+        let mut tmp_x = vec![0.0f32; lanes];
+        let mut tmp_y = vec![0.0f32; lanes];
+        let mut tmp_b = vec![0.0f32; lanes];
+        let mut tmp_dwx = vec![0.0f32; lanes];
+        let mut tmp_dwy = vec![0.0f32; lanes];
+        let mut tmp_dwb = vec![0.0f32; lanes];
+
+        let mut acx_lane = vec![0.0f32; lanes];
+        let mut acy_lane = vec![0.0f32; lanes];
+        let mut acb_lane = vec![0.0f32; lanes];
+
+        let blk_off = blk * 64;
+        let mut k0 = 1usize;
+        while k0 < 64 {
+            let chunk = (64 - k0).min(lanes);
+            for lane in 0..chunk {
+                let k = k0 + lane;
+                tmp_x[lane] = dct_x[blk_off + k];
+                tmp_y[lane] = dct_y[blk_off + k];
+                tmp_b[lane] = dct_b[blk_off + k];
+                tmp_dwx[lane] = dequant_weights[k] * x_dm_multiplier;
+                tmp_dwy[lane] = dequant_weights[64 + k];
+                tmp_dwb[lane] = dequant_weights[128 + k] * b_dm_multiplier;
+            }
+            for lane in chunk..lanes {
+                tmp_x[lane] = 0.0;
+                tmp_y[lane] = 0.0;
+                tmp_b[lane] = 0.0;
+                tmp_dwx[lane] = 1.0;
+                tmp_dwy[lane] = 1.0;
+                tmp_dwb[lane] = 1.0;
+            }
+
+            let vx = D::F32Vec::load(d, &tmp_x);
+            let vy = D::F32Vec::load(d, &tmp_y);
+            let vb = D::F32Vec::load(d, &tmp_b);
+
+            let acx = vx - ytox_vec * vy;
+            let acy = vy;
+            let acb = vb - ytob_vec * vy;
+
+            acx.store(&mut acx_lane);
+            acy.store(&mut acy_lane);
+            acb.store(&mut acb_lane);
+
+            for lane in 0..chunk {
+                let k = k0 + lane;
+                qx[blk_off + k] =
+                    quantize_ac(acx_lane[lane], global_scale, raw_quant, tmp_dwx[lane]);
+                qy[blk_off + k] =
+                    quantize_ac(acy_lane[lane], global_scale, raw_quant, tmp_dwy[lane]);
+                qb[blk_off + k] =
+                    quantize_ac(acb_lane[lane], global_scale, raw_quant, tmp_dwb[lane]);
+            }
+            k0 += lanes;
         }
     }
 
@@ -1575,6 +1946,96 @@ fn compute_mask(out_val: f32) -> f32 {
     let v3 = 1.0 / (v1 * v1 + K_OFFSET3);
     let v4 = 1.0 / (v1 * v1 + K_OFFSET4);
     K_BASE + K_MUL4 * v4 + K_MUL2 * v2 + K_MUL3 * v3
+}
+
+fn compute_mask_slice_simd_assisted<D: SimdDescriptor>(d: D, input: &[f32], out: &mut [f32]) {
+    const K_BASE: f32 = -0.7647;
+    const K_MUL4: f32 = 9.4708735624378946;
+    const K_MUL2: f32 = 17.35036561631863;
+    const K_OFFSET2: f32 = 302.59587815579727;
+    const K_MUL3: f32 = 6.7943250517376494;
+    const K_OFFSET3: f32 = 3.7179635626140772;
+    const K_OFFSET4: f32 = 0.25 * K_OFFSET3;
+    const K_MUL0: f32 = 0.80061762862741759;
+
+    let lanes = D::F32Vec::LEN;
+    let v_k_mul0 = D::F32Vec::splat(d, K_MUL0);
+    let v_k_offset2 = D::F32Vec::splat(d, K_OFFSET2);
+    let v_k_offset3 = D::F32Vec::splat(d, K_OFFSET3);
+    let v_k_offset4 = D::F32Vec::splat(d, K_OFFSET4);
+    let v_k_mul2 = D::F32Vec::splat(d, K_MUL2);
+    let v_k_mul3 = D::F32Vec::splat(d, K_MUL3);
+    let v_k_mul4 = D::F32Vec::splat(d, K_MUL4);
+    let v_k_base = D::F32Vec::splat(d, K_BASE);
+    let v_one = D::F32Vec::splat(d, 1.0);
+    let v_min = D::F32Vec::splat(d, 1e-3);
+
+    let mut tmp_in = vec![0.0f32; lanes];
+    let mut tmp_out = vec![0.0f32; lanes];
+
+    let mut i = 0usize;
+    while i < input.len() {
+        let chunk = (input.len() - i).min(lanes);
+        tmp_in[..chunk].copy_from_slice(&input[i..i + chunk]);
+        for v in tmp_in.iter_mut().take(lanes).skip(chunk) {
+            *v = 0.0;
+        }
+
+        let x = D::F32Vec::load(d, &tmp_in);
+        let v1 = (x * v_k_mul0).max(v_min);
+        let v1_sq = v1 * v1;
+        let v2 = v_one / (v1 + v_k_offset2);
+        let v3 = v_one / (v1_sq + v_k_offset3);
+        let v4 = v_one / (v1_sq + v_k_offset4);
+        let y = v_k_base + v_k_mul4 * v4 + v_k_mul2 * v2 + v_k_mul3 * v3;
+        y.store(&mut tmp_out);
+
+        out[i..i + chunk].copy_from_slice(&tmp_out[..chunk]);
+        i += lanes;
+    }
+}
+
+fn compute_mask_slice(input: &[f32], out: &mut [f32]) {
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
+    {
+        match detect_encoder_simd_backend() {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    compute_mask_slice_simd_assisted(d, input, out);
+                    return;
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    compute_mask_slice_simd_assisted(d, input, out);
+                    return;
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    compute_mask_slice_simd_assisted(d, input, out);
+                    return;
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    compute_mask_slice_simd_assisted(d, input, out);
+                    return;
+                }
+            }
+        }
+    }
+
+    for (i, &v) in input.iter().enumerate() {
+        out[i] = compute_mask(v);
+    }
 }
 
 /// Fast log2 approximation matching libjxl's FastLog2f.
@@ -1680,6 +2141,96 @@ fn blue_modulation(
 /// Compute per-pixel Laplacian-based diff in Y channel, squared, clamped,
 /// then MaskingSqrt'd, downsampled 4x, and FuzzyErosion'd to get per-block
 /// aq_map values. Direct port of libjxl ComputeTile.
+fn downsample_row4_scalar(row_buf: &[f32], out: &mut [f32]) {
+    for qx in 0..out.len() {
+        out[qx] =
+            (row_buf[qx * 4] + row_buf[qx * 4 + 1] + row_buf[qx * 4 + 2] + row_buf[qx * 4 + 3])
+                * 0.25;
+    }
+}
+
+fn downsample_row4_simd_assisted<D: SimdDescriptor>(d: D, row_buf: &[f32], out: &mut [f32]) {
+    let lanes = D::F32Vec::LEN;
+    let quarter = D::F32Vec::splat(d, 0.25);
+    let mut tmp_interleaved = vec![0.0f32; lanes * 4];
+    let mut tmp_out = vec![0.0f32; lanes];
+
+    let mut q0 = 0usize;
+    while q0 < out.len() {
+        let chunk = (out.len() - q0).min(lanes);
+        if chunk == lanes {
+            let start = q0 * 4;
+            let src = &row_buf[start..start + lanes * 4];
+            let (a, b, c, d4) = D::F32Vec::load_deinterleaved_4(d, src);
+            let avg = (a + b + c + d4) * quarter;
+            avg.store(&mut tmp_out);
+            out[q0..q0 + lanes].copy_from_slice(&tmp_out[..lanes]);
+        } else {
+            for lane in 0..chunk {
+                let qx = q0 + lane;
+                let base = lane * 4;
+                tmp_interleaved[base] = row_buf[qx * 4];
+                tmp_interleaved[base + 1] = row_buf[qx * 4 + 1];
+                tmp_interleaved[base + 2] = row_buf[qx * 4 + 2];
+                tmp_interleaved[base + 3] = row_buf[qx * 4 + 3];
+            }
+            for lane in chunk..lanes {
+                let base = lane * 4;
+                tmp_interleaved[base] = 0.0;
+                tmp_interleaved[base + 1] = 0.0;
+                tmp_interleaved[base + 2] = 0.0;
+                tmp_interleaved[base + 3] = 0.0;
+            }
+            let (a, b, c, d4) = D::F32Vec::load_deinterleaved_4(d, &tmp_interleaved);
+            let avg = (a + b + c + d4) * quarter;
+            avg.store(&mut tmp_out);
+            out[q0..q0 + chunk].copy_from_slice(&tmp_out[..chunk]);
+        }
+        q0 += lanes;
+    }
+}
+
+fn downsample_row4_auto(row_buf: &[f32], out: &mut [f32]) {
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
+    {
+        match detect_encoder_simd_backend() {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    downsample_row4_simd_assisted(d, row_buf, out);
+                    return;
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    downsample_row4_simd_assisted(d, row_buf, out);
+                    return;
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    downsample_row4_simd_assisted(d, row_buf, out);
+                    return;
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    downsample_row4_simd_assisted(d, row_buf, out);
+                    return;
+                }
+            }
+        }
+    }
+
+    downsample_row4_scalar(row_buf, out)
+}
+
 fn compute_aq_map(
     xyb_y: &[f32],
     img_w: usize,
@@ -1732,14 +2283,8 @@ fn compute_aq_map(
         if y % 4 == 3 {
             let dy = y / 4;
             if dy < ds_h {
-                for qx in 0..ds_w {
-                    let avg = (row_buf[qx * 4]
-                        + row_buf[qx * 4 + 1]
-                        + row_buf[qx * 4 + 2]
-                        + row_buf[qx * 4 + 3])
-                        * 0.25;
-                    pre_erosion[dy * ds_w + qx] = avg;
-                }
+                let out_row = &mut pre_erosion[dy * ds_w..(dy + 1) * ds_w];
+                downsample_row4_auto(&row_buf, out_row);
             }
         }
     }
@@ -1839,10 +2384,13 @@ fn apply_per_block_modulations(
     let mul = scale * dampen;
     let add = (1.0 - dampen) * base_level;
 
+    let mut base_mask = vec![0.0f32; aq_map.len()];
+    compute_mask_slice(aq_map, &mut base_mask);
+
     for by in 0..bh {
         for bx in 0..bw {
             let idx = by * bw + bx;
-            let mut out_val = compute_mask(aq_map[idx]);
+            let mut out_val = base_mask[idx];
             out_val = gamma_modulation(bx, by, xyb_x, xyb_y, img_w, img_h) + out_val;
             let hf_val = hf_modulation(bx, by, xyb_y, img_w, img_h) + out_val;
             let blue_val = blue_modulation(bx, by, xyb_x, xyb_y, xyb_b, img_w, img_h) + out_val;
@@ -2091,6 +2639,75 @@ fn build_zero_merge_transform_map(
     transform_map
 }
 
+fn abs_sum_i32_slice_scalar(values: &[i32]) -> u64 {
+    let mut sum = 0u64;
+    for &v in values {
+        sum += v.unsigned_abs() as u64;
+    }
+    sum
+}
+
+fn abs_sum_i32_slice_simd_assisted<D: SimdDescriptor>(d: D, values: &[i32]) -> u64 {
+    let lanes = D::I32Vec::LEN;
+    let mut sum = 0u64;
+    let mut tmp_in = vec![0i32; lanes];
+    let mut tmp_out = vec![0i32; lanes];
+
+    let mut i = 0usize;
+    while i < values.len() {
+        let chunk = (values.len() - i).min(lanes);
+        tmp_in[..chunk].copy_from_slice(&values[i..i + chunk]);
+        for v in tmp_in.iter_mut().take(lanes).skip(chunk) {
+            *v = 0;
+        }
+        let vv = D::I32Vec::load(d, &tmp_in);
+        vv.abs().store(&mut tmp_out);
+        for &v in &tmp_out[..chunk] {
+            sum += v as u64;
+        }
+        i += lanes;
+    }
+
+    sum
+}
+
+fn abs_sum_i32_slice(values: &[i32]) -> u64 {
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
+    {
+        match detect_encoder_simd_backend() {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    return abs_sum_i32_slice_simd_assisted(d, values);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    return abs_sum_i32_slice_simd_assisted(d, values);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    return abs_sum_i32_slice_simd_assisted(d, values);
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    return abs_sum_i32_slice_simd_assisted(d, values);
+                }
+            }
+        }
+    }
+
+    abs_sum_i32_slice_scalar(values)
+}
+
 fn quantized_transform_region_abs_sum(
     ac: &[i32],
     bw: usize,
@@ -2104,9 +2721,7 @@ fn quantized_transform_region_abs_sum(
         for ix in 0..cx {
             let block_idx = (by + iy) * bw + (bx + ix);
             let base = block_idx * 64;
-            for &v in &ac[base + 1..base + 64] {
-                sum += v.unsigned_abs() as u64;
-            }
+            sum += abs_sum_i32_slice(&ac[base + 1..base + 64]);
         }
     }
     sum
@@ -4885,12 +5500,12 @@ fn encode_vardct_frame_inner(
         }
 
         // Build token encodings for each pass/group.
-        let per_pass_uint_configs: Vec<crate::encode::entropy::HybridUintConfig> =
-            if num_passes > 1 {
-                vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0); num_passes]
-            } else {
-                vec![crate::encode::entropy::HybridUintConfig::new(4, 1, 2)]
-            };
+        let per_pass_uint_configs: Vec<crate::encode::entropy::HybridUintConfig> = if num_passes > 1
+        {
+            vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0); num_passes]
+        } else {
+            vec![crate::encode::entropy::HybridUintConfig::new(4, 1, 2)]
+        };
         let all_encoded_passes: Vec<Vec<Vec<crate::encode::entropy::HybridUintEncoded>>> =
             group_tokens_passes
                 .iter()
@@ -5432,6 +6047,89 @@ fn natural_coeff_order_8x8() -> [usize; 64] {
     order
 }
 
+#[inline]
+fn nonzero_flags_in_order_scalar(coeffs: &[i32], order: &[usize; 64]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for k in 1..64 {
+        out[k] = u8::from(coeffs[order[k]] != 0);
+    }
+    out
+}
+
+fn nonzero_flags_in_order_simd_assisted<D: SimdDescriptor>(
+    d: D,
+    coeffs: &[i32],
+    order: &[usize; 64],
+) -> [u8; 64] {
+    let lanes = D::I32Vec::LEN;
+    let zero = D::I32Vec::splat(d, 0);
+    let one = D::I32Vec::splat(d, 1);
+    let mut gathered = vec![0i32; lanes];
+    let mut lane_vals = vec![0i32; lanes];
+
+    let mut out = [0u8; 64];
+    let mut k0 = 1usize;
+    while k0 < 64 {
+        let chunk = (64 - k0).min(lanes);
+        for lane in 0..chunk {
+            let k = k0 + lane;
+            gathered[lane] = coeffs[order[k]];
+        }
+        for v in gathered.iter_mut().skip(chunk) {
+            *v = 0;
+        }
+
+        let v = D::I32Vec::load(d, &gathered);
+        let mask_zero = v.eq(zero);
+        let nz = mask_zero.if_then_else_i32(zero, one);
+        nz.store(&mut lane_vals);
+
+        for lane in 0..chunk {
+            let k = k0 + lane;
+            out[k] = lane_vals[lane] as u8;
+        }
+        k0 += lanes;
+    }
+    out
+}
+
+fn nonzero_flags_in_order(coeffs: &[i32], order: &[usize; 64]) -> [u8; 64] {
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
+    {
+        match detect_encoder_simd_backend() {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    return nonzero_flags_in_order_simd_assisted(d, coeffs, order);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    return nonzero_flags_in_order_simd_assisted(d, coeffs, order);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    return nonzero_flags_in_order_simd_assisted(d, coeffs, order);
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    return nonzero_flags_in_order_simd_assisted(d, coeffs, order);
+                }
+            }
+        }
+    }
+
+    nonzero_flags_in_order_scalar(coeffs, order)
+}
+
 /// Compute optimal coefficient order for 8x8 DCT by counting non-zero frequencies.
 ///
 /// Returns 3 custom orders (Y, X, B channels) based on zero density analysis.
@@ -5468,10 +6166,10 @@ fn compute_optimal_coeff_orders_8x8(
                     continue;
                 }
                 total_blocks += 1;
+                let base = global_idx * 64;
+                let flags = nonzero_flags_in_order(&ac[base..base + 64], &natural);
                 for k in 1..64 {
-                    if ac[global_idx * 64 + natural[k]] != 0 {
-                        nonzero_count[k] += 1;
-                    }
+                    nonzero_count[k] += flags[k] as u64;
                 }
             }
         }
@@ -5639,11 +6337,10 @@ fn tokenize_block_8x8(
     let order = custom_order.unwrap_or(&default_order);
 
     // Count actual nonzeros (positions 1..64 in scan order)
+    let flags = nonzero_flags_in_order(coeffs, order);
     let mut nonzeros = 0usize;
-    for k in 1..64 {
-        if coeffs[order[k]] != 0 {
-            nonzeros += 1;
-        }
+    for &flag in flags.iter().skip(1) {
+        nonzeros += flag as usize;
     }
 
     // Emit nonzeros count token
@@ -7217,6 +7914,8 @@ fn encode_hf_group_tokens_ans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::xyb::srgb_u8_to_xyb;
+    use jxl_simd::{SimdDescriptor, test_all_instruction_sets};
 
     #[test]
     fn test_effort_to_speed_tier_mapping_monotonic() {
@@ -7272,6 +7971,247 @@ mod tests {
             "d=0.5 global_scale ({gs05}) should be > d=1 ({gs})"
         );
     }
+
+    fn quantize_vardct_blocks_simd_equiv<D: SimdDescriptor>(d: D) {
+        let bw = 6usize;
+        let bh = 5usize;
+        let blocks = bw * bh;
+        let mut dct_x = vec![0.0f32; blocks * 64];
+        let mut dct_y = vec![0.0f32; blocks * 64];
+        let mut dct_b = vec![0.0f32; blocks * 64];
+        for i in 0..blocks * 64 {
+            dct_x[i] = ((i as f32 * 0.37).sin() * 11.0) + 0.3;
+            dct_y[i] = ((i as f32 * 0.21).cos() * 9.0) - 0.4;
+            dct_b[i] = ((i as f32 * 0.41).sin() * 13.0) + 0.6;
+        }
+
+        let mut raw_quant_map = vec![1u8; blocks];
+        for (i, q) in raw_quant_map.iter_mut().enumerate() {
+            *q = 1 + (i % 17) as u8;
+        }
+
+        let cr_w = bw.div_ceil(8);
+        let cr_h = bh.div_ceil(8);
+        let mut ytox_map = vec![0i32; cr_w * cr_h];
+        let mut ytob_map = vec![0i32; cr_w * cr_h];
+        for i in 0..(cr_w * cr_h) {
+            ytox_map[i] = ((i as i32 % 11) - 5) * 3;
+            ytob_map[i] = ((i as i32 % 9) - 4) * 2;
+        }
+
+        let global_scale = 10_026u32;
+        let quant_lf = 192u32;
+        let inv_lf_quant = [4096.0f32, 512.0, 256.0];
+        let dequant_weights = default_dct8x8_dequant_weights();
+
+        let scalar = quantize_vardct_blocks(
+            &dct_x,
+            &dct_y,
+            &dct_b,
+            global_scale,
+            quant_lf,
+            &raw_quant_map,
+            &inv_lf_quant,
+            dequant_weights,
+            0.8,
+            1.0,
+            bw,
+            &ytox_map,
+            &ytob_map,
+        );
+
+        let simd = quantize_vardct_blocks_simd_assisted(
+            d,
+            &dct_x,
+            &dct_y,
+            &dct_b,
+            global_scale,
+            quant_lf,
+            &raw_quant_map,
+            &inv_lf_quant,
+            dequant_weights,
+            0.8,
+            1.0,
+            bw,
+            &ytox_map,
+            &ytob_map,
+        );
+
+        assert_eq!(scalar.dc_x, simd.dc_x);
+        assert_eq!(scalar.dc_y, simd.dc_y);
+        assert_eq!(scalar.dc_b, simd.dc_b);
+        assert_eq!(scalar.ac_x, simd.ac_x);
+        assert_eq!(scalar.ac_y, simd.ac_y);
+        assert_eq!(scalar.ac_b, simd.ac_b);
+    }
+
+    test_all_instruction_sets!(quantize_vardct_blocks_simd_equiv);
+
+    fn nonzero_flags_in_order_simd_equiv<D: SimdDescriptor>(d: D) {
+        let order = natural_coeff_order_8x8();
+        let mut coeffs = [0i32; 64];
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            let v = ((i as i32 * 17 + 13) % 11) - 5;
+            *c = if i % 7 == 0 { 0 } else { v };
+        }
+
+        let s = nonzero_flags_in_order_scalar(&coeffs, &order);
+        let v = nonzero_flags_in_order_simd_assisted(d, &coeffs, &order);
+        assert_eq!(s, v);
+    }
+
+    test_all_instruction_sets!(nonzero_flags_in_order_simd_equiv);
+
+    fn abs_sum_i32_slice_simd_equiv<D: SimdDescriptor>(d: D) {
+        let mut values = vec![0i32; 511];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = ((i as i32 * 37 + 11) % 2001) - 1000;
+        }
+        let s = abs_sum_i32_slice_scalar(&values);
+        let v = abs_sum_i32_slice_simd_assisted(d, &values);
+        assert_eq!(s, v);
+    }
+
+    test_all_instruction_sets!(abs_sum_i32_slice_simd_equiv);
+
+    fn compute_mask_slice_simd_equiv<D: SimdDescriptor>(d: D) {
+        let mut input = vec![0.0f32; 513];
+        for (i, v) in input.iter_mut().enumerate() {
+            *v = ((i as f32 * 0.173).sin() * 3.0) + 1.5;
+        }
+        let mut scalar = vec![0.0f32; input.len()];
+        let mut simd = vec![0.0f32; input.len()];
+
+        for (i, &v) in input.iter().enumerate() {
+            scalar[i] = compute_mask(v);
+        }
+        compute_mask_slice_simd_assisted(d, &input, &mut simd);
+
+        for i in 0..input.len() {
+            assert!(
+                (scalar[i] - simd[i]).abs() < 1e-5,
+                "idx {i}: {} vs {}",
+                scalar[i],
+                simd[i]
+            );
+        }
+    }
+
+    test_all_instruction_sets!(compute_mask_slice_simd_equiv);
+
+    fn downsample_row4_simd_equiv<D: SimdDescriptor>(d: D) {
+        let n = 257usize;
+        let mut row = vec![0.0f32; n * 4];
+        for (i, v) in row.iter_mut().enumerate() {
+            *v = ((i as f32 * 0.071).sin() * 2.0) + 0.5;
+        }
+        let mut a = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        downsample_row4_scalar(&row, &mut a);
+        downsample_row4_simd_assisted(d, &row, &mut b);
+        for i in 0..n {
+            assert!((a[i] - b[i]).abs() < 1e-6, "idx {i}: {} vs {}", a[i], b[i]);
+        }
+    }
+
+    test_all_instruction_sets!(downsample_row4_simd_equiv);
+
+    fn aq_field_parity_metrics_simd_equiv<D: SimdDescriptor>(d: D) {
+        let img_w = 64usize;
+        let img_h = 64usize;
+        let bw = img_w.div_ceil(8);
+        let bh = img_h.div_ceil(8);
+        let mut x = vec![0.0f32; img_w * img_h];
+        let mut y = vec![0.0f32; img_w * img_h];
+        let mut b = vec![0.0f32; img_w * img_h];
+        for yy in 0..img_h {
+            for xx in 0..img_w {
+                let i = yy * img_w + xx;
+                x[i] = ((i as f32 * 0.071).sin() * 0.2) + 0.4;
+                y[i] = ((i as f32 * 0.113).cos() * 0.3) + 0.6;
+                b[i] = ((i as f32 * 0.097).sin() * 0.25) + 0.5;
+            }
+        }
+
+        let distance = 1.0f32;
+        let scale = 0.79f32 / distance;
+
+        let mut aq_scalar = compute_aq_map(&y, img_w, img_h, bw, bh, distance);
+        let mut aq_simd = aq_scalar.clone();
+
+        apply_per_block_modulations(
+            &mut aq_scalar,
+            &x,
+            &y,
+            &b,
+            img_w,
+            img_h,
+            bw,
+            bh,
+            distance,
+            scale,
+        );
+
+        let mut base_mask = vec![0.0f32; aq_simd.len()];
+        compute_mask_slice_simd_assisted(d, &aq_simd, &mut base_mask);
+
+        let base_level = 0.48 * scale;
+        let dampen = if distance >= 2.0 {
+            let dd = 1.0 - (distance - 2.0) / 12.0;
+            dd.max(0.0)
+        } else {
+            1.0
+        };
+        let mul = scale * dampen;
+        let add = (1.0 - dampen) * base_level;
+
+        for by in 0..bh {
+            for bx in 0..bw {
+                let idx = by * bw + bx;
+                let mut out_val = base_mask[idx];
+                out_val = gamma_modulation(bx, by, &x, &y, img_w, img_h) + out_val;
+                let hf_val = hf_modulation(bx, by, &y, img_w, img_h) + out_val;
+                let blue_val = blue_modulation(bx, by, &x, &y, &b, img_w, img_h) + out_val;
+                out_val = hf_val.min(blue_val);
+                aq_simd[idx] = (out_val * std::f32::consts::LOG2_E).exp2() * mul + add;
+            }
+        }
+
+        let mut max_delta = 0.0f32;
+        let mut sum_delta = 0.0f32;
+        for i in 0..aq_scalar.len() {
+            let d = (aq_scalar[i] - aq_simd[i]).abs();
+            max_delta = max_delta.max(d);
+            sum_delta += d;
+        }
+        let mean_delta = sum_delta / aq_scalar.len() as f32;
+        assert!(max_delta < 1e-4, "max AQ delta too high: {max_delta}");
+        assert!(mean_delta < 1e-6, "mean AQ delta too high: {mean_delta}");
+    }
+
+    test_all_instruction_sets!(aq_field_parity_metrics_simd_equiv);
+
+    fn compute_cfl_maps_simd_equiv<D: SimdDescriptor>(d: D) {
+        let bw = 10usize;
+        let bh = 9usize;
+        let blocks = bw * bh;
+        let mut dct_x = vec![0.0f32; blocks * 64];
+        let mut dct_y = vec![0.0f32; blocks * 64];
+        let mut dct_b = vec![0.0f32; blocks * 64];
+        for i in 0..blocks * 64 {
+            dct_x[i] = ((i as f32 * 0.27).sin() * 7.0) + 0.1;
+            dct_y[i] = ((i as f32 * 0.33).cos() * 6.0) + 0.2;
+            dct_b[i] = ((i as f32 * 0.19).sin() * 8.0) - 0.3;
+        }
+
+        let (sx, sb) = compute_cfl_maps_scalar(&dct_x, &dct_y, &dct_b, bw, bh);
+        let (vx, vb) = compute_cfl_maps_simd_assisted(d, &dct_x, &dct_y, &dct_b, bw, bh);
+
+        assert_eq!(sx, vx);
+        assert_eq!(sb, vb);
+    }
+
+    test_all_instruction_sets!(compute_cfl_maps_simd_equiv);
 
     #[test]
     fn test_predict_num_nonzeros_matches_decoder_behavior() {

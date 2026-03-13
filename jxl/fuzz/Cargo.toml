@@ -14,6 +14,14 @@ libfuzzer-sys = "0.4"
 path = ".."
 features = ["encoder"]
 
+[dependencies.jxl_simd]
+path = "../../jxl_simd"
+features = ["all-simd"]
+
+[dependencies.jxl_transforms]
+path = "../../jxl_transforms"
+features = ["all-simd"]
+
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
@@ -54,5 +62,11 @@ doc = false
 [[bin]]
 name = "encode_progressive_alpha_smoke"
 path = "fuzz_targets/encode_progressive_alpha_smoke.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_simd_scalar_equiv_smoke"
+path = "fuzz_targets/encode_simd_scalar_equiv_smoke.rs"
 test = false
 doc = false

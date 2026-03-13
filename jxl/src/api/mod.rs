@@ -22,9 +22,9 @@ pub use crate::image::JxlOutputBuffer;
 pub use crate::jpeg::JpegReconstructionData;
 pub use color::*;
 pub use data_types::*;
-pub use decoder::*;
 #[cfg(test)]
 pub(crate) use decoder::tests as decoder_tests;
+pub use decoder::*;
 pub use inner::*;
 pub use input::*;
 pub use options::*;

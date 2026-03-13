@@ -1019,13 +1019,8 @@ pub(crate) fn encode_modular_u8_gray_image_codestream_with_mode(
         let gh = (height - oy).min(256);
 
         let mut best_predictor = if fast_lossless { 1u32 } else { 0u32 };
-        let mut best_residuals = collect_gray_residuals_predictor(
-            gray,
-            width_usize,
-            (ox, oy),
-            (gw, gh),
-            best_predictor,
-        );
+        let mut best_residuals =
+            collect_gray_residuals_predictor(gray, width_usize, (ox, oy), (gw, gh), best_predictor);
         let mut best_score = residual_score(&best_residuals);
         if !fast_lossless {
             for predictor in [1u32] {
