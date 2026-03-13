@@ -408,13 +408,44 @@ fn write_ans_prefix(w: &mut BitWriter, val: u16) -> Result<()> {
 // ==================== rANS stream encoder ====================
 
 /// Bit payload associated with one token in forward decoding order.
+/// Uses inline storage for refills (most tokens need 0-2 refills).
 #[derive(Debug, Default)]
 struct AnsTokenBits {
     /// 16-bit rANS normalization words consumed by `AnsHistogram::read`.
-    refills: Vec<u16>,
+    /// Inline up to 4 refills to avoid heap allocation for most tokens.
+    refills_inline: [u16; 4],
+    refills_len: u8,
+    refills_overflow: Option<Vec<u16>>,
     /// HybridUint extra bits consumed after reading the token.
     extra_bits: u32,
     extra_nbits: usize,
+}
+
+impl AnsTokenBits {
+    #[inline]
+    fn push_refill(&mut self, val: u16) {
+        let len = self.refills_len as usize;
+        if len < 4 {
+            self.refills_inline[len] = val;
+            self.refills_len += 1;
+        } else {
+            self.refills_overflow
+                .get_or_insert_with(Vec::new)
+                .push(val);
+        }
+    }
+
+    #[inline]
+    fn refills(&self) -> impl Iterator<Item = &u16> {
+        let inline_len = (self.refills_len as usize).min(4);
+        self.refills_inline[..inline_len].iter().chain(
+            self.refills_overflow
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .iter(),
+        )
+    }
 }
 
 /// Per-cluster reverse mapping from (symbol, offset) -> 12-bit ANS index.
@@ -563,7 +594,7 @@ pub fn write_ans_stream(
         // Renormalize (matches libjxl ANSCoder::PutSymbol):
         // while (state >> (32 - LOG_SUM_PROBS)) >= freq, emit 16 LSB bits.
         while (state >> (32 - LOG_SUM_PROBS)) >= freq {
-            bits.refills.push((state & 0xFFFF) as u16);
+            bits.push_refill((state & 0xFFFF) as u16);
             state >>= 16;
         }
 
@@ -585,7 +616,7 @@ pub fn write_ans_stream(
     // Write initial state, then per-token payloads in forward symbol order.
     w.write(32, state as u64)?;
     for bits in token_bits_rev.iter().rev() {
-        for &r in &bits.refills {
+        for &r in bits.refills() {
             w.write(16, r as u64)?;
         }
         if bits.extra_nbits > 0 {
