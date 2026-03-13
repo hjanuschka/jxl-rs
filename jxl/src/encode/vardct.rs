@@ -2899,14 +2899,31 @@ fn gather_clamped_block(
     block_h: usize,
 ) -> Vec<f32> {
     let mut block = vec![0.0f32; block_w * block_h];
+    gather_clamped_block_into(chan, width, height, px0, py0, block_w, block_h, &mut block);
+    block
+}
+
+/// Gather a clamped block into a pre-allocated buffer.
+#[inline]
+fn gather_clamped_block_into(
+    chan: &[f32],
+    width: usize,
+    height: usize,
+    px0: usize,
+    py0: usize,
+    block_w: usize,
+    block_h: usize,
+    block: &mut [f32],
+) {
+    debug_assert!(block.len() >= block_w * block_h);
     for y in 0..block_h {
+        let sy = (py0 + y).min(height - 1);
+        let row_start = sy * width;
         for x in 0..block_w {
             let sx = (px0 + x).min(width - 1);
-            let sy = (py0 + y).min(height - 1);
-            block[y * block_w + x] = chan[sy * width + sx];
+            block[y * block_w + x] = chan[row_start + sx];
         }
     }
-    block
 }
 
 fn transform_coeff_index_to_block_storage(
@@ -3305,27 +3322,37 @@ fn forward_dct_nxn(pixels: &[f32], coeffs: &mut [f32], n: usize) {
 }
 
 fn forward_with_linear_solver(block: &[f32], solver: &TransformLinearForwardSolver) -> Vec<f32> {
-    debug_assert_eq!(block.len(), solver.coeff_count);
-    let n = solver.coeff_count;
+    let mut coeffs = vec![0.0f32; solver.coeff_count];
+    let mut scratch = vec![0.0f32; solver.coeff_count];
+    forward_with_linear_solver_into(block, solver, &mut coeffs, &mut scratch);
+    coeffs
+}
 
-    let mut solved = vec![0.0f32; n];
+/// Forward transform using linear solver, writing into pre-allocated buffers.
+/// `coeffs` and `scratch` must be at least `solver.coeff_count` elements.
+fn forward_with_linear_solver_into(
+    block: &[f32],
+    solver: &TransformLinearForwardSolver,
+    coeffs: &mut [f32],
+    scratch: &mut [f32],
+) {
+    let n = solver.coeff_count;
+    debug_assert!(block.len() >= n && coeffs.len() >= n && scratch.len() >= n);
+
     let inv = &solver.inverse;
-    // Process rows of the inverse matrix, using slice indexing to help
-    // the compiler elide bounds checks in the inner dot-product loop.
-    for (r, out) in solved.iter_mut().enumerate() {
+    for (r, out) in scratch[..n].iter_mut().enumerate() {
         let row = &inv[r * n..(r + 1) * n];
         let mut sum = 0.0f32;
-        for (a, b) in row.iter().zip(block.iter()) {
+        for (a, b) in row.iter().zip(block[..n].iter()) {
             sum += a * b;
         }
         *out = sum;
     }
 
-    let mut coeffs = vec![0.0f32; n];
+    coeffs[..n].fill(0.0);
     for (i, &coeff_index) in solver.hf_coeff_indices.iter().enumerate() {
-        coeffs[coeff_index] = solved[solver.lf_count + i];
+        coeffs[coeff_index] = scratch[solver.lf_count + i];
     }
-    coeffs
 }
 
 fn compute_forward_transform_coeffs(
@@ -3966,6 +3993,49 @@ fn build_entropy_merge_transform_map(
     let entropy_mul_16 = 2.5f32;
     let entropy_mul_32 = 3.5f32;
 
+    // Pre-allocated buffers for forward transform hot path.
+    // Reused across all block evaluations to avoid ~54K heap allocations.
+    let max_block_size = 1024; // DCT32x32 = 32*32
+    let mut gather_buf = vec![0.0f32; max_block_size];
+    let mut coeffs_buf = [
+        vec![0.0f32; max_block_size],
+        vec![0.0f32; max_block_size],
+        vec![0.0f32; max_block_size],
+    ];
+    let mut scratch_buf = vec![0.0f32; max_block_size];
+
+    // Compute forward transform coefficients into pre-allocated buffers.
+    // Returns the number of coefficients (block_w * block_h).
+    let compute_coeffs_into =
+        |transform_id: u8,
+         bx: usize,
+         by: usize,
+         block_w: usize,
+         block_h: usize,
+         gather_buf: &mut [f32],
+         coeffs: &mut [Vec<f32>; 3],
+         scratch: &mut [f32]|
+         -> usize {
+            let n = block_w * block_h;
+            let chans: [&[f32]; 3] = [pixel_x, pixel_y, pixel_b];
+            for (c, chan) in chans.iter().enumerate() {
+                gather_clamped_block_into(chan, width, height, bx * 8, by * 8, block_w, block_h, gather_buf);
+                if let Some(solver) = rectangular_forward_solver(transform_id)
+                    .or_else(|| square_forward_solver(transform_id))
+                {
+                    forward_with_linear_solver_into(&gather_buf[..n], solver, &mut coeffs[c], scratch);
+                } else {
+                    // Fallback: use allocating path
+                    let block = gather_clamped_block(chan, width, height, bx * 8, by * 8, block_w, block_h);
+                    let full = compute_forward_transform_coeffs(
+                        transform_id, chan, chan, chan, width, height, bx, by, block_w, block_h,
+                    );
+                    coeffs[c][..n].copy_from_slice(&full[0][..n]);
+                }
+            }
+            n
+        };
+
     // Phase 0: Per-block 8x8 transform selection.
     // DISABLED: At d <= ~4.0, libjxl's EstimateEntropy produces all-zero
     // quantized values, making all transforms score identically. DCT8 wins
@@ -4023,17 +4093,9 @@ fn build_entropy_merge_transform_map(
 
             let rq = rq0.max(rq1) as u32;
             // DCT16X8: 8 cols (1 block), 16 rows (2 blocks)
-            let coeffs = compute_forward_transform_coeffs(
-                DCT16X8_TRANSFORM_ID,
-                pixel_x,
-                pixel_y,
-                pixel_b,
-                width,
-                height,
-                bx,
-                by,
-                8,
-                16,
+            compute_coeffs_into(
+                DCT16X8_TRANSFORM_ID, bx, by, 8, 16,
+                &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
             );
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
@@ -4054,7 +4116,7 @@ fn build_entropy_merge_transform_map(
                     if dw.abs() < 1e-10 {
                         continue;
                     }
-                    let q = (coeffs[c][k] * scale_rect / dw).round();
+                    let q = (coeffs_buf[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
             }
@@ -4099,17 +4161,9 @@ fn build_entropy_merge_transform_map(
 
             let rq = rq0.max(rq1) as u32;
             // DCT8X16: 16 cols (2 blocks), 8 rows (1 block)
-            let coeffs = compute_forward_transform_coeffs(
-                DCT8X16_TRANSFORM_ID,
-                pixel_x,
-                pixel_y,
-                pixel_b,
-                width,
-                height,
-                bx,
-                by,
-                16,
-                8,
+            compute_coeffs_into(
+                DCT8X16_TRANSFORM_ID, bx, by, 16, 8,
+                &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
             );
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
@@ -4130,7 +4184,7 @@ fn build_entropy_merge_transform_map(
                     if dw.abs() < 1e-10 {
                         continue;
                     }
-                    let q = (coeffs[c][k] * scale_rect / dw).round();
+                    let q = (coeffs_buf[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
             }
@@ -4200,17 +4254,9 @@ fn build_entropy_merge_transform_map(
                 (sum16 / 4.0).powf(1.0 / 16.0).round().max(1.0) as u32
             };
 
-            let coeffs = compute_forward_transform_coeffs(
-                DCT16_TRANSFORM_ID,
-                pixel_x,
-                pixel_y,
-                pixel_b,
-                width,
-                height,
-                bx,
-                by,
-                16,
-                16,
+            compute_coeffs_into(
+                DCT16_TRANSFORM_ID, bx, by, 16, 16,
+                &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
             );
             let scale16 = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e16 = 0.0f32;
@@ -4231,7 +4277,7 @@ fn build_entropy_merge_transform_map(
                     if dw.abs() < 1e-10 {
                         continue;
                     }
-                    let q = (coeffs[c][k] * scale16 / dw).round();
+                    let q = (coeffs_buf[c][k] * scale16 / dw).round();
                     e16 += q.abs().sqrt() * chan_w;
                 }
             }
@@ -4274,17 +4320,9 @@ fn build_entropy_merge_transform_map(
                     for dx in 0..2 {
                         let bx16 = bx + dx * 2;
                         let by16 = by + dy * 2;
-                        let coeffs = compute_forward_transform_coeffs(
-                            DCT16_TRANSFORM_ID,
-                            pixel_x,
-                            pixel_y,
-                            pixel_b,
-                            width,
-                            height,
-                            bx16,
-                            by16,
-                            16,
-                            16,
+                        compute_coeffs_into(
+                            DCT16_TRANSFORM_ID, bx16, by16, 16, 16,
+                            &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
                         );
                         let rq16: u32 = (0..2)
                             .flat_map(|ddy| {
@@ -4312,7 +4350,7 @@ fn build_entropy_merge_transform_map(
                                 if dw.abs() < 1e-10 {
                                     continue;
                                 }
-                                let q = (coeffs[c][k] * scale16 / dw).round();
+                                let q = (coeffs_buf[c][k] * scale16 / dw).round();
                                 e16_sum += q.abs().sqrt() * chan_w;
                             }
                         }
@@ -4333,17 +4371,9 @@ fn build_entropy_merge_transform_map(
                     (sum16 / 16.0).powf(1.0 / 16.0).round().max(1.0) as u32
                 };
 
-                let coeffs = compute_forward_transform_coeffs(
-                    DCT32_TRANSFORM_ID,
-                    pixel_x,
-                    pixel_y,
-                    pixel_b,
-                    width,
-                    height,
-                    bx,
-                    by,
-                    32,
-                    32,
+                compute_coeffs_into(
+                    DCT32_TRANSFORM_ID, bx, by, 32, 32,
+                    &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
                 );
                 let scale32 = (global_scale as f32 * rq32 as f32) / 65536.0;
                 let mut e32 = 0.0f32;
@@ -4364,7 +4394,7 @@ fn build_entropy_merge_transform_map(
                         if dw.abs() < 1e-10 {
                             continue;
                         }
-                        let q = (coeffs[c][k] * scale32 / dw).round();
+                        let q = (coeffs_buf[c][k] * scale32 / dw).round();
                         e32 += q.abs().sqrt() * chan_w;
                     }
                 }
