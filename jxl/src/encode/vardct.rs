@@ -14,7 +14,7 @@ use crate::encode::encodings::write_u32;
 use crate::encode::entropy::context_map::write_context_map;
 use crate::encode::entropy::huffman_encode::build_huffman_code;
 use crate::encode::headers::write_file_header;
-use crate::encode::simd::{EncoderSimdBackend, detect_encoder_simd_backend};
+use crate::encode::simd::{EncoderSimdBackend, benchmark_force_scalar, detect_encoder_simd_backend};
 use crate::encode::toc::write_toc;
 use crate::encode::xyb::srgb_u8_to_xyb_auto;
 use crate::error::Result;
@@ -1341,9 +1341,7 @@ fn compute_cfl_maps(
     bw: usize,
     bh: usize,
 ) -> (Vec<i32>, Vec<i32>) {
-    if std::env::var("JXL_ENC_SIMD")
-        .map(|v| v.eq_ignore_ascii_case("assisted"))
-        .unwrap_or(false)
+    if !benchmark_force_scalar()
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -1600,9 +1598,7 @@ fn quantize_vardct_blocks(
     ytob_map: &[i32],
     extra_dc_precision: u32,
 ) -> QuantizedVardct {
-    if std::env::var("JXL_ENC_SIMD")
-        .map(|v| v.eq_ignore_ascii_case("assisted"))
-        .unwrap_or(false)
+    if !benchmark_force_scalar()
     {
         let backend = detect_encoder_simd_backend();
         match backend {
@@ -2019,9 +2015,7 @@ fn compute_mask_slice_simd_assisted<D: SimdDescriptor>(d: D, input: &[f32], out:
 }
 
 fn compute_mask_slice(input: &[f32], out: &mut [f32]) {
-    if std::env::var("JXL_ENC_SIMD")
-        .map(|v| v.eq_ignore_ascii_case("assisted"))
-        .unwrap_or(false)
+    if !benchmark_force_scalar()
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -2214,9 +2208,7 @@ fn downsample_row4_simd_assisted<D: SimdDescriptor>(d: D, row_buf: &[f32], out: 
 }
 
 fn downsample_row4_auto(row_buf: &[f32], out: &mut [f32]) {
-    if std::env::var("JXL_ENC_SIMD")
-        .map(|v| v.eq_ignore_ascii_case("assisted"))
-        .unwrap_or(false)
+    if !benchmark_force_scalar()
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -2695,9 +2687,7 @@ fn abs_sum_i32_slice_simd_assisted<D: SimdDescriptor>(d: D, values: &[i32]) -> u
 }
 
 fn abs_sum_i32_slice(values: &[i32]) -> u64 {
-    if std::env::var("JXL_ENC_SIMD")
-        .map(|v| v.eq_ignore_ascii_case("assisted"))
-        .unwrap_or(false)
+    if !benchmark_force_scalar()
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -6157,9 +6147,7 @@ fn nonzero_flags_in_order_simd_assisted<D: SimdDescriptor>(
 }
 
 fn nonzero_flags_in_order(coeffs: &[i32], order: &[usize; 64]) -> [u8; 64] {
-    if std::env::var("JXL_ENC_SIMD")
-        .map(|v| v.eq_ignore_ascii_case("assisted"))
-        .unwrap_or(false)
+    if !benchmark_force_scalar()
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}

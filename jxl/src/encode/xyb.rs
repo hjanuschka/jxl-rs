@@ -147,9 +147,8 @@ pub fn srgb_u8_to_xyb(
 
 /// Runtime-dispatched RGB->XYB path for the encoder.
 ///
-/// Current policy keeps scalar as the deterministic default for codestream
-/// stability; SIMD-assisted conversion can be forced for benchmarking via
-/// `JXL_ENC_SIMD=assisted`.
+/// SIMD is enabled by default through runtime dispatch. Use `JXL_ENC_SIMD=scalar`
+/// to force scalar-only mode for deterministic reference output.
 pub fn srgb_u8_to_xyb_auto(
     rgb: &[u8],
     width: usize,
@@ -158,53 +157,45 @@ pub fn srgb_u8_to_xyb_auto(
     out_y: &mut [f32],
     out_b: &mut [f32],
 ) -> Result<()> {
-    match std::env::var("JXL_ENC_SIMD") {
-        Ok(v) if v.eq_ignore_ascii_case("assisted") => {
-            let backend = crate::encode::simd::detect_encoder_simd_backend();
-            match backend {
-                EncoderSimdBackend::Scalar => {
-                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+    if !crate::encode::simd::benchmark_force_scalar() {
+        let backend = crate::encode::simd::detect_encoder_simd_backend();
+        match backend {
+            EncoderSimdBackend::Scalar => {}
+            #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+            EncoderSimdBackend::Sse42 => {
+                if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                    return srgb_u8_to_xyb_simd_assisted(
+                        d, rgb, width, height, out_x, out_y, out_b,
+                    );
                 }
-                #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
-                EncoderSimdBackend::Sse42 => {
-                    if let Some(d) = jxl_simd::Sse42Descriptor::new() {
-                        return srgb_u8_to_xyb_simd_assisted(
-                            d, rgb, width, height, out_x, out_y, out_b,
-                        );
-                    }
-                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+            EncoderSimdBackend::Avx2 => {
+                if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                    return srgb_u8_to_xyb_simd_assisted(
+                        d, rgb, width, height, out_x, out_y, out_b,
+                    );
                 }
-                #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
-                EncoderSimdBackend::Avx2 => {
-                    if let Some(d) = jxl_simd::AvxDescriptor::new() {
-                        return srgb_u8_to_xyb_simd_assisted(
-                            d, rgb, width, height, out_x, out_y, out_b,
-                        );
-                    }
-                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+            }
+            #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+            EncoderSimdBackend::Avx512 => {
+                if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                    return srgb_u8_to_xyb_simd_assisted(
+                        d, rgb, width, height, out_x, out_y, out_b,
+                    );
                 }
-                #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
-                EncoderSimdBackend::Avx512 => {
-                    if let Some(d) = jxl_simd::Avx512Descriptor::new() {
-                        return srgb_u8_to_xyb_simd_assisted(
-                            d, rgb, width, height, out_x, out_y, out_b,
-                        );
-                    }
-                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
-                }
-                #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
-                EncoderSimdBackend::Neon => {
-                    if let Some(d) = jxl_simd::NeonDescriptor::new() {
-                        return srgb_u8_to_xyb_simd_assisted(
-                            d, rgb, width, height, out_x, out_y, out_b,
-                        );
-                    }
-                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+            }
+            #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+            EncoderSimdBackend::Neon => {
+                if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                    return srgb_u8_to_xyb_simd_assisted(
+                        d, rgb, width, height, out_x, out_y, out_b,
+                    );
                 }
             }
         }
-        _ => srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b),
     }
+    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
 }
 
 /// SIMD-assisted XYB conversion path using jxl_simd + jxl_transforms primitives.
