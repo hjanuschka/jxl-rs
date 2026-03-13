@@ -58,6 +58,21 @@ fn srgb_to_linear(v: f32) -> f32 {
     }
 }
 
+/// Pre-computed LUT for sRGB u8 [0..255] -> linear float.
+/// Using a LUT ensures scalar and SIMD paths produce identical results,
+/// avoiding rational polynomial approximation differences.
+fn srgb_u8_to_linear_lut() -> &'static [f32; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0.0f32; 256];
+        for i in 0..256 {
+            table[i] = srgb_to_linear(i as f32 / 255.0);
+        }
+        table
+    })
+}
+
 /// Convert sRGB u8 RGB pixels to XYB float channels.
 ///
 /// Input: `rgb` is interleaved R,G,B bytes (length = width*height*3).
@@ -98,11 +113,13 @@ pub fn srgb_u8_to_xyb(
     // For default intensity_target = 255.0, intensity_scale = 1.0
     let intensity_scale = 255.0_f32 / intensity_target;
 
+    let lut = srgb_u8_to_linear_lut();
+
     for i in 0..npixels {
-        // Step 1: sRGB u8 -> sRGB float [0,1] -> linear sRGB [0,1]
-        let r_lin = srgb_to_linear(rgb[i * 3] as f32 / 255.0);
-        let g_lin = srgb_to_linear(rgb[i * 3 + 1] as f32 / 255.0);
-        let b_lin = srgb_to_linear(rgb[i * 3 + 2] as f32 / 255.0);
+        // Step 1: sRGB u8 -> linear sRGB via LUT (byte-identical to SIMD path)
+        let r_lin = lut[rgb[i * 3] as usize];
+        let g_lin = lut[rgb[i * 3 + 1] as usize];
+        let b_lin = lut[rgb[i * 3 + 2] as usize];
 
         // Step 2: Apply forward opsin matrix (linear sRGB -> linear LMS)
         let l_lin = forward_mat[0][0] as f32 * r_lin
@@ -226,30 +243,18 @@ pub fn srgb_u8_to_xyb_simd_assisted<D: SimdDescriptor>(
         });
     }
 
+    // Use LUT for sRGB u8 -> linear (byte-identical to scalar path).
+    let lut = srgb_u8_to_linear_lut();
     let mut r = vec![0f32; npixels];
     let mut g = vec![0f32; npixels];
     let mut b = vec![0f32; npixels];
     for i in 0..npixels {
-        r[i] = rgb[i * 3] as f32 * (1.0 / 255.0);
-        g[i] = rgb[i * 3 + 1] as f32 * (1.0 / 255.0);
-        b[i] = rgb[i * 3 + 2] as f32 * (1.0 / 255.0);
+        r[i] = lut[rgb[i * 3] as usize];
+        g[i] = lut[rgb[i * 3 + 1] as usize];
+        b[i] = lut[rgb[i * 3 + 2] as usize];
     }
 
     let lanes = D::F32Vec::LEN;
-    let simd_len = (npixels / lanes) * lanes;
-
-    // S201: SIMD transfer stage.
-    if simd_len > 0 {
-        tf::srgb_to_linear_simd(d, &mut r[..simd_len]);
-        tf::srgb_to_linear_simd(d, &mut g[..simd_len]);
-        tf::srgb_to_linear_simd(d, &mut b[..simd_len]);
-    }
-    for i in simd_len..npixels {
-        r[i] = srgb_to_linear(r[i]);
-        g[i] = srgb_to_linear(g[i]);
-        b[i] = srgb_to_linear(b[i]);
-    }
-
     let forward_mat = DEFAULT_FORWARD_MATRIX;
     let mut l_lin = vec![0f32; npixels];
     let mut m_lin = vec![0f32; npixels];
@@ -272,9 +277,10 @@ pub fn srgb_u8_to_xyb_simd_assisted<D: SimdDescriptor>(
         let gv = D::F32Vec::load(d, &g[i..]);
         let bv = D::F32Vec::load(d, &b[i..]);
 
-        rv.mul_add(r0, gv * r1 + bv * r2).store(&mut l_lin[i..]);
-        rv.mul_add(g0, gv * g1 + bv * g2).store(&mut m_lin[i..]);
-        rv.mul_add(b0, gv * b1 + bv * b2).store(&mut s_lin[i..]);
+        // Use separate multiply+add (not mul_add/FMA) to match scalar FP order.
+        (rv * r0 + gv * r1 + bv * r2).store(&mut l_lin[i..]);
+        (rv * g0 + gv * g1 + bv * g2).store(&mut m_lin[i..]);
+        (rv * b0 + gv * b1 + bv * b2).store(&mut s_lin[i..]);
         i += lanes;
     }
     while i < npixels {
