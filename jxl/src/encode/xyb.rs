@@ -9,9 +9,12 @@
 //! This is the exact inverse of the decoder's `XybStage`.
 
 use crate::{
+    color::tf,
+    encode::simd::EncoderSimdBackend,
     error::{Error, Result},
     util::Matrix3x3,
 };
+use jxl_simd::{F32SimdVec, SimdDescriptor};
 
 /// Default opsin biases (same for all 3 channels).
 #[allow(clippy::excessive_precision)]
@@ -72,9 +75,7 @@ pub fn srgb_u8_to_xyb(
     out_y: &mut [f32],
     out_b: &mut [f32],
 ) -> Result<()> {
-    let npixels = width
-        .checked_mul(height)
-        .ok_or(Error::ArithmeticOverflow)?;
+    let npixels = width.checked_mul(height).ok_or(Error::ArithmeticOverflow)?;
     let expected_rgb = npixels.checked_mul(3).ok_or(Error::ArithmeticOverflow)?;
     if rgb.len() != expected_rgb {
         return Err(Error::InvalidPixelBufferLength {
@@ -142,6 +143,218 @@ pub fn srgb_u8_to_xyb(
     }
 
     Ok(())
+}
+
+/// Runtime-dispatched RGB->XYB path for the encoder.
+///
+/// Current policy keeps scalar as the deterministic default for codestream
+/// stability; SIMD-assisted conversion can be forced for benchmarking via
+/// `JXL_ENC_SIMD=assisted`.
+pub fn srgb_u8_to_xyb_auto(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    out_x: &mut [f32],
+    out_y: &mut [f32],
+    out_b: &mut [f32],
+) -> Result<()> {
+    match std::env::var("JXL_ENC_SIMD") {
+        Ok(v) if v.eq_ignore_ascii_case("assisted") => {
+            let backend = crate::encode::simd::detect_encoder_simd_backend();
+            match backend {
+                EncoderSimdBackend::Scalar => {
+                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+                }
+                #[cfg(all(target_arch = "x86_64", any(feature = "sse42", feature = "all-simd")))]
+                EncoderSimdBackend::Sse42 => {
+                    if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                        return srgb_u8_to_xyb_simd_assisted(
+                            d, rgb, width, height, out_x, out_y, out_b,
+                        );
+                    }
+                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+                }
+                #[cfg(all(target_arch = "x86_64", any(feature = "avx", feature = "all-simd")))]
+                EncoderSimdBackend::Avx2 => {
+                    if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                        return srgb_u8_to_xyb_simd_assisted(
+                            d, rgb, width, height, out_x, out_y, out_b,
+                        );
+                    }
+                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+                }
+                #[cfg(all(target_arch = "x86_64", any(feature = "avx512", feature = "all-simd")))]
+                EncoderSimdBackend::Avx512 => {
+                    if let Some(d) = jxl_simd::Avx512Descriptor::new() {
+                        return srgb_u8_to_xyb_simd_assisted(
+                            d, rgb, width, height, out_x, out_y, out_b,
+                        );
+                    }
+                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+                }
+                #[cfg(all(target_arch = "aarch64", any(feature = "neon", feature = "all-simd")))]
+                EncoderSimdBackend::Neon => {
+                    if let Some(d) = jxl_simd::NeonDescriptor::new() {
+                        return srgb_u8_to_xyb_simd_assisted(
+                            d, rgb, width, height, out_x, out_y, out_b,
+                        );
+                    }
+                    srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b)
+                }
+            }
+        }
+        _ => srgb_u8_to_xyb(rgb, width, height, out_x, out_y, out_b),
+    }
+}
+
+/// SIMD-assisted XYB conversion path using jxl_simd + jxl_transforms primitives.
+///
+/// This keeps final cbrt/mix scalar for parity with the existing reference path,
+/// while accelerating transfer and matrix stages with SIMD lanes.
+pub fn srgb_u8_to_xyb_simd_assisted<D: SimdDescriptor>(
+    d: D,
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    out_x: &mut [f32],
+    out_y: &mut [f32],
+    out_b: &mut [f32],
+) -> Result<()> {
+    let npixels = width.checked_mul(height).ok_or(Error::ArithmeticOverflow)?;
+    let expected_rgb = npixels.checked_mul(3).ok_or(Error::ArithmeticOverflow)?;
+    if rgb.len() != expected_rgb {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: expected_rgb,
+            actual: rgb.len(),
+        });
+    }
+    if out_x.len() != npixels || out_y.len() != npixels || out_b.len() != npixels {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: npixels,
+            actual: out_x.len().min(out_y.len()).min(out_b.len()),
+        });
+    }
+
+    let mut r = vec![0f32; npixels];
+    let mut g = vec![0f32; npixels];
+    let mut b = vec![0f32; npixels];
+    for i in 0..npixels {
+        r[i] = rgb[i * 3] as f32 * (1.0 / 255.0);
+        g[i] = rgb[i * 3 + 1] as f32 * (1.0 / 255.0);
+        b[i] = rgb[i * 3 + 2] as f32 * (1.0 / 255.0);
+    }
+
+    let lanes = D::F32Vec::LEN;
+    let simd_len = (npixels / lanes) * lanes;
+
+    // S201: SIMD transfer stage.
+    if simd_len > 0 {
+        tf::srgb_to_linear_simd(d, &mut r[..simd_len]);
+        tf::srgb_to_linear_simd(d, &mut g[..simd_len]);
+        tf::srgb_to_linear_simd(d, &mut b[..simd_len]);
+    }
+    for i in simd_len..npixels {
+        r[i] = srgb_to_linear(r[i]);
+        g[i] = srgb_to_linear(g[i]);
+        b[i] = srgb_to_linear(b[i]);
+    }
+
+    let forward_mat = DEFAULT_FORWARD_MATRIX;
+    let mut l_lin = vec![0f32; npixels];
+    let mut m_lin = vec![0f32; npixels];
+    let mut s_lin = vec![0f32; npixels];
+
+    let r0 = D::F32Vec::splat(d, forward_mat[0][0] as f32);
+    let r1 = D::F32Vec::splat(d, forward_mat[0][1] as f32);
+    let r2 = D::F32Vec::splat(d, forward_mat[0][2] as f32);
+    let g0 = D::F32Vec::splat(d, forward_mat[1][0] as f32);
+    let g1 = D::F32Vec::splat(d, forward_mat[1][1] as f32);
+    let g2 = D::F32Vec::splat(d, forward_mat[1][2] as f32);
+    let b0 = D::F32Vec::splat(d, forward_mat[2][0] as f32);
+    let b1 = D::F32Vec::splat(d, forward_mat[2][1] as f32);
+    let b2 = D::F32Vec::splat(d, forward_mat[2][2] as f32);
+
+    // S202: SIMD matrix stage.
+    let mut i = 0usize;
+    while i + lanes <= npixels {
+        let rv = D::F32Vec::load(d, &r[i..]);
+        let gv = D::F32Vec::load(d, &g[i..]);
+        let bv = D::F32Vec::load(d, &b[i..]);
+
+        rv.mul_add(r0, gv * r1 + bv * r2).store(&mut l_lin[i..]);
+        rv.mul_add(g0, gv * g1 + bv * g2).store(&mut m_lin[i..]);
+        rv.mul_add(b0, gv * b1 + bv * b2).store(&mut s_lin[i..]);
+        i += lanes;
+    }
+    while i < npixels {
+        l_lin[i] = forward_mat[0][0] as f32 * r[i]
+            + forward_mat[0][1] as f32 * g[i]
+            + forward_mat[0][2] as f32 * b[i];
+        m_lin[i] = forward_mat[1][0] as f32 * r[i]
+            + forward_mat[1][1] as f32 * g[i]
+            + forward_mat[1][2] as f32 * b[i];
+        s_lin[i] = forward_mat[2][0] as f32 * r[i]
+            + forward_mat[2][1] as f32 * g[i]
+            + forward_mat[2][2] as f32 * b[i];
+        i += 1;
+    }
+
+    let bias = DEFAULT_OPSIN_BIAS;
+    let bias_cbrt = bias.cbrt();
+    let intensity_scale = 255.0_f32 / DEFAULT_INTENSITY_TARGET;
+
+    for i in 0..npixels {
+        let l = (l_lin[i] / intensity_scale - bias).cbrt();
+        let m = (m_lin[i] / intensity_scale - bias).cbrt();
+        let s = (s_lin[i] / intensity_scale - bias).cbrt();
+
+        out_x[i] = (l - m) * 0.5;
+        out_y[i] = (l + m) * 0.5 + bias_cbrt;
+        out_b[i] = s + bias_cbrt;
+    }
+
+    Ok(())
+}
+
+/// RGBA convenience path for SIMD-assisted XYB preprocessing.
+///
+/// Splits interleaved RGBA into RGB+alpha and runs SIMD-assisted RGB->XYB.
+pub fn srgb_u8_rgba_to_xyb_with_alpha_simd_assisted<D: SimdDescriptor>(
+    d: D,
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    out_x: &mut [f32],
+    out_y: &mut [f32],
+    out_b: &mut [f32],
+    out_alpha: &mut [u8],
+) -> Result<()> {
+    let npixels = width.checked_mul(height).ok_or(Error::ArithmeticOverflow)?;
+    let expected_rgba = npixels.checked_mul(4).ok_or(Error::ArithmeticOverflow)?;
+    if rgba.len() != expected_rgba {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: expected_rgba,
+            actual: rgba.len(),
+        });
+    }
+    if out_alpha.len() != npixels {
+        return Err(Error::InvalidPixelBufferLength {
+            expected: npixels,
+            actual: out_alpha.len(),
+        });
+    }
+
+    let mut rgb = vec![0u8; npixels * 3];
+    for i in 0..npixels {
+        let src = i * 4;
+        let dst = i * 3;
+        rgb[dst] = rgba[src];
+        rgb[dst + 1] = rgba[src + 1];
+        rgb[dst + 2] = rgba[src + 2];
+        out_alpha[i] = rgba[src + 3];
+    }
+
+    srgb_u8_to_xyb_simd_assisted(d, &rgb, width, height, out_x, out_y, out_b)
 }
 
 /// Convert XYB float channels back to sRGB u8 (for testing).
@@ -218,6 +431,7 @@ fn linear_to_srgb(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jxl_simd::ScalarDescriptor;
 
     #[test]
     fn test_forward_matrix_invertible() {
@@ -401,5 +615,105 @@ mod tests {
             "red b: expected ~0.472, got {}",
             b[0]
         );
+    }
+
+    #[test]
+    fn test_xyb_simd_assisted_close_to_scalar_reference() {
+        let (w, h) = (37usize, 19usize);
+        let npixels = w * h;
+        let mut rgb = vec![0u8; npixels * 3];
+        for i in 0..rgb.len() {
+            rgb[i] = ((i as f32 * 11.17 + 5.3).sin() * 127.0 + 127.0) as u8;
+        }
+
+        let mut sx = vec![0.0f32; npixels];
+        let mut sy = vec![0.0f32; npixels];
+        let mut sb = vec![0.0f32; npixels];
+        srgb_u8_to_xyb(&rgb, w, h, &mut sx, &mut sy, &mut sb).unwrap();
+
+        let mut vx = vec![0.0f32; npixels];
+        let mut vy = vec![0.0f32; npixels];
+        let mut vb = vec![0.0f32; npixels];
+        srgb_u8_to_xyb_simd_assisted(ScalarDescriptor, &rgb, w, h, &mut vx, &mut vy, &mut vb)
+            .unwrap();
+
+        let mut max_diff = 0.0f32;
+        for i in 0..npixels {
+            max_diff = max_diff.max((sx[i] - vx[i]).abs());
+            max_diff = max_diff.max((sy[i] - vy[i]).abs());
+            max_diff = max_diff.max((sb[i] - vb[i]).abs());
+        }
+        assert!(
+            max_diff < 1e-3,
+            "max SIMD-assisted delta too large: {max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_xyb_rgba_simd_assisted_preserves_alpha() {
+        let (w, h) = (9usize, 7usize);
+        let npixels = w * h;
+        let mut rgba = vec![0u8; npixels * 4];
+        for i in 0..npixels {
+            let o = i * 4;
+            rgba[o] = (i * 3 % 256) as u8;
+            rgba[o + 1] = (i * 7 % 256) as u8;
+            rgba[o + 2] = (i * 11 % 256) as u8;
+            rgba[o + 3] = (i * 13 % 256) as u8;
+        }
+
+        let mut x = vec![0.0f32; npixels];
+        let mut y = vec![0.0f32; npixels];
+        let mut b = vec![0.0f32; npixels];
+        let mut alpha = vec![0u8; npixels];
+        srgb_u8_rgba_to_xyb_with_alpha_simd_assisted(
+            ScalarDescriptor,
+            &rgba,
+            w,
+            h,
+            &mut x,
+            &mut y,
+            &mut b,
+            &mut alpha,
+        )
+        .unwrap();
+
+        for i in 0..npixels {
+            assert_eq!(alpha[i], rgba[i * 4 + 3]);
+        }
+    }
+
+    #[test]
+    fn test_xyb_simd_edge_values() {
+        let edges = [0u8, 1u8, 254u8, 255u8];
+        for &r in &edges {
+            for &g in &edges {
+                for &bb in &edges {
+                    let rgb = [r, g, bb];
+                    let mut sx = [0.0f32; 1];
+                    let mut sy = [0.0f32; 1];
+                    let mut sb = [0.0f32; 1];
+                    srgb_u8_to_xyb(&rgb, 1, 1, &mut sx, &mut sy, &mut sb).unwrap();
+
+                    let mut vx = [0.0f32; 1];
+                    let mut vy = [0.0f32; 1];
+                    let mut vb = [0.0f32; 1];
+                    srgb_u8_to_xyb_simd_assisted(
+                        ScalarDescriptor,
+                        &rgb,
+                        1,
+                        1,
+                        &mut vx,
+                        &mut vy,
+                        &mut vb,
+                    )
+                    .unwrap();
+
+                    assert!((sx[0] - vx[0]).abs() < 1e-5);
+                    assert!((sy[0] - vy[0]).abs() < 1e-5);
+                    assert!((sb[0] - vb[0]).abs() < 1e-5);
+                }
+            }
+        }
     }
 }

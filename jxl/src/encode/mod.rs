@@ -14,6 +14,8 @@ pub mod modular;
 pub mod modular_encode;
 pub mod modular_transforms;
 pub mod options;
+pub mod simd;
+pub mod simd_math;
 pub mod toc;
 pub mod tools;
 pub mod vardct;

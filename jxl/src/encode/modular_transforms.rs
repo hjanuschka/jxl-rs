@@ -19,7 +19,11 @@ pub struct ModularTransformPlan {
 }
 
 /// Build a bootstrap transform plan from image characteristics.
-pub fn build_bootstrap_plan(_width: usize, _height: usize, _channels: usize) -> ModularTransformPlan {
+pub fn build_bootstrap_plan(
+    _width: usize,
+    _height: usize,
+    _channels: usize,
+) -> ModularTransformPlan {
     ModularTransformPlan::default()
 }
 

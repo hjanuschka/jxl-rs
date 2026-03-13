@@ -198,6 +198,87 @@ jobs:
             rd_compare.csv
             rd_dashboard.html
 
+  encoder_simd_micro:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install latest rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          prefix-key: encoder-simd-micro-${{ matrix.os }}
+
+      - name: Run encoder SIMD microbench (auto)
+        run: cargo bench -p jxl --bench encoder_simd_micro --features encoder -- --warm-up-time 0.1 --measurement-time 0.2
+
+      - name: Summarize encoder SIMD microbench
+        run: python3 tools/encoder_simd_bench_summary.py --out-csv encoder_simd_micro.csv --out-md encoder_simd_micro.md
+
+      - name: Check SIMD benchmark thresholds (informational)
+        run: python3 tools/check_encoder_simd_thresholds.py encoder_simd_micro.csv
+
+      - name: Upload encoder SIMD microbench artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: encoder_simd_micro_artifacts_${{ matrix.os }}
+          path: |
+            encoder_simd_micro.csv
+            encoder_simd_micro.md
+
+  encoder_simd_equivalence:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install latest rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          prefix-key: encoder-simd-equivalence
+
+      - name: Build jxle + decoder
+        run: cargo build --release -p jxl_cli --bin jxle --bin jxl_cli
+
+      - name: Scalar vs auto codestream equivalence corpus
+        run: python3 tools/compare_encoder_scalar_auto_codestreams.py --jxle target/release/jxle --distance 1.0 --effort 7
+
+      - name: Scalar vs assisted RD regression corpus
+        run: python3 tools/check_encoder_simd_rd_regression.py --jxle target/release/jxle --jxl-decoder target/release/jxl_cli --distance 1.0 --effort 7
+
+  encoder_simd_fuzz_smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install latest rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          prefix-key: encoder-simd-fuzz-smoke
+
+      - name: Compile SIMD/scalar fuzz equivalence target
+        run: cargo check --manifest-path jxl/fuzz/Cargo.toml --bin encode_simd_scalar_equiv_smoke
+
   test:
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:

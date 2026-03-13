@@ -10,9 +10,7 @@ use super::{
 #[cfg(test)]
 use crate::frame::Frame;
 use crate::{
-    api::JxlFrameHeader,
-    container::frame_index::FrameIndexBox,
-    error::Result,
+    api::JxlFrameHeader, container::frame_index::FrameIndexBox, error::Result,
     jpeg::JpegReconstructionData,
 };
 use states::*;
@@ -1522,7 +1520,9 @@ pub(crate) mod tests {
         };
 
         assert!(dec.has_jpeg_reconstruction());
-        let parsed = dec.jpeg_reconstruction_data().expect("jbrd should be parsed");
+        let parsed = dec
+            .jpeg_reconstruction_data()
+            .expect("jbrd should be parsed");
         assert_eq!(parsed.raw, jbrd_payload);
     }
 

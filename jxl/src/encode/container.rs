@@ -146,7 +146,11 @@ pub fn wrap_codestream_jxlp_chunked_with_extra_boxes(
         }
 
         let payload_size = (4 + chunk.len()) as u64;
-        write_box_header(&mut writer, ContainerBoxType::PARTIAL_CODESTREAM, payload_size)?;
+        write_box_header(
+            &mut writer,
+            ContainerBoxType::PARTIAL_CODESTREAM,
+            payload_size,
+        )?;
         writer.write_aligned_bytes(&index.to_be_bytes())?;
         writer.write_aligned_bytes(chunk)?;
     }
@@ -208,7 +212,10 @@ mod tests {
         let xml = b"<x:xmpmeta/>";
         let container = wrap_codestream_with_extra_boxes(
             &codestream,
-            &[(ContainerBoxType::EXIF, &exif), (ContainerBoxType::XML, xml)],
+            &[
+                (ContainerBoxType::EXIF, &exif),
+                (ContainerBoxType::XML, xml),
+            ],
         )
         .unwrap();
         assert!(container.windows(4).any(|w| w == b"Exif"));
@@ -274,7 +281,10 @@ mod tests {
         let container = wrap_codestream_jxlp_chunked_with_extra_boxes(
             &codestream,
             3,
-            &[(ContainerBoxType::EXIF, &exif), (ContainerBoxType::XML, xml)],
+            &[
+                (ContainerBoxType::EXIF, &exif),
+                (ContainerBoxType::XML, xml),
+            ],
         )
         .unwrap();
 

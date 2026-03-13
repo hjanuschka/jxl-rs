@@ -1,0 +1,13 @@
+suite,benchmark,mean_ns,mean_human,ci_low_ns,ci_high_ns
+encoder_end_to_end_corpus,encode_rgb_flat,847612606.600,847.613 ms,841489836.923,854222043.124
+encoder_end_to_end_corpus,encode_rgb_photo,294783897.000,294.784 ms,291985931.500,297825780.854
+encoder_end_to_end_corpus,encode_rgba_alpha,1246067029.100,1.246 s,1232503069.217,1260492737.220
+encoder_forward_dct_reference,dct2d_32_scalar/Avx512,210441.682,210.442 us,206314.211,215831.945
+encoder_forward_dct_reference,dct2d_32_simd/Avx512,659237.530,659.238 us,652670.104,666480.735
+encoder_idct8_kernel_reference,idct2d_8_8/Scalar,66.817,66.8 ns,66.581,67.016
+encoder_quant_token_prep,huffman_from_token_histogram,225033.376,225.033 us,220107.871,232409.681
+encoder_quant_token_prep,quantize_coeffs,185295.030,185.295 us,183558.518,187082.458
+encoder_quant_token_prep,tokenize_pack_signed,198221.564,198.222 us,195359.598,201385.182
+encoder_xyb,srgb_u8_to_xyb/1024x768,41509035.933,41.509 ms,41002077.067,42150008.667
+encoder_xyb,srgb_u8_to_xyb_assisted/Avx512,47903574.100,47.904 ms,47041418.100,48905437.500
+encoder_xyb,srgb_u8_to_xyb_scalar/1024x768,41375696.000,41.376 ms,40806878.200,42130078.655

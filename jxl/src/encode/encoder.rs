@@ -171,10 +171,7 @@ fn gray_to_rgb_tripled(gray: &[u8]) -> Vec<u8> {
     rgb
 }
 
-fn enforce_max_output_bytes(
-    max_output_bytes: Option<usize>,
-    bytes: Vec<u8>,
-) -> Result<Vec<u8>> {
+fn enforce_max_output_bytes(max_output_bytes: Option<usize>, bytes: Vec<u8>) -> Result<Vec<u8>> {
     if let Some(limit) = max_output_bytes
         && bytes.len() > limit
     {
@@ -212,7 +209,9 @@ impl JxlEncoder {
             return Err(crate::error::Error::InvalidImageSize(width, height));
         }
         if self.options.threads != 1 {
-            return Err(crate::error::Error::InvalidThreadCount(self.options.threads));
+            return Err(crate::error::Error::InvalidThreadCount(
+                self.options.threads,
+            ));
         }
         if size.0 > self.options.max_width || size.1 > self.options.max_height {
             return Err(crate::error::Error::ImageSizeTooLarge(width, height));
@@ -254,7 +253,11 @@ impl JxlEncoder {
                     } else {
                         rgb.to_vec()
                     };
-                    headers::encode_modular_u8_rgb_image_codestream_with_mode(size, &encoded_rgb, self.options.fast_lossless)
+                    headers::encode_modular_u8_rgb_image_codestream_with_mode(
+                        size,
+                        &encoded_rgb,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Rgb8Strided { data, stride } => {
@@ -277,7 +280,11 @@ impl JxlEncoder {
                     } else {
                         packed
                     };
-                    headers::encode_modular_u8_rgb_image_codestream_with_mode(size, &encoded_rgb, self.options.fast_lossless)
+                    headers::encode_modular_u8_rgb_image_codestream_with_mode(
+                        size,
+                        &encoded_rgb,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Rgba8Interleaved(rgba) => {
@@ -370,7 +377,11 @@ impl JxlEncoder {
                     } else {
                         rgb8
                     };
-                    headers::encode_modular_u8_rgb_image_codestream_with_mode(size, &encoded_rgb, self.options.fast_lossless)
+                    headers::encode_modular_u8_rgb_image_codestream_with_mode(
+                        size,
+                        &encoded_rgb,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Rgba16Interleaved(rgba16) => {
@@ -423,7 +434,11 @@ impl JxlEncoder {
                     } else {
                         gray8
                     };
-                    headers::encode_modular_u8_gray_image_codestream_with_mode(size, &encoded_gray, self.options.fast_lossless)
+                    headers::encode_modular_u8_gray_image_codestream_with_mode(
+                        size,
+                        &encoded_gray,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Rgb32fInterleaved(rgbf) => {
@@ -451,7 +466,11 @@ impl JxlEncoder {
                     } else {
                         rgb8
                     };
-                    headers::encode_modular_u8_rgb_image_codestream_with_mode(size, &encoded_rgb, self.options.fast_lossless)
+                    headers::encode_modular_u8_rgb_image_codestream_with_mode(
+                        size,
+                        &encoded_rgb,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Rgba32fInterleaved(rgbaf) => {
@@ -504,7 +523,11 @@ impl JxlEncoder {
                     } else {
                         gray8
                     };
-                    headers::encode_modular_u8_gray_image_codestream_with_mode(size, &encoded_gray, self.options.fast_lossless)
+                    headers::encode_modular_u8_gray_image_codestream_with_mode(
+                        size,
+                        &encoded_gray,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Gray8Interleaved(gray) => {
@@ -527,7 +550,11 @@ impl JxlEncoder {
                     } else {
                         gray.to_vec()
                     };
-                    headers::encode_modular_u8_gray_image_codestream_with_mode(size, &encoded_gray, self.options.fast_lossless)
+                    headers::encode_modular_u8_gray_image_codestream_with_mode(
+                        size,
+                        &encoded_gray,
+                        self.options.fast_lossless,
+                    )
                 }
             }
             JxlEncoderImageData::Gray8Strided { data, stride } => {
@@ -551,7 +578,11 @@ impl JxlEncoder {
                     } else {
                         gray
                     };
-                    headers::encode_modular_u8_gray_image_codestream_with_mode(size, &encoded_gray, self.options.fast_lossless)
+                    headers::encode_modular_u8_gray_image_codestream_with_mode(
+                        size,
+                        &encoded_gray,
+                        self.options.fast_lossless,
+                    )
                 }
             }
         }?;
@@ -690,7 +721,11 @@ impl JxlEncoder {
         size: (u32, u32),
         rgb: &[u8],
     ) -> Result<Vec<u8>> {
-        headers::encode_modular_u8_rgb_image_codestream_with_mode(size, rgb, self.options.fast_lossless)
+        headers::encode_modular_u8_rgb_image_codestream_with_mode(
+            size,
+            rgb,
+            self.options.fast_lossless,
+        )
     }
 
     /// Encodes a minimal header-only stream wrapped in a JXL container.
@@ -739,7 +774,11 @@ impl JxlEncoder {
     /// Encodes an interleaved RGB8 buffer into a single-group modular stream,
     /// wrapped in a JXL container.
     pub fn encode_modular_u8_rgb_container(&self, size: (u32, u32), rgb: &[u8]) -> Result<Vec<u8>> {
-        let codestream = headers::encode_modular_u8_rgb_image_codestream_with_mode(size, rgb, self.options.fast_lossless)?;
+        let codestream = headers::encode_modular_u8_rgb_image_codestream_with_mode(
+            size,
+            rgb,
+            self.options.fast_lossless,
+        )?;
         container::wrap_codestream(&codestream)
     }
 
@@ -769,12 +808,12 @@ impl JxlEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::decoder_tests::decode as decode_f32;
     use crate::{
         api::{JxlSignatureType, ProcessingResult, check_signature},
         container::{BitstreamKind, ContainerParser},
         encode::vardct::{VarDctConfig, encode_vardct_u8_rgb_codestream},
     };
-    use crate::api::decoder_tests::decode as decode_f32;
 
     #[test]
     fn test_encode_codestream_signature() {
@@ -1321,7 +1360,10 @@ mod tests {
                 result: Some(JxlSignatureType::Codestream)
             }
         );
-        assert_ne!(vardct, modular, "VarDCT mode should not emit modular stream bytes");
+        assert_ne!(
+            vardct, modular,
+            "VarDCT mode should not emit modular stream bytes"
+        );
     }
 
     #[test]
@@ -1676,8 +1718,12 @@ mod tests {
                 rgb[i + 2] = ((x + y) * 255 / 46) as u8;
             }
         }
-        let a = enc.encode_modular_u8_rgb_codestream((32, 16), &rgb).unwrap();
-        let b = enc.encode_modular_u8_rgb_codestream((32, 16), &rgb).unwrap();
+        let a = enc
+            .encode_modular_u8_rgb_codestream((32, 16), &rgb)
+            .unwrap();
+        let b = enc
+            .encode_modular_u8_rgb_codestream((32, 16), &rgb)
+            .unwrap();
         assert_eq!(a, b, "modular codestream should be deterministic");
     }
 
@@ -1804,7 +1850,10 @@ mod tests {
         }
 
         let cs = enc
-            .encode_image_codestream((w as u32, h as u32), JxlEncoderImageData::Rgb8Interleaved(&rgb))
+            .encode_image_codestream(
+                (w as u32, h as u32),
+                JxlEncoderImageData::Rgb8Interleaved(&rgb),
+            )
             .unwrap();
         let (_n, frames) = decode_f32(&cs, usize::MAX, true, false, None).unwrap();
         let buf = &frames[0][0];
@@ -1841,7 +1890,10 @@ mod tests {
         }
 
         let cs = enc
-            .encode_image_codestream((w as u32, h as u32), JxlEncoderImageData::Gray8Interleaved(&gray))
+            .encode_image_codestream(
+                (w as u32, h as u32),
+                JxlEncoderImageData::Gray8Interleaved(&gray),
+            )
             .unwrap();
         let (_n, frames) = decode_f32(&cs, usize::MAX, true, false, None).unwrap();
         let buf = &frames[0][0];
@@ -1876,7 +1928,10 @@ mod tests {
         let cs = enc
             .encode_image_codestream(
                 (w as u32, h as u32),
-                JxlEncoderImageData::Rgb8Strided { data: &data, stride },
+                JxlEncoderImageData::Rgb8Strided {
+                    data: &data,
+                    stride,
+                },
             )
             .unwrap();
         let (_n, frames) = decode_f32(&cs, usize::MAX, true, false, None).unwrap();
@@ -1888,12 +1943,12 @@ mod tests {
                 let i = y * stride + x * 3;
                 let dr = ((row[x * 3].clamp(0.0, 1.0) * 255.0).round() as i32 - data[i] as i32)
                     .unsigned_abs();
-                let dg =
-                    ((row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as i32 - data[i + 1] as i32)
-                        .unsigned_abs();
-                let db =
-                    ((row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as i32 - data[i + 2] as i32)
-                        .unsigned_abs();
+                let dg = ((row[x * 3 + 1].clamp(0.0, 1.0) * 255.0).round() as i32
+                    - data[i + 1] as i32)
+                    .unsigned_abs();
+                let db = ((row[x * 3 + 2].clamp(0.0, 1.0) * 255.0).round() as i32
+                    - data[i + 2] as i32)
+                    .unsigned_abs();
                 assert_eq!(dr, 0);
                 assert_eq!(dg, 0);
                 assert_eq!(db, 0);
@@ -1918,7 +1973,10 @@ mod tests {
         let cs = enc
             .encode_image_codestream(
                 (w as u32, h as u32),
-                JxlEncoderImageData::Gray8Strided { data: &data, stride },
+                JxlEncoderImageData::Gray8Strided {
+                    data: &data,
+                    stride,
+                },
             )
             .unwrap();
         let (_n, frames) = decode_f32(&cs, usize::MAX, true, false, None).unwrap();
@@ -1927,7 +1985,8 @@ mod tests {
         for y in 0..h {
             let row = buf.row(y);
             for x in 0..w {
-                let d = ((row[x].clamp(0.0, 1.0) * 255.0).round() as i32 - data[y * stride + x] as i32)
+                let d = ((row[x].clamp(0.0, 1.0) * 255.0).round() as i32
+                    - data[y * stride + x] as i32)
                     .unsigned_abs();
                 assert_eq!(d, 0);
             }
