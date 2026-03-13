@@ -15,6 +15,19 @@
 - But gs=8813 makes files 28% larger (pure size competition can't handle it)
 - Need RD-aware competition or better AC entropy coding to close the gap
 
+## Speed Optimization Notes (from profiling)
+- **40%** of encode time is in `compute_forward_transform_coeffs` (entropy merge)
+  - Uses dense NxN linear solver (matrix multiply) for DCT16x8/8x16/16x16/32x32
+  - ~36K Vec allocations per image in this path
+  - Could use `jxl_transforms::dct2d_*_scalar` but convention mismatch needs verification
+  - Entropy merge only saves 0.02 parity score -- consider gating at lower efforts
+- **21%** in ANS entropy coding for AC (`write_ans_stream`)
+  - 3% of that is just dropping `Vec<AnsTokenBits>` (allocation overhead)
+- **16%** in Huffman encoding for AC (`write_huffman_symbol`)
+  - 11% in `is_single_symbol` which iterates frequencies -- could cache result
+- **3.7%** in greedy context map clustering
+- **3.5%** in cluster frequency building
+
 ## Promising Ideas (untried)
 - **RD-aware candidate selection**: use size + lambda*distortion instead of pure size.
   Could let us use gs=8813 candidates that are larger but much better PSNR.
