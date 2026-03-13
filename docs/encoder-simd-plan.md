@@ -165,8 +165,8 @@ Legend:
 
 - [x] A1 SIMD enabled by default through runtime dispatch on supported targets.
   - Done: S704 promotes all SIMD-assisted paths to default-on.
-- [~] A2 Scalar and SIMD produce byte-identical codestreams on conformance corpus.
-  - Status: SIMD output differs from scalar by minor FP rounding (max 1 pixel unit on decoded output, 0.004% of pixels affected). Both produce valid JXL. Byte-identical requirement relaxed to "visually equivalent, both valid" for wave 1.
+- [x] A2 Scalar and SIMD produce byte-identical codestreams on conformance corpus.
+  - Done: sRGB->linear conversion uses a 256-entry LUT (shared by both paths), and SIMD opsin matrix application avoids FMA to match scalar FP order. `JXL_ENC_SIMD=scalar` and default SIMD produce byte-identical output.
 - [x] A3 No RD regressions outside agreed thresholds.
   - Done: parity_score identical between scalar and SIMD modes (2.37). PSNR delta < 0.01 dB.
 - [x] A4 End-to-end encode speedup >= 1.5x on representative RGB corpus.
