@@ -652,6 +652,7 @@ dependencies = [
  "paste",
  "rand",
  "rand_xorshift",
+ "rayon",
  "test-log",
  "thiserror",
  "tracing",
