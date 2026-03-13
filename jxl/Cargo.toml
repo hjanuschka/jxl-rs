@@ -22,6 +22,7 @@ array-init = "2.0.0"
 tracing = { version = "0.1.40", optional = true }
 jxl_macros = { path = "../jxl_macros", version = "=0.4.3" }
 jxl_simd = { path = "../jxl_simd", version = "=0.4.3" }
+rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
 arbtest = "0.3.2"
@@ -42,7 +43,7 @@ avx512 = ["jxl_simd/avx512"]
 neon = ["jxl_simd/neon"]
 
 # Encoder feature rollout (pure Rust implementation).
-encoder = ["jxl_transforms/encoder"]
+encoder = ["jxl_transforms/encoder", "rayon"]
 encoder-vardct = ["encoder"]
 encoder-advanced = ["encoder-vardct"]
 
