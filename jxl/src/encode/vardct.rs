@@ -4066,10 +4066,12 @@ fn build_entropy_merge_transform_map(
     // DCT16X8 (id=6): 16 rows x 8 cols = 1 block wide, 2 blocks tall
     // Merge 2 vertically adjacent blocks (must not cross group boundaries)
     let group_dim = 32usize; // 256 pixels / 8 = 32 blocks per group dimension
+
+    // Collect candidate pairs for parallel forward transform computation.
+    let mut vert_candidates: Vec<(usize, usize, f32, u32)> = Vec::new(); // (bx, by, e8_sum, rq)
     for bx in 0..bw {
         let mut by = 0;
         while by + 1 < bh {
-            // Don't cross group boundary vertically
             if by / group_dim != (by + 1) / group_dim {
                 by += 1;
                 continue;
@@ -4080,23 +4082,37 @@ fn build_entropy_merge_transform_map(
                 by += 1;
                 continue;
             }
-
             let rq0 = raw_quant_map[by * bw + bx] as f32;
             let rq1 = raw_quant_map[(by + 1) * bw + bx] as f32;
             if rq0.max(rq1) > rq0.min(rq1) * 1.5 + 1.0 {
                 by += 1;
                 continue;
             }
-
             let e8_sum = estimate_8x8_entropy(by * bw + bx, bx, by)
                 + estimate_8x8_entropy((by + 1) * bw + bx, bx, by + 1);
+            vert_candidates.push((bx, by, e8_sum, rq0.max(rq1) as u32));
+            by += 2; // skip to next non-overlapping pair
+        }
+    }
 
-            let rq = rq0.max(rq1) as u32;
-            // DCT16X8: 8 cols (1 block), 16 rows (2 blocks)
-            compute_coeffs_into(
-                DCT16X8_TRANSFORM_ID, bx, by, 8, 16,
-                &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
-            );
+    // Parallel forward transform + entropy estimation for vertical pairs.
+    use rayon::prelude::*;
+    let solver_16x8 = rectangular_forward_solver(DCT16X8_TRANSFORM_ID);
+    let vert_results: Vec<(usize, usize, bool)> = vert_candidates
+        .par_iter()
+        .map(|&(bx, by, e8_sum, rq)| {
+            let chans: [&[f32]; 3] = [pixel_x, pixel_y, pixel_b];
+            let mut gather = vec![0.0f32; 128];
+            let mut coeffs = [vec![0.0f32; 128], vec![0.0f32; 128], vec![0.0f32; 128]];
+            let mut scratch = vec![0.0f32; 128];
+
+            if let Some(solver) = &solver_16x8 {
+                for (c, chan) in chans.iter().enumerate() {
+                    gather_clamped_block_into(chan, width, height, bx * 8, by * 8, 8, 16, &mut gather);
+                    forward_with_linear_solver_into(&gather[..128], solver, &mut coeffs[c], &mut scratch);
+                }
+            }
+
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
             for c in 0..3usize {
@@ -4116,28 +4132,29 @@ fn build_entropy_merge_transform_map(
                     if dw.abs() < 1e-10 {
                         continue;
                     }
-                    let q = (coeffs_buf[c][k] * scale_rect / dw).round();
+                    let q = (coeffs[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
             }
             e_rect *= entropy_mul_rect;
+            (bx, by, e_rect < e8_sum)
+        })
+        .collect();
 
-            if e_rect < e8_sum {
-                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16X8_TRANSFORM_ID;
-                map[(by + 1) * bw + bx] = DCT16X8_TRANSFORM_ID;
-                by += 2;
-            } else {
-                by += 1;
-            }
+    // Apply vertical merge decisions deterministically (in order).
+    for (bx, by, should_merge) in vert_results {
+        if should_merge {
+            map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16X8_TRANSFORM_ID;
+            map[(by + 1) * bw + bx] = DCT16X8_TRANSFORM_ID;
         }
     }
 
     // DCT8X16 (id=7): 8 rows x 16 cols = 2 blocks wide, 1 block tall
-    // Merge 2 horizontally adjacent blocks (must not cross group boundaries)
+    // Collect horizontal candidates, then evaluate in parallel.
+    let mut horiz_candidates: Vec<(usize, usize, f32, u32)> = Vec::new();
     for by in 0..bh {
         let mut bx = 0;
         while bx + 1 < bw {
-            // Don't cross group boundary horizontally
             if bx / group_dim != (bx + 1) / group_dim {
                 bx += 1;
                 continue;
@@ -4148,55 +4165,57 @@ fn build_entropy_merge_transform_map(
                 bx += 1;
                 continue;
             }
-
             let rq0 = raw_quant_map[by * bw + bx] as f32;
             let rq1 = raw_quant_map[by * bw + bx + 1] as f32;
             if rq0.max(rq1) > rq0.min(rq1) * 1.5 + 1.0 {
                 bx += 1;
                 continue;
             }
-
             let e8_sum = estimate_8x8_entropy(by * bw + bx, bx, by)
                 + estimate_8x8_entropy(by * bw + bx + 1, bx + 1, by);
+            horiz_candidates.push((bx, by, e8_sum, rq0.max(rq1) as u32));
+            bx += 2;
+        }
+    }
 
-            let rq = rq0.max(rq1) as u32;
-            // DCT8X16: 16 cols (2 blocks), 8 rows (1 block)
-            compute_coeffs_into(
-                DCT8X16_TRANSFORM_ID, bx, by, 16, 8,
-                &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
-            );
+    let solver_8x16 = rectangular_forward_solver(DCT8X16_TRANSFORM_ID);
+    let horiz_results: Vec<(usize, usize, bool)> = horiz_candidates
+        .par_iter()
+        .map(|&(bx, by, e8_sum, rq)| {
+            let chans: [&[f32]; 3] = [pixel_x, pixel_y, pixel_b];
+            let mut gather = vec![0.0f32; 128];
+            let mut coeffs = [vec![0.0f32; 128], vec![0.0f32; 128], vec![0.0f32; 128]];
+            let mut scratch = vec![0.0f32; 128];
+
+            if let Some(solver) = &solver_8x16 {
+                for (c, chan) in chans.iter().enumerate() {
+                    gather_clamped_block_into(chan, width, height, bx * 8, by * 8, 16, 8, &mut gather);
+                    forward_with_linear_solver_into(&gather[..128], solver, &mut coeffs[c], &mut scratch);
+                }
+            }
+
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
             for c in 0..3usize {
                 let dw_base = &dct8x16_weights[c * 128..(c + 1) * 128];
-                let dm_mul = match c {
-                    0 => x_dm_multiplier,
-                    1 => 1.0,
-                    _ => b_dm_multiplier,
-                };
-                let chan_w = match c {
-                    0 => 0.3f32,
-                    1 => 1.0,
-                    _ => 0.3,
-                };
+                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
+                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
                 for k in 1..128 {
                     let dw = dw_base[k] * dm_mul;
-                    if dw.abs() < 1e-10 {
-                        continue;
-                    }
-                    let q = (coeffs_buf[c][k] * scale_rect / dw).round();
+                    if dw.abs() < 1e-10 { continue; }
+                    let q = (coeffs[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
             }
             e_rect *= entropy_mul_rect;
+            (bx, by, e_rect < e8_sum)
+        })
+        .collect();
 
-            if e_rect < e8_sum {
-                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X16_TRANSFORM_ID;
-                map[by * bw + bx + 1] = DCT8X16_TRANSFORM_ID;
-                bx += 2;
-            } else {
-                bx += 1;
-            }
+    for (bx, by, should_merge) in horiz_results {
+        if should_merge {
+            map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X16_TRANSFORM_ID;
+            map[by * bw + bx + 1] = DCT8X16_TRANSFORM_ID;
         }
     }
 
