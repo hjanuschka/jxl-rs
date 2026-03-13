@@ -5504,7 +5504,9 @@ fn encode_vardct_frame_inner(
         {
             vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0); num_passes]
         } else {
-            vec![crate::encode::entropy::HybridUintConfig::new(4, 1, 2)]
+            // Match libjxl default: (4, 2, 0) puts more MSBs in token for
+            // better ANS distribution modeling of AC coefficients.
+            vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0)]
         };
         let all_encoded_passes: Vec<Vec<Vec<crate::encode::entropy::HybridUintEncoded>>> =
             group_tokens_passes
