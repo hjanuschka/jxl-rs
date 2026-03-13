@@ -5766,19 +5766,41 @@ fn encode_hf_metadata_modular(
     let total = cr_w * cr_h + cr_w * cr_h + count * 2 + bw * bh;
     assert_eq!(data.len(), total);
 
-    // Encode as a regular modular section with a single zero-predictor tree.
-    // The residual stream is channel-concatenated in decode order.
-    // For HF metadata, data contains mixed-size channels (ytox, ytob, transform, epf),
-    // so per-channel prediction isn't straightforward. Use zero predictor.
+    // Encode as a regular modular section. Try both Huffman and ANS, pick smaller.
+    // HF metadata contains mixed-size channels (ytox, ytob, transform, epf).
+    // Use zero predictor (data is already raw values, no spatial prediction benefit).
     let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
+
+    // Estimate Huffman size
+    let mut huff_est = BitWriter::new();
     crate::encode::modular_encode::write_modular_section_huffman(
-        w,
-        0, // offset
-        0, // predictor = Zero
-        data,
-        uint_config,
-        false, // use_global_tree
-    )
+        &mut huff_est, 0, 0, data, uint_config, false,
+    )?;
+    let huff_size = huff_est.total_bits_written();
+
+    // Estimate ANS size (only for non-trivial data)
+    let use_ans = if data.len() >= 64 {
+        let mut ans_est = BitWriter::new();
+        if crate::encode::modular_encode::write_modular_section_ans_pub(
+            &mut ans_est, 0, 0, data, uint_config, false,
+        ).is_ok() {
+            ans_est.total_bits_written() < huff_size
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if use_ans {
+        crate::encode::modular_encode::write_modular_section_ans_pub(
+            w, 0, 0, data, uint_config, false,
+        )
+    } else {
+        crate::encode::modular_encode::write_modular_section_huffman(
+            w, 0, 0, data, uint_config, false,
+        )
+    }
 }
 
 // ==================== AC coefficient tokenization ====================
