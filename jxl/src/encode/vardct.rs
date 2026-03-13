@@ -3309,12 +3309,16 @@ fn forward_with_linear_solver(block: &[f32], solver: &TransformLinearForwardSolv
     let n = solver.coeff_count;
 
     let mut solved = vec![0.0f32; n];
-    for r in 0..n {
+    let inv = &solver.inverse;
+    // Process rows of the inverse matrix, using slice indexing to help
+    // the compiler elide bounds checks in the inner dot-product loop.
+    for (r, out) in solved.iter_mut().enumerate() {
+        let row = &inv[r * n..(r + 1) * n];
         let mut sum = 0.0f32;
-        for c in 0..n {
-            sum += solver.inverse[r * n + c] * block[c];
+        for (a, b) in row.iter().zip(block.iter()) {
+            sum += a * b;
         }
-        solved[r] = sum;
+        *out = sum;
     }
 
     let mut coeffs = vec![0.0f32; n];
