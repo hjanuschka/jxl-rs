@@ -685,13 +685,29 @@ pub fn encode_modular_signed_stream(
         }
     }
 
+    // AverageWestAndNorth predictor (3): (left + top) / 2 (integer truncation towards zero)
+    let mut avg_wn_residuals = Vec::with_capacity(data.len());
+    for c in 0..num_channels {
+        let ch = &data[c * channel_size..(c + 1) * channel_size];
+        for y in 0..height {
+            for x in 0..width {
+                let val = ch[y * width + x];
+                let left = get_left(ch, x, y) as i64;
+                let top = get_top(ch, x, y) as i64;
+                let pred = (left + top) / 2;
+                avg_wn_residuals.push(val - pred as i32);
+            }
+        }
+    }
+
     // Pick predictor by exact encoded size (regression-safe).
-    let candidates: [(u32, &[i32]); 5] = [
+    let candidates: [(u32, &[i32]); 6] = [
         (0, data),
         (5, &grad_residuals),
         (1, &left_residuals),
         (2, &top_residuals),
         (4, &select_residuals),
+        (3, &avg_wn_residuals),
     ];
 
     let mut best_predictor = 0u32;
