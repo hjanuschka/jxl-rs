@@ -331,7 +331,8 @@ pub fn encode_modular_signed_stream(
 ) -> Result<()> {
     assert_eq!(data.len(), width * height * num_channels);
 
-    let uint_config = HybridUintConfig::new(4, 1, 2);
+    // Match libjxl's default modular HybridUint config for VarDCT DC data.
+    let uint_config = HybridUintConfig::new(4, 2, 0);
 
     // Try multiple predictors and pick the best by actual encoded byte size.
     let channel_size = width * height;
