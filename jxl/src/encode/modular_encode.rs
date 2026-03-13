@@ -14,6 +14,7 @@ use super::{
     BitWriter,
     entropy::{
         HybridUintConfig, HybridUintEncoded,
+        ans::{AnsDistribution, AnsToken, write_ans_histograms, write_ans_stream},
         huffman_encode::{
             HuffmanCode, build_huffman_code, write_huffman_histograms, write_huffman_symbol,
         },
@@ -232,6 +233,73 @@ pub fn write_modular_section_huffman(
     Ok(())
 }
 
+/// Write a complete modular section using ANS entropy coding.
+///
+/// Same structure as write_modular_section_huffman but uses ANS instead of Huffman
+/// for the residual data. Tree is still Huffman (tiny, overhead negligible).
+fn write_modular_section_ans(
+    writer: &mut BitWriter,
+    offset: i32,
+    predictor: u32,
+    signed_residuals: &[i32],
+    uint_config: HybridUintConfig,
+    use_global_tree: bool,
+) -> Result<()> {
+    write_minimal_group_header(writer, use_global_tree)?;
+
+    // Tree: use Huffman (tree is tiny, ANS overhead would be larger)
+    let tree_stream = build_tree_token_stream(offset, predictor)?;
+    let tree_context_map = [0u8; 6];
+    write_huffman_histograms(
+        writer,
+        &tree_context_map,
+        &[tree_stream.uint_config],
+        &[tree_stream.code.clone()],
+    )?;
+    write_token_stream(writer, &tree_stream)?;
+
+    // Residual data: use ANS
+    let residual_encoded: Vec<HybridUintEncoded> = signed_residuals
+        .iter()
+        .map(|&v| uint_config.encode(pack_signed(v)))
+        .collect();
+
+    let max_token = residual_encoded
+        .iter()
+        .map(|e| e.token)
+        .max()
+        .unwrap_or(0);
+    let alphabet_size = (max_token as usize + 1).max(1);
+    let mut frequencies = vec![0u64; alphabet_size];
+    for enc in &residual_encoded {
+        frequencies[enc.token as usize] += 1;
+    }
+
+    let dist = AnsDistribution::from_frequencies(&frequencies)
+        .ok_or(Error::InvalidAnsHistogram)?;
+
+    let ans_tokens: Vec<AnsToken> = residual_encoded
+        .iter()
+        .map(|enc| AnsToken {
+            symbol: enc.token,
+            cluster: 0,
+            extra_bits: enc.extra_bits,
+            extra_nbits: enc.nbits as usize,
+        })
+        .collect();
+
+    let residual_context_map = [0u8];
+    write_ans_histograms(
+        writer,
+        &residual_context_map,
+        &[uint_config],
+        &[dist.clone()],
+    )?;
+    write_ans_stream(writer, &[dist], &ans_tokens)?;
+
+    Ok(())
+}
+
 /// Write LF global section with histogram-driven tree + residual encoding.
 ///
 /// For single-group images, also includes the residual data.
@@ -426,8 +494,10 @@ pub fn encode_modular_signed_stream(
     let mut best_predictor = 0u32;
     let mut best_idx = 0usize;
     let mut best_size = usize::MAX;
+    let mut best_use_ans = false;
 
     for (idx, (predictor, values)) in candidates.iter().enumerate() {
+        // Try Huffman
         let mut tmp = BitWriter::new();
         write_modular_section_huffman(&mut tmp, 0, *predictor, values, uint_config, false)?;
         let sz = tmp.finish().len();
@@ -435,17 +505,45 @@ pub fn encode_modular_signed_stream(
             best_size = sz;
             best_predictor = *predictor;
             best_idx = idx;
+            best_use_ans = false;
+        }
+
+        // Try ANS (only worthwhile for larger streams where ANS overhead pays off)
+        if data.len() >= 256 {
+            let mut tmp_ans = BitWriter::new();
+            if write_modular_section_ans(&mut tmp_ans, 0, *predictor, values, uint_config, false)
+                .is_ok()
+            {
+                let sz_ans = tmp_ans.finish().len();
+                if sz_ans < best_size {
+                    best_size = sz_ans;
+                    best_predictor = *predictor;
+                    best_idx = idx;
+                    best_use_ans = true;
+                }
+            }
         }
     }
 
-    write_modular_section_huffman(
-        writer,
-        0,
-        best_predictor,
-        candidates[best_idx].1,
-        uint_config,
-        false,
-    )
+    if best_use_ans {
+        write_modular_section_ans(
+            writer,
+            0,
+            best_predictor,
+            candidates[best_idx].1,
+            uint_config,
+            false,
+        )
+    } else {
+        write_modular_section_huffman(
+            writer,
+            0,
+            best_predictor,
+            candidates[best_idx].1,
+            uint_config,
+            false,
+        )
+    }
 }
 
 #[cfg(test)]
