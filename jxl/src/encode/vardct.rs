@@ -943,7 +943,7 @@ fn encode_single_rgba_frame(
     // Scale quant_ac by 1.15 to reduce quantization aggressiveness.
     // Our AQ map distributes bits less optimally than libjxl's. Scaling up
     // compensates uniformly, closing PSNR gaps at the cost of ~5% larger files.
-    let quant_ac = (0.765f32 * 1.15) / config.distance;
+    let quant_ac = (0.765f32 * 1.25) / config.distance;
     let (adaptive_map, global_scale, quant_lf, aq_float_map) = build_adaptive_raw_quant_map_full(
         &x_chan,
         &y_chan,
