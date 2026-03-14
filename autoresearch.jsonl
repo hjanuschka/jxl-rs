@@ -135,3 +135,6 @@
 {"run":63,"commit":"f38f147","metric":1.958,"metrics":{},"status":"keep","description":"Parity plateau confirmed at 1.958 (62 experiments). All parameter-level optimizations exhausted.","timestamp":1773451629516,"segment":0}
 {"run":64,"commit":"f38f147","metric":1.958,"metrics":{},"status":"discard","description":"Fast cbrt (libjxl Newton-Raphson): identical output, LUT dominates precision","timestamp":1773451799559,"segment":0}
 {"run":65,"commit":"f38f147","metric":4.375,"metrics":{},"status":"discard","description":"quant_ac 0.88/d (was 0.79): softer_rq=6 matches libjxl but +4.86% size from entropy gap","timestamp":1773451960360,"segment":0}
+{"run":66,"commit":"287ebc2","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.958 stable. 65 experiments. Confirmed: 26% entropy gap from coefficient value differences, not ANS overhead.","timestamp":1773452051467,"segment":0}
+{"run":67,"commit":"18ae55c","metric":1.958,"metrics":{},"status":"discard","description":"Match libjxl gaborish FP order (row-based Symmetric5): identical output, quant absorbs ULP diffs","timestamp":1773452245116,"segment":0}
+{"run":68,"commit":"18ae55c","metric":9.015,"metrics":{},"status":"discard","description":"Force DCT8-only (no merges): +15% size, -1.0 dB. Merges are critical for our parity!","timestamp":1773452354587,"segment":0}
