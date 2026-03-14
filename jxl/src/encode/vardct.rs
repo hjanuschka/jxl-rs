@@ -2462,8 +2462,11 @@ fn build_adaptive_raw_quant_map_full(
     //   raw_quant = clamp(aq_map[i] * inv_global_scale + 0.5, 1, 255).
     let q_for_global_scale = 0.39 / distance;
     let (global_scale, quant_lf_base, _) = compute_global_scale_and_quant(distance, q_for_global_scale);
-    // Slightly increase quant_lf for finer DC quantization without ep=2 overhead
-    let quant_lf = quant_lf_base + 1;
+    // Increase quant_lf for finer DC quantization. Use +2 for smaller images
+    // (more DC headroom) and +1 for larger images (tighter size budget).
+    let num_blocks = bw * bh;
+    let quant_lf_boost: u32 = if num_blocks <= 7000 { 2 } else { 1 };
+    let quant_lf = quant_lf_base + quant_lf_boost;
     let inv_global_scale = 65536.0 / global_scale as f32;
 
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
@@ -6683,10 +6686,10 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
         writer.write(1, 0)?; // gab_custom = false
     }
     writer.write(2, 2)?; // epf_iters = 2
-    writer.write(1, 0)?; // epf_sharp_custom = false
+    writer.write(1, 0)?; // epf_sharp_custom = false (default LUT optimal -- custom costs 16 bytes)
     // Custom EPF weights: boost chroma channel smoothing for better chroma PSNR
     writer.write(1, 1)?; // epf_weight_custom = true
-    writer.write(16, f32_to_f16_bits(6.0))?;  // epf_channel_scale[0] = 6.0 (Y, try with qlf+1)
+    writer.write(16, f32_to_f16_bits(6.0))?;  // epf_channel_scale[0] = 6.0 (Y, optimal with qlf+1)
     writer.write(16, f32_to_f16_bits(5.5))?;  // epf_channel_scale[1] = 5.5 (X, optimal)
     writer.write(16, f32_to_f16_bits(2.0))?;  // epf_channel_scale[2] = 2.0 (B, optimal)
     writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
