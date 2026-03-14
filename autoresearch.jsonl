@@ -125,3 +125,8 @@
 {"run":53,"commit":"4f48e46","metric":1.969,"metrics":{},"status":"discard","description":"ep=2 with shift optimization: 1.969 vs 1.958, zoltan +0.43% size penalty negates PSNR gain","timestamp":1773450054079,"segment":0}
 {"run":54,"commit":"4f48e46","metric":23.124,"metrics":{},"status":"discard","description":"ep=2 + softer_rq=base-2: way too coarse, -1.97 dB PSNR","timestamp":1773450134677,"segment":0}
 {"run":55,"commit":"4f48e46","metric":23.124,"metrics":{},"status":"discard","description":"ep=2 + extra_softer_rq=base-2: rq=4 wins everywhere, -1.97 dB PSNR","timestamp":1773450518859,"segment":0}
+{"run":56,"commit":"5b1b5f8","metric":1.958,"metrics":{},"status":"keep","description":"Baseline with ANS shift optimization: parity 1.958, size -9.99% (was -9.95%), 55 experiments","timestamp":1773450577518,"segment":0}
+{"run":57,"commit":"5b1b5f8","metric":56.833,"metrics":{},"status":"discard","description":"Disable gaborish: -4.56 dB PSNR, -30% size but terrible quality","timestamp":1773450685879,"segment":0}
+{"run":58,"commit":"5b1b5f8","metric":1.958,"metrics":{},"status":"discard","description":"2% quality budget selection: no change, rq=5 vs rq=6 gap is 26% (way over 2%)","timestamp":1773451127634,"segment":0}
+{"run":59,"commit":"5b1b5f8","metric":1.958,"metrics":{},"status":"discard","description":"More cluster counts (48,64): no change, limited by number of contexts","timestamp":1773451262752,"segment":0}
+{"run":60,"commit":"3e58cc7","metric":1.958,"metrics":{},"status":"discard","description":"Trellis DC quantization (floor/ceil vs prediction): no change, round-nearest already optimal","timestamp":1773451447431,"segment":0}
