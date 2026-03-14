@@ -2467,7 +2467,7 @@ fn build_adaptive_raw_quant_map_full(
     // Increase quant_lf for finer DC quantization. Use +2 for smaller images
     // (more DC headroom) and +1 for larger images (tighter size budget).
     let num_blocks = bw * bh;
-    let quant_lf_boost: u32 = if num_blocks <= 7000 { 2 } else { 1 };
+    let quant_lf_boost: u32 = if num_blocks <= 7000 { 3 } else { 1 };
     let quant_lf = quant_lf_base + quant_lf_boost;
     let inv_global_scale = 65536.0 / global_scale as f32;
 
