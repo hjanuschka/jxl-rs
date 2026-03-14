@@ -25,15 +25,13 @@ pub struct HuffmanCode {
     pub alphabet_size: usize,
     pub code_lengths: Vec<u8>,
     pub codes: Vec<u32>,
-    /// Cached: true if at most 1 non-zero symbol (decoder reads 0 bits per symbol).
-    pub single_symbol: bool,
 }
 
 impl HuffmanCode {
     /// Returns true if this code has at most 1 non-zero symbol.
-    #[inline(always)]
+    /// The decoder's simple table (nsym=1) reads 0 bits per symbol in this case.
     pub fn is_single_symbol(&self) -> bool {
-        self.single_symbol
+        self.code_lengths.iter().filter(|&&l| l > 0).count() <= 1
     }
 }
 
@@ -64,19 +62,16 @@ pub fn build_huffman_code_limited(frequencies: &[u64], max_bits: usize) -> Optio
             alphabet_size,
             code_lengths,
             codes,
-            single_symbol: true,
         });
     }
 
     let code_lengths = build_code_lengths(frequencies, max_bits);
     let codes = canonical_codes(&code_lengths);
-    let single_symbol = code_lengths.iter().filter(|&&l| l > 0).count() <= 1;
 
     Some(HuffmanCode {
         alphabet_size,
         code_lengths,
         codes,
-        single_symbol,
     })
 }
 
@@ -111,19 +106,16 @@ pub fn build_huffman_code(frequencies: &[u64]) -> Option<HuffmanCode> {
             alphabet_size,
             code_lengths,
             codes,
-            single_symbol: true,
         });
     }
 
     let code_lengths = build_code_lengths(frequencies, MAX_BITS);
     let codes = canonical_codes(&code_lengths);
-    let single_symbol = code_lengths.iter().filter(|&&l| l > 0).count() <= 1;
 
     Some(HuffmanCode {
         alphabet_size,
         code_lengths,
         codes,
-        single_symbol,
     })
 }
 

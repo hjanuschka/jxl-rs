@@ -692,37 +692,37 @@ pub(crate) fn encode_modular_u8_rgb_image_codestream_with_mode(
 
         // Channel-major, row-major within each channel.
         for channel in 0..3 {
-            // Buffer previous row for predictors that use N/NW
-            let mut prev_row = vec![0i32; gw_usize];
+            let mut prev_row_first = 0i32;
 
             for y in oy..(oy + gh) {
                 let local_y = (y - oy) as usize;
-                let mut curr_row = Vec::with_capacity(gw_usize);
+                let first_pixel_index = y as usize * width_usize + ox as usize;
+                let first_sample = i32::from(rgb[first_pixel_index * 3 + channel]);
 
-                for lx in 0..gw_usize {
-                    let x = ox as usize + lx;
-                    let pixel_index = y as usize * width_usize + x;
-                    let sample = i32::from(rgb[pixel_index * 3 + channel]);
-
-                    let w = if lx > 0 { curr_row[lx - 1] } else { if local_y > 0 { prev_row[0] } else { 0 } };
-                    let n = if local_y > 0 { prev_row[lx] } else { w };
-                    let nw = if local_y > 0 && lx > 0 { prev_row[lx - 1] } else { w };
-
-                    let pred = match predictor {
-                        1 => w,                           // Left
-                        2 => n,                           // Top
-                        3 => (w + n) / 2,                 // Average(W, N)
-                        4 => {                            // Select (median-like)
-                            let p = w + n - nw;
-                            if (p - w).abs() < (p - n).abs() { w } else { n }
+                let first_pred = match predictor {
+                    1 => {
+                        if local_y > 0 {
+                            prev_row_first
+                        } else {
+                            0
                         }
-                        5 => w + n - nw,                   // Gradient
-                        _ => 0,                           // Zero
+                    }
+                    _ => 0,
+                };
+                residuals.push(first_sample - (first_pred + offset));
+                prev_row_first = first_sample;
+
+                let mut prev = first_sample;
+                for x in (ox + 1)..(ox + gw) {
+                    let pixel_index = y as usize * width_usize + x as usize;
+                    let sample = i32::from(rgb[pixel_index * 3 + channel]);
+                    let pred = match predictor {
+                        1 => prev,
+                        _ => 0,
                     };
                     residuals.push(sample - (pred + offset));
-                    curr_row.push(sample);
+                    prev = sample;
                 }
-                prev_row = curr_row;
             }
         }
         residuals
@@ -750,7 +750,7 @@ pub(crate) fn encode_modular_u8_rgb_image_codestream_with_mode(
         let mut best_score = residual_score(&best_residuals);
 
         if !fast_lossless {
-            for predictor in [1u32, 2, 4, 5] {
+            for predictor in [1u32] {
                 let residuals = collect_group_residuals_predictor(
                     rgb,
                     width_usize,
@@ -819,7 +819,7 @@ pub(crate) fn encode_modular_u8_rgb_image_codestream_with_mode(
         let mut best_score = residual_score(&best_residuals);
 
         if !fast_lossless {
-            for predictor in [1u32, 2, 4, 5] {
+            for predictor in [1u32] {
                 let residuals = collect_group_residuals_predictor(
                     rgb,
                     width_usize,
@@ -968,7 +968,7 @@ pub(crate) fn encode_modular_u8_gray_image_codestream_with_mode(
         );
         let mut best_score = residual_score(&best_residuals);
         if !fast_lossless {
-            for predictor in [1u32, 2, 4, 5] {
+            for predictor in [1u32] {
                 let residuals = collect_gray_residuals_predictor(
                     gray,
                     width_usize,
@@ -1023,7 +1023,7 @@ pub(crate) fn encode_modular_u8_gray_image_codestream_with_mode(
             collect_gray_residuals_predictor(gray, width_usize, (ox, oy), (gw, gh), best_predictor);
         let mut best_score = residual_score(&best_residuals);
         if !fast_lossless {
-            for predictor in [1u32, 2, 4, 5] {
+            for predictor in [1u32] {
                 let residuals = collect_gray_residuals_predictor(
                     gray,
                     width_usize,

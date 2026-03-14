@@ -14,7 +14,7 @@ use crate::encode::encodings::write_u32;
 use crate::encode::entropy::context_map::write_context_map;
 use crate::encode::entropy::huffman_encode::build_huffman_code;
 use crate::encode::headers::write_file_header;
-use crate::encode::simd::{EncoderSimdBackend, benchmark_force_scalar, detect_encoder_simd_backend};
+use crate::encode::simd::{EncoderSimdBackend, detect_encoder_simd_backend};
 use crate::encode::toc::write_toc;
 use crate::encode::xyb::srgb_u8_to_xyb_auto;
 use crate::error::Result;
@@ -191,7 +191,7 @@ fn effort_params(effort: u8) -> EffortParams {
         // Enable entropy-merge heuristics from Hare-and-slower style tiers.
         enable_entropy_merge: speed_tier <= 5,
         // Enable custom coefficient orders from Squirrel-and-slower tiers.
-        enable_custom_coeff_orders: false, // custom orders add overhead without PSNR benefit
+        enable_custom_coeff_orders: speed_tier <= 3,
         max_total_encodes,
     }
 }
@@ -235,7 +235,6 @@ fn distance_to_quant_params(distance: f32) -> (u32, u32) {
 ///   base_raw_quant = ClampVal(quant_ac * inv_global_scale + 0.5)
 /// Compute global_scale, quant_lf, and base_raw_quant from distance.
 /// Uses quant_ac = 0.79/d for the base raw_quant calculation.
-/// PSNR-first: use effective_distance < distance for finer quantization.
 fn distance_to_full_quant_params(distance: f32) -> (u32, u32, u8) {
     let quant_ac = 0.79f32 / distance;
     let (global_scale, quant_lf, _) = compute_global_scale_and_quant(distance, quant_ac);
@@ -944,7 +943,7 @@ fn encode_single_rgba_frame(
     // Scale quant_ac by 1.15 to reduce quantization aggressiveness.
     // Our AQ map distributes bits less optimally than libjxl's. Scaling up
     // compensates uniformly, closing PSNR gaps at the cost of ~5% larger files.
-    let quant_ac = (0.765f32 * 1.25) / config.distance;
+    let quant_ac = (0.765f32 * 1.15) / config.distance;
     let (adaptive_map, global_scale, quant_lf, aq_float_map) = build_adaptive_raw_quant_map_full(
         &x_chan,
         &y_chan,
@@ -957,13 +956,9 @@ fn encode_single_rgba_frame(
         quant_ac,
     );
     let (_, _, base_raw_quant) = distance_to_full_quant_params(config.distance);
-    // PSNR-first: uniform quant only (no adaptive map). Adaptive map gets selected
-    // by size-RD for some images but gives worse PSNR (e.g., kodim13).
-    // libjxl kFalcon also uses uniform quant, so this matches the reference.
-    let softer_rq = (base_raw_quant as u16).saturating_sub(1).max(1) as u8;
     let mut raw_quant_map_candidates = vec![
-        vec![base_raw_quant; bw * bh], // uniform candidate (standard)
-        vec![base_raw_quant; bw * bh], // placeholder for flat-region index compatibility
+        vec![base_raw_quant; bw * bh], // uniform candidate
+        adaptive_map,                  // libjxl-style adaptive candidate
     ];
 
     // For RGBA input, add boosted quant candidates for translucent edges,
@@ -1056,8 +1051,8 @@ fn encode_single_rgba_frame(
     let dequant_weights = default_dct8x8_dequant_weights();
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
-    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 1.15; // = 0.92, safe balance
-    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 1.07; // b_dm sweet spot
+    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0); // = 0.8
+    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0); // = 1.0
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
@@ -1078,11 +1073,6 @@ fn encode_single_rgba_frame(
     let is_flat_graphic = is_flat_graphic_pre;
     let max_total_encodes = effort_cfg.max_total_encodes;
     let mut total_encodes = 0usize;
-    // Extra DC precision: doubles DC quantization granularity per level.
-    // Level 1 halves the DC quantization step for better PSNR at small size cost.
-    // Use extra_dc_precision=2 for images with more size headroom (smaller images)
-    let num_blocks = bw * bh;
-    let extra_dc_precision: u32 = if num_blocks <= 7000 { 2 } else { 1 };
     let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());
     for raw_quant_map in &raw_quant_map_candidates {
         let quantized = quantize_vardct_blocks(
@@ -1099,7 +1089,6 @@ fn encode_single_rgba_frame(
             bw,
             &ytox_map,
             &ytob_map,
-            extra_dc_precision,
         );
         let mut transform_map_candidates =
             build_transform_map_candidates_from_quantized_ac_with_flags(
@@ -1184,7 +1173,6 @@ fn encode_single_rgba_frame(
                 alpha,
                 config.effort,
                 config.progressive,
-                extra_dc_precision,
             )?;
 
             let has_supported_nonzero_transform = transform_map.iter().any(|&t| {
@@ -1238,7 +1226,6 @@ fn encode_single_rgba_frame(
                     alpha,
                     config.effort,
                     config.progressive,
-                    extra_dc_precision,
                 )?;
 
                 total_encodes += 1;
@@ -1301,7 +1288,7 @@ struct QuantizedVardct {
 /// Actual factors: base_correlation_x + x_factor/84 for X, base_correlation_b + b_factor/84 for B.
 /// libjxl's towards_zero shrinkage for CfL multipliers.
 /// Reduces oscillations by pulling small values to zero.
-const TOWARDS_ZERO: f64 = 2.0;
+const TOWARDS_ZERO: f64 = 2.6;
 
 /// Approximate quantization weights for CfL regression.
 /// libjxl multiplies DCT coefficients by q * inv_dequant_matrix[k].
@@ -1343,7 +1330,9 @@ fn compute_cfl_maps(
     bw: usize,
     bh: usize,
 ) -> (Vec<i32>, Vec<i32>) {
-    if !benchmark_force_scalar()
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -1447,24 +1436,22 @@ fn compute_cfl_maps_scalar(
             // where regularizer = num * distance_mul * 0.5 * K^2
             let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8) * ((tx * 8 + 8).min(bw) - tx * 8);
             let num_coeffs = (n_blocks * 63) as f64;
-            // libjxl's kDistanceMultiplierAC = 1e-9, but in their formula the
-            // regularizer is in (y*qw/84)^2 units. Converting to our sum_yy
-            // units: reg = 84^2 * N * 1e-9 * 0.5 = N * 3.528e-6.
-            let reg = num_coeffs * 84.0 * 84.0 * 1e-9 * 0.5;
+            // kDistanceMultiplierAC = 1e-3 (libjxl uses 1e-9 but with much
+            // larger q*qm weights; we scale up to compensate)
+            let dist_mul = 1e-3;
 
             // X channel: base_correlation_x = 0
-            // libjxl: x = 84 * sum(y*qw^2*X) / (sum(y^2*qw^2) + reg)
-            if sum_yy_x + reg > 1e-10 {
-                let x_raw = (sum_yx / (sum_yy_x + reg)) * K_COLOR_FACTOR as f64;
+            let reg_x = num_coeffs * dist_mul * 0.5;
+            if sum_yy_x + reg_x > 1e-10 {
+                let x_raw = (sum_yx / (sum_yy_x + reg_x)) * K_COLOR_FACTOR as f64;
                 let x_shrunk = towards_zero_shrink(x_raw, TOWARDS_ZERO);
                 ytox_map[ty * cr_w + tx] = (x_shrunk.round() as i32).clamp(-127, 127);
             }
 
             // B channel: base_correlation_b = 1.0
-            // libjxl: x = 84 * sum(y*qw^2*(B-Y)) / (sum(y^2*qw^2) + reg)
-            // Previous bug: (sum_yb/(sum_yy+reg) - 1.0)*84 leaked reg into numerator
-            if sum_yy_b + reg > 1e-10 {
-                let b_raw = K_COLOR_FACTOR as f64 * (sum_yb - sum_yy_b) / (sum_yy_b + reg);
+            let reg_b = num_coeffs * dist_mul * 0.5;
+            if sum_yy_b + reg_b > 1e-10 {
+                let b_raw = ((sum_yb / (sum_yy_b + reg_b)) - 1.0) * K_COLOR_FACTOR as f64;
                 let b_shrunk = towards_zero_shrink(b_raw, TOWARDS_ZERO);
                 ytob_map[ty * cr_w + tx] = (b_shrunk.round() as i32).clamp(-127, 127);
             }
@@ -1565,16 +1552,18 @@ fn compute_cfl_maps_simd_assisted<D: SimdDescriptor>(
 
             let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8) * ((tx * 8 + 8).min(bw) - tx * 8);
             let num_coeffs = (n_blocks * 63) as f64;
-            let reg = num_coeffs * 84.0 * 84.0 * 1e-9 * 0.5;
+            let dist_mul = 1e-3;
 
-            if sum_yy_x + reg > 1e-10 {
-                let x_raw = (sum_yx / (sum_yy_x + reg)) * K_COLOR_FACTOR as f64;
+            let reg_x = num_coeffs * dist_mul * 0.5;
+            if sum_yy_x + reg_x > 1e-10 {
+                let x_raw = (sum_yx / (sum_yy_x + reg_x)) * K_COLOR_FACTOR as f64;
                 let x_shrunk = towards_zero_shrink(x_raw, TOWARDS_ZERO);
                 ytox_map[ty * cr_w + tx] = (x_shrunk.round() as i32).clamp(-127, 127);
             }
 
-            if sum_yy_b + reg > 1e-10 {
-                let b_raw = K_COLOR_FACTOR as f64 * (sum_yb - sum_yy_b) / (sum_yy_b + reg);
+            let reg_b = num_coeffs * dist_mul * 0.5;
+            if sum_yy_b + reg_b > 1e-10 {
+                let b_raw = ((sum_yb / (sum_yy_b + reg_b)) - 1.0) * K_COLOR_FACTOR as f64;
                 let b_shrunk = towards_zero_shrink(b_raw, TOWARDS_ZERO);
                 ytob_map[ty * cr_w + tx] = (b_shrunk.round() as i32).clamp(-127, 127);
             }
@@ -1598,9 +1587,10 @@ fn quantize_vardct_blocks(
     bw: usize,
     ytox_map: &[i32],
     ytob_map: &[i32],
-    extra_dc_precision: u32,
 ) -> QuantizedVardct {
-    if !benchmark_force_scalar()
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
     {
         let backend = detect_encoder_simd_backend();
         match backend {
@@ -1623,7 +1613,6 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
-                        extra_dc_precision,
                     );
                 }
             }
@@ -1645,7 +1634,6 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
-                        extra_dc_precision,
                     );
                 }
             }
@@ -1667,7 +1655,6 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
-                        extra_dc_precision,
                     );
                 }
             }
@@ -1689,7 +1676,6 @@ fn quantize_vardct_blocks(
                         bw,
                         ytox_map,
                         ytob_map,
-                        extra_dc_precision,
                     );
                 }
             }
@@ -1717,10 +1703,6 @@ fn quantize_vardct_blocks(
         let ytox_ratio = x_factor as f32 / K_COLOR_FACTOR;
         let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
 
-        // Per-tile adaptive b_dm: larger |ytob| -> finer B quant to compensate Y->B error
-        let ytob_abs = (b_factor as f32 / K_COLOR_FACTOR).abs();
-        let tile_b_dm = b_dm_multiplier * (1.0);
-
         // DC: apply CfL decorrelation and proper DC quantization.
         let raw_dc_x = dct_x[blk * 64];
         let raw_dc_y = dct_y[blk * 64];
@@ -1729,18 +1711,15 @@ fn quantize_vardct_blocks(
         let cfl_dc_y = raw_dc_y; // in_y = dc_y
         let cfl_dc_b = raw_dc_b - raw_dc_y; // in_b = dc_b - dc_y (y_to_b_lf=1.0)
 
-        dc_x[blk] =
-            quantize_dc_with_ep(cfl_dc_x, global_scale, quant_lf, inv_lf_quant[0], extra_dc_precision);
-        dc_y[blk] =
-            quantize_dc_with_ep(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1], extra_dc_precision);
-        dc_b[blk] =
-            quantize_dc_with_ep(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2], extra_dc_precision);
+        dc_x[blk] = quantize_dc(cfl_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
+        dc_y[blk] = quantize_dc(cfl_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
+        dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
 
         // AC: apply CfL decorrelation with per-tile ytox and ytob factors.
         for k in 1..64 {
             let dw_x = dequant_weights[k] * x_dm_multiplier;
             let dw_y = dequant_weights[64 + k];
-            let dw_b = dequant_weights[128 + k] * tile_b_dm;
+            let dw_b = dequant_weights[128 + k] * b_dm_multiplier;
 
             let ac_x = dct_x[blk * 64 + k] - ytox_ratio * dct_y[blk * 64 + k];
             let ac_y = dct_y[blk * 64 + k];
@@ -1777,7 +1756,6 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
     bw: usize,
     ytox_map: &[i32],
     ytob_map: &[i32],
-    extra_dc_precision: u32,
 ) -> QuantizedVardct {
     const K_COLOR_FACTOR: f32 = 84.0;
     let num_blocks = raw_quant_map.len();
@@ -1801,21 +1779,14 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
         let ytox_ratio = x_factor as f32 / K_COLOR_FACTOR;
         let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
 
-        // Per-tile adaptive b_dm: larger |ytob| -> finer B quant to compensate Y->B error
-        let ytob_abs = (b_factor as f32 / K_COLOR_FACTOR).abs();
-        let tile_b_dm = b_dm_multiplier * (1.0);
-
         let raw_dc_x = dct_x[blk * 64];
         let raw_dc_y = dct_y[blk * 64];
         let raw_dc_b = dct_b[blk * 64];
         let cfl_dc_b = raw_dc_b - raw_dc_y;
 
-        dc_x[blk] =
-            quantize_dc_with_ep(raw_dc_x, global_scale, quant_lf, inv_lf_quant[0], extra_dc_precision);
-        dc_y[blk] =
-            quantize_dc_with_ep(raw_dc_y, global_scale, quant_lf, inv_lf_quant[1], extra_dc_precision);
-        dc_b[blk] =
-            quantize_dc_with_ep(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2], extra_dc_precision);
+        dc_x[blk] = quantize_dc(raw_dc_x, global_scale, quant_lf, inv_lf_quant[0]);
+        dc_y[blk] = quantize_dc(raw_dc_y, global_scale, quant_lf, inv_lf_quant[1]);
+        dc_b[blk] = quantize_dc(cfl_dc_b, global_scale, quant_lf, inv_lf_quant[2]);
 
         let ytox_vec = D::F32Vec::splat(d, ytox_ratio);
         let ytob_vec = D::F32Vec::splat(d, ytob_ratio);
@@ -1842,7 +1813,7 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
                 tmp_b[lane] = dct_b[blk_off + k];
                 tmp_dwx[lane] = dequant_weights[k] * x_dm_multiplier;
                 tmp_dwy[lane] = dequant_weights[64 + k];
-                tmp_dwb[lane] = dequant_weights[128 + k] * tile_b_dm;
+                tmp_dwb[lane] = dequant_weights[128 + k] * b_dm_multiplier;
             }
             for lane in chunk..lanes {
                 tmp_x[lane] = 0.0;
@@ -2025,7 +1996,9 @@ fn compute_mask_slice_simd_assisted<D: SimdDescriptor>(d: D, input: &[f32], out:
 }
 
 fn compute_mask_slice(input: &[f32], out: &mut [f32]) {
-    if !benchmark_force_scalar()
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -2218,7 +2191,9 @@ fn downsample_row4_simd_assisted<D: SimdDescriptor>(d: D, row_buf: &[f32], out: 
 }
 
 fn downsample_row4_auto(row_buf: &[f32], out: &mut [f32]) {
-    if !benchmark_force_scalar()
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -2471,12 +2446,7 @@ fn build_adaptive_raw_quant_map_full(
     // Then SetQuantFieldRect converts each aq_map[i] to
     //   raw_quant = clamp(aq_map[i] * inv_global_scale + 0.5, 1, 255).
     let q_for_global_scale = 0.39 / distance;
-    let (global_scale, quant_lf_base, _) = compute_global_scale_and_quant(distance, q_for_global_scale);
-    // Increase quant_lf for finer DC quantization. Use +2 for smaller images
-    // (more DC headroom) and +1 for larger images (tighter size budget).
-    let num_blocks = bw * bh;
-    let quant_lf_boost: u32 = if num_blocks <= 7000 { 2 } else { 0 };
-    let quant_lf = quant_lf_base + quant_lf_boost;
+    let (global_scale, quant_lf, _) = compute_global_scale_and_quant(distance, q_for_global_scale);
     let inv_global_scale = 65536.0 / global_scale as f32;
 
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
@@ -2702,7 +2672,9 @@ fn abs_sum_i32_slice_simd_assisted<D: SimdDescriptor>(d: D, values: &[i32]) -> u
 }
 
 fn abs_sum_i32_slice(values: &[i32]) -> u64 {
-    if !benchmark_force_scalar()
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -2914,31 +2886,14 @@ fn gather_clamped_block(
     block_h: usize,
 ) -> Vec<f32> {
     let mut block = vec![0.0f32; block_w * block_h];
-    gather_clamped_block_into(chan, width, height, px0, py0, block_w, block_h, &mut block);
-    block
-}
-
-/// Gather a clamped block into a pre-allocated buffer.
-#[inline]
-fn gather_clamped_block_into(
-    chan: &[f32],
-    width: usize,
-    height: usize,
-    px0: usize,
-    py0: usize,
-    block_w: usize,
-    block_h: usize,
-    block: &mut [f32],
-) {
-    debug_assert!(block.len() >= block_w * block_h);
     for y in 0..block_h {
-        let sy = (py0 + y).min(height - 1);
-        let row_start = sy * width;
         for x in 0..block_w {
             let sx = (px0 + x).min(width - 1);
-            block[y * block_w + x] = chan[row_start + sx];
+            let sy = (py0 + y).min(height - 1);
+            block[y * block_w + x] = chan[sy * width + sx];
         }
     }
+    block
 }
 
 fn transform_coeff_index_to_block_storage(
@@ -3337,37 +3292,23 @@ fn forward_dct_nxn(pixels: &[f32], coeffs: &mut [f32], n: usize) {
 }
 
 fn forward_with_linear_solver(block: &[f32], solver: &TransformLinearForwardSolver) -> Vec<f32> {
-    let mut coeffs = vec![0.0f32; solver.coeff_count];
-    let mut scratch = vec![0.0f32; solver.coeff_count];
-    forward_with_linear_solver_into(block, solver, &mut coeffs, &mut scratch);
-    coeffs
-}
-
-/// Forward transform using linear solver, writing into pre-allocated buffers.
-/// `coeffs` and `scratch` must be at least `solver.coeff_count` elements.
-fn forward_with_linear_solver_into(
-    block: &[f32],
-    solver: &TransformLinearForwardSolver,
-    coeffs: &mut [f32],
-    scratch: &mut [f32],
-) {
+    debug_assert_eq!(block.len(), solver.coeff_count);
     let n = solver.coeff_count;
-    debug_assert!(block.len() >= n && coeffs.len() >= n && scratch.len() >= n);
 
-    let inv = &solver.inverse;
-    for (r, out) in scratch[..n].iter_mut().enumerate() {
-        let row = &inv[r * n..(r + 1) * n];
+    let mut solved = vec![0.0f32; n];
+    for r in 0..n {
         let mut sum = 0.0f32;
-        for (a, b) in row.iter().zip(block[..n].iter()) {
-            sum += a * b;
+        for c in 0..n {
+            sum += solver.inverse[r * n + c] * block[c];
         }
-        *out = sum;
+        solved[r] = sum;
     }
 
-    coeffs[..n].fill(0.0);
+    let mut coeffs = vec![0.0f32; n];
     for (i, &coeff_index) in solver.hf_coeff_indices.iter().enumerate() {
-        coeffs[coeff_index] = scratch[solver.lf_count + i];
+        coeffs[coeff_index] = solved[solver.lf_count + i];
     }
+    coeffs
 }
 
 fn compute_forward_transform_coeffs(
@@ -4005,51 +3946,8 @@ fn build_entropy_merge_transform_map(
     // Entropy multipliers: without libjxl's perceptual loss term working,
     // we use high multipliers to avoid quality-destroying merges.
     // PSNR parity with libjxl is the priority over file size.
-    let entropy_mul_16 = 5.5f32;
-    let entropy_mul_32 = 7.0f32;
-
-    // Pre-allocated buffers for forward transform hot path.
-    // Reused across all block evaluations to avoid ~54K heap allocations.
-    let max_block_size = 1024; // DCT32x32 = 32*32
-    let mut gather_buf = vec![0.0f32; max_block_size];
-    let mut coeffs_buf = [
-        vec![0.0f32; max_block_size],
-        vec![0.0f32; max_block_size],
-        vec![0.0f32; max_block_size],
-    ];
-    let mut scratch_buf = vec![0.0f32; max_block_size];
-
-    // Compute forward transform coefficients into pre-allocated buffers.
-    // Returns the number of coefficients (block_w * block_h).
-    let compute_coeffs_into =
-        |transform_id: u8,
-         bx: usize,
-         by: usize,
-         block_w: usize,
-         block_h: usize,
-         gather_buf: &mut [f32],
-         coeffs: &mut [Vec<f32>; 3],
-         scratch: &mut [f32]|
-         -> usize {
-            let n = block_w * block_h;
-            let chans: [&[f32]; 3] = [pixel_x, pixel_y, pixel_b];
-            for (c, chan) in chans.iter().enumerate() {
-                gather_clamped_block_into(chan, width, height, bx * 8, by * 8, block_w, block_h, gather_buf);
-                if let Some(solver) = rectangular_forward_solver(transform_id)
-                    .or_else(|| square_forward_solver(transform_id))
-                {
-                    forward_with_linear_solver_into(&gather_buf[..n], solver, &mut coeffs[c], scratch);
-                } else {
-                    // Fallback: use allocating path
-                    let block = gather_clamped_block(chan, width, height, bx * 8, by * 8, block_w, block_h);
-                    let full = compute_forward_transform_coeffs(
-                        transform_id, chan, chan, chan, width, height, bx, by, block_w, block_h,
-                    );
-                    coeffs[c][..n].copy_from_slice(&full[0][..n]);
-                }
-            }
-            n
-        };
+    let entropy_mul_16 = 2.5f32;
+    let entropy_mul_32 = 3.5f32;
 
     // Phase 0: Per-block 8x8 transform selection.
     // DISABLED: At d <= ~4.0, libjxl's EstimateEntropy produces all-zero
@@ -4076,17 +3974,15 @@ fn build_entropy_merge_transform_map(
     // Phase 0.5: DCT16x8 / DCT8x16 rectangular merges (pairs of 8x8 blocks).
     // These are common in libjxl and help in areas smooth in one direction.
     let dct8x16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(6);
-    let entropy_mul_rect = 4.0f32; // Conservative multiplier for rect merges
+    let entropy_mul_rect = 2.0f32; // Conservative multiplier for rect merges
 
     // DCT16X8 (id=6): 16 rows x 8 cols = 1 block wide, 2 blocks tall
     // Merge 2 vertically adjacent blocks (must not cross group boundaries)
     let group_dim = 32usize; // 256 pixels / 8 = 32 blocks per group dimension
-
-    // Collect candidate pairs for parallel forward transform computation.
-    let mut vert_candidates: Vec<(usize, usize, f32, u32)> = Vec::new(); // (bx, by, e8_sum, rq)
     for bx in 0..bw {
         let mut by = 0;
         while by + 1 < bh {
+            // Don't cross group boundary vertically
             if by / group_dim != (by + 1) / group_dim {
                 by += 1;
                 continue;
@@ -4097,37 +3993,31 @@ fn build_entropy_merge_transform_map(
                 by += 1;
                 continue;
             }
+
             let rq0 = raw_quant_map[by * bw + bx] as f32;
             let rq1 = raw_quant_map[(by + 1) * bw + bx] as f32;
             if rq0.max(rq1) > rq0.min(rq1) * 1.5 + 1.0 {
                 by += 1;
                 continue;
             }
+
             let e8_sum = estimate_8x8_entropy(by * bw + bx, bx, by)
                 + estimate_8x8_entropy((by + 1) * bw + bx, bx, by + 1);
-            vert_candidates.push((bx, by, e8_sum, rq0.max(rq1) as u32));
-            by += 2; // skip to next non-overlapping pair
-        }
-    }
 
-    // Parallel forward transform + entropy estimation for vertical pairs.
-    use rayon::prelude::*;
-    let solver_16x8 = rectangular_forward_solver(DCT16X8_TRANSFORM_ID);
-    let vert_results: Vec<(usize, usize, bool)> = vert_candidates
-        .par_iter()
-        .map(|&(bx, by, e8_sum, rq)| {
-            let chans: [&[f32]; 3] = [pixel_x, pixel_y, pixel_b];
-            let mut gather = vec![0.0f32; 128];
-            let mut coeffs = [vec![0.0f32; 128], vec![0.0f32; 128], vec![0.0f32; 128]];
-            let mut scratch = vec![0.0f32; 128];
-
-            if let Some(solver) = &solver_16x8 {
-                for (c, chan) in chans.iter().enumerate() {
-                    gather_clamped_block_into(chan, width, height, bx * 8, by * 8, 8, 16, &mut gather);
-                    forward_with_linear_solver_into(&gather[..128], solver, &mut coeffs[c], &mut scratch);
-                }
-            }
-
+            let rq = rq0.max(rq1) as u32;
+            // DCT16X8: 8 cols (1 block), 16 rows (2 blocks)
+            let coeffs = compute_forward_transform_coeffs(
+                DCT16X8_TRANSFORM_ID,
+                pixel_x,
+                pixel_y,
+                pixel_b,
+                width,
+                height,
+                bx,
+                by,
+                8,
+                16,
+            );
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
             for c in 0..3usize {
@@ -4152,24 +4042,23 @@ fn build_entropy_merge_transform_map(
                 }
             }
             e_rect *= entropy_mul_rect;
-            (bx, by, e_rect < e8_sum)
-        })
-        .collect();
 
-    // Apply vertical merge decisions deterministically (in order).
-    for (bx, by, should_merge) in vert_results {
-        if should_merge {
-            map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16X8_TRANSFORM_ID;
-            map[(by + 1) * bw + bx] = DCT16X8_TRANSFORM_ID;
+            if e_rect < e8_sum {
+                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT16X8_TRANSFORM_ID;
+                map[(by + 1) * bw + bx] = DCT16X8_TRANSFORM_ID;
+                by += 2;
+            } else {
+                by += 1;
+            }
         }
     }
 
     // DCT8X16 (id=7): 8 rows x 16 cols = 2 blocks wide, 1 block tall
-    // Collect horizontal candidates, then evaluate in parallel.
-    let mut horiz_candidates: Vec<(usize, usize, f32, u32)> = Vec::new();
+    // Merge 2 horizontally adjacent blocks (must not cross group boundaries)
     for by in 0..bh {
         let mut bx = 0;
         while bx + 1 < bw {
+            // Don't cross group boundary horizontally
             if bx / group_dim != (bx + 1) / group_dim {
                 bx += 1;
                 continue;
@@ -4180,57 +4069,63 @@ fn build_entropy_merge_transform_map(
                 bx += 1;
                 continue;
             }
+
             let rq0 = raw_quant_map[by * bw + bx] as f32;
             let rq1 = raw_quant_map[by * bw + bx + 1] as f32;
             if rq0.max(rq1) > rq0.min(rq1) * 1.5 + 1.0 {
                 bx += 1;
                 continue;
             }
+
             let e8_sum = estimate_8x8_entropy(by * bw + bx, bx, by)
                 + estimate_8x8_entropy(by * bw + bx + 1, bx + 1, by);
-            horiz_candidates.push((bx, by, e8_sum, rq0.max(rq1) as u32));
-            bx += 2;
-        }
-    }
 
-    let solver_8x16 = rectangular_forward_solver(DCT8X16_TRANSFORM_ID);
-    let horiz_results: Vec<(usize, usize, bool)> = horiz_candidates
-        .par_iter()
-        .map(|&(bx, by, e8_sum, rq)| {
-            let chans: [&[f32]; 3] = [pixel_x, pixel_y, pixel_b];
-            let mut gather = vec![0.0f32; 128];
-            let mut coeffs = [vec![0.0f32; 128], vec![0.0f32; 128], vec![0.0f32; 128]];
-            let mut scratch = vec![0.0f32; 128];
-
-            if let Some(solver) = &solver_8x16 {
-                for (c, chan) in chans.iter().enumerate() {
-                    gather_clamped_block_into(chan, width, height, bx * 8, by * 8, 16, 8, &mut gather);
-                    forward_with_linear_solver_into(&gather[..128], solver, &mut coeffs[c], &mut scratch);
-                }
-            }
-
+            let rq = rq0.max(rq1) as u32;
+            // DCT8X16: 16 cols (2 blocks), 8 rows (1 block)
+            let coeffs = compute_forward_transform_coeffs(
+                DCT8X16_TRANSFORM_ID,
+                pixel_x,
+                pixel_y,
+                pixel_b,
+                width,
+                height,
+                bx,
+                by,
+                16,
+                8,
+            );
             let scale_rect = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e_rect = 0.0f32;
             for c in 0..3usize {
                 let dw_base = &dct8x16_weights[c * 128..(c + 1) * 128];
-                let dm_mul = match c { 0 => x_dm_multiplier, 1 => 1.0, _ => b_dm_multiplier };
-                let chan_w = match c { 0 => 0.3f32, 1 => 1.0, _ => 0.3 };
+                let dm_mul = match c {
+                    0 => x_dm_multiplier,
+                    1 => 1.0,
+                    _ => b_dm_multiplier,
+                };
+                let chan_w = match c {
+                    0 => 0.3f32,
+                    1 => 1.0,
+                    _ => 0.3,
+                };
                 for k in 1..128 {
                     let dw = dw_base[k] * dm_mul;
-                    if dw.abs() < 1e-10 { continue; }
+                    if dw.abs() < 1e-10 {
+                        continue;
+                    }
                     let q = (coeffs[c][k] * scale_rect / dw).round();
                     e_rect += q.abs().sqrt() * chan_w;
                 }
             }
             e_rect *= entropy_mul_rect;
-            (bx, by, e_rect < e8_sum)
-        })
-        .collect();
 
-    for (bx, by, should_merge) in horiz_results {
-        if should_merge {
-            map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X16_TRANSFORM_ID;
-            map[by * bw + bx + 1] = DCT8X16_TRANSFORM_ID;
+            if e_rect < e8_sum {
+                map[by * bw + bx] = TRANSFORM_FIRST_BLOCK_FLAG | DCT8X16_TRANSFORM_ID;
+                map[by * bw + bx + 1] = DCT8X16_TRANSFORM_ID;
+                bx += 2;
+            } else {
+                bx += 1;
+            }
         }
     }
 
@@ -4288,9 +4183,17 @@ fn build_entropy_merge_transform_map(
                 (sum16 / 4.0).powf(1.0 / 16.0).round().max(1.0) as u32
             };
 
-            compute_coeffs_into(
-                DCT16_TRANSFORM_ID, bx, by, 16, 16,
-                &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
+            let coeffs = compute_forward_transform_coeffs(
+                DCT16_TRANSFORM_ID,
+                pixel_x,
+                pixel_y,
+                pixel_b,
+                width,
+                height,
+                bx,
+                by,
+                16,
+                16,
             );
             let scale16 = (global_scale as f32 * rq as f32) / 65536.0;
             let mut e16 = 0.0f32;
@@ -4311,7 +4214,7 @@ fn build_entropy_merge_transform_map(
                     if dw.abs() < 1e-10 {
                         continue;
                     }
-                    let q = (coeffs_buf[c][k] * scale16 / dw).round();
+                    let q = (coeffs[c][k] * scale16 / dw).round();
                     e16 += q.abs().sqrt() * chan_w;
                 }
             }
@@ -4354,9 +4257,17 @@ fn build_entropy_merge_transform_map(
                     for dx in 0..2 {
                         let bx16 = bx + dx * 2;
                         let by16 = by + dy * 2;
-                        compute_coeffs_into(
-                            DCT16_TRANSFORM_ID, bx16, by16, 16, 16,
-                            &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
+                        let coeffs = compute_forward_transform_coeffs(
+                            DCT16_TRANSFORM_ID,
+                            pixel_x,
+                            pixel_y,
+                            pixel_b,
+                            width,
+                            height,
+                            bx16,
+                            by16,
+                            16,
+                            16,
                         );
                         let rq16: u32 = (0..2)
                             .flat_map(|ddy| {
@@ -4384,7 +4295,7 @@ fn build_entropy_merge_transform_map(
                                 if dw.abs() < 1e-10 {
                                     continue;
                                 }
-                                let q = (coeffs_buf[c][k] * scale16 / dw).round();
+                                let q = (coeffs[c][k] * scale16 / dw).round();
                                 e16_sum += q.abs().sqrt() * chan_w;
                             }
                         }
@@ -4405,9 +4316,17 @@ fn build_entropy_merge_transform_map(
                     (sum16 / 16.0).powf(1.0 / 16.0).round().max(1.0) as u32
                 };
 
-                compute_coeffs_into(
-                    DCT32_TRANSFORM_ID, bx, by, 32, 32,
-                    &mut gather_buf, &mut coeffs_buf, &mut scratch_buf,
+                let coeffs = compute_forward_transform_coeffs(
+                    DCT32_TRANSFORM_ID,
+                    pixel_x,
+                    pixel_y,
+                    pixel_b,
+                    width,
+                    height,
+                    bx,
+                    by,
+                    32,
+                    32,
                 );
                 let scale32 = (global_scale as f32 * rq32 as f32) / 65536.0;
                 let mut e32 = 0.0f32;
@@ -4428,7 +4347,7 @@ fn build_entropy_merge_transform_map(
                         if dw.abs() < 1e-10 {
                             continue;
                         }
-                        let q = (coeffs_buf[c][k] * scale32 / dw).round();
+                        let q = (coeffs[c][k] * scale32 / dw).round();
                         e32 += q.abs().sqrt() * chan_w;
                     }
                 }
@@ -5224,19 +5143,7 @@ fn forward_dct_channel(
 ///   quantized = round(dc_float * global_scale * quant_lf / (2^16 * LF_QUANT[c]))
 ///             = round(dc_float * global_scale * quant_lf * INV_LF_QUANT[c] / 2^16)
 fn quantize_dc(dc_float: f32, global_scale: u32, quant_lf: u32, inv_lf_quant: f32) -> i32 {
-    quantize_dc_with_ep(dc_float, global_scale, quant_lf, inv_lf_quant, 0)
-}
-
-fn quantize_dc_with_ep(
-    dc_float: f32,
-    global_scale: u32,
-    quant_lf: u32,
-    inv_lf_quant: f32,
-    extra_precision: u32,
-) -> i32 {
-    let ep_mul = (1u32 << extra_precision) as f32;
-    let scale =
-        (global_scale as f32) * (quant_lf as f32) * inv_lf_quant * ep_mul / (1u32 << 16) as f32;
+    let scale = (global_scale as f32) * (quant_lf as f32) * inv_lf_quant / (1u32 << 16) as f32;
     (dc_float * scale).round() as i32
 }
 
@@ -5322,7 +5229,6 @@ fn encode_vardct_frame(
         None, // no alpha
         7,
         false,
-        0, // extra_dc_precision
     )
 }
 
@@ -5352,7 +5258,6 @@ fn encode_vardct_frame_inner(
     alpha: Option<&[u8]>,
     effort: u8,
     progressive: bool,
-    extra_dc_precision: u32,
 ) -> Result<Vec<u8>> {
     let has_alpha = alpha.is_some();
     let num_extra_channels = if has_alpha { 1u32 } else { 0 };
@@ -5421,7 +5326,6 @@ fn encode_vardct_frame_inner(
             ytob_map,
             alpha,
             effort,
-            extra_dc_precision,
         )?;
 
         write_toc(&mut writer, &[section.len() as u32])?;
@@ -5600,8 +5504,7 @@ fn encode_vardct_frame_inner(
         {
             vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0); num_passes]
         } else {
-            // (4, 2, 0) puts more MSBs in token, optimal for AC coeff distributions
-            vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0)]
+            vec![crate::encode::entropy::HybridUintConfig::new(4, 1, 2)]
         };
         let all_encoded_passes: Vec<Vec<Vec<crate::encode::entropy::HybridUintEncoded>>> =
             group_tokens_passes
@@ -5668,7 +5571,6 @@ fn encode_vardct_frame_inner(
                 transform_map,
                 ytox_map,
                 ytob_map,
-                extra_dc_precision,
             )?);
         }
 
@@ -5697,7 +5599,7 @@ fn encode_vardct_frame_inner(
                     .iter()
                     .flat_map(|e| e.iter().copied())
                     .collect();
-            for max_c in [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32] {
+            for max_c in [2, 4, 8, 16, 32] {
                 if max_c <= num_ac_contexts {
                     let greedy_map = build_greedy_clustered_context_map(
                         num_ac_contexts,
@@ -5857,22 +5759,23 @@ fn encode_hf_metadata_modular(
     // Channels:
     //   ch0: ytox_map         (cr_w * cr_h)
     //   ch1: ytob_map         (cr_w * cr_h)
-    //   ch2: transform_image  (count * 2)  -- width=count, height=2
+    //   ch2: transform_image  (count * 2)
     //   ch3: epf_map          (bw * bh)
     let total = cr_w * cr_h + cr_w * cr_h + count * 2 + bw * bh;
     assert_eq!(data.len(), total);
 
-    // Use multi-channel modular encoding with proper 2D dimensions for each channel.
-    // This enables spatial prediction (Left, Top, Gradient, Select) within each
-    // channel, which is important for CfL maps and EPF maps that have 2D correlation.
-    let channel_specs = [
-        (cr_w, cr_h),    // ch0: ytox_map
-        (cr_w, cr_h),    // ch1: ytob_map
-        (count, 2),      // ch2: transform_image (count x 2)
-        (bw, bh),        // ch3: epf_map
-    ];
-    crate::encode::modular_encode::encode_modular_multichannel_stream(
-        w, &channel_specs, data,
+    // Encode as a regular modular section with a single zero-predictor tree.
+    // The residual stream is channel-concatenated in decode order.
+    // For HF metadata, data contains mixed-size channels (ytox, ytob, transform, epf),
+    // so per-channel prediction isn't straightforward. Use zero predictor.
+    let uint_config = crate::encode::entropy::HybridUintConfig::new(4, 1, 2);
+    crate::encode::modular_encode::write_modular_section_huffman(
+        w,
+        0, // offset
+        0, // predictor = Zero
+        data,
+        uint_config,
+        false, // use_global_tree
     )
 }
 
@@ -6191,7 +6094,9 @@ fn nonzero_flags_in_order_simd_assisted<D: SimdDescriptor>(
 }
 
 fn nonzero_flags_in_order(coeffs: &[i32], order: &[usize; 64]) -> [u8; 64] {
-    if !benchmark_force_scalar()
+    if std::env::var("JXL_ENC_SIMD")
+        .map(|v| v.eq_ignore_ascii_case("assisted"))
+        .unwrap_or(false)
     {
         match detect_encoder_simd_backend() {
             EncoderSimdBackend::Scalar => {}
@@ -6592,32 +6497,6 @@ struct FrameHeaderConfig {
 }
 
 /// Unified VarDCT frame header writer.
-/// Convert f32 to IEEE 754 half-precision (F16) as u16.
-fn f32_to_f16_bits(f: f32) -> u64 {
-    let bits = f.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = (bits >> 23) & 0xFF;
-    let mant = bits & 0x7F_FFFF;
-    if exp == 0 {
-        // zero or denormal -> F16 zero
-        (sign as u64) << 15
-    } else if exp == 0xFF {
-        // inf/nan
-        let h_mant = if mant != 0 { 0x200u64 } else { 0 };
-        ((sign as u64) << 15) | (0x1F << 10) | h_mant
-    } else {
-        let new_exp = exp as i32 - 127 + 15;
-        if new_exp <= 0 {
-            (sign as u64) << 15
-        } else if new_exp >= 31 {
-            ((sign as u64) << 15) | (0x1F << 10)
-        } else {
-            let h_mant = (mant >> 13) as u64;
-            ((sign as u64) << 15) | ((new_exp as u64) << 10) | h_mant
-        }
-    }
-}
-
 fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfig) -> Result<()> {
     // 1. all_default = false (we need VarDCT settings)
     writer.write(1, 0)?;
@@ -6696,14 +6575,8 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
         writer.write(1, 0)?; // gab_custom = false
     }
     writer.write(2, 2)?; // epf_iters = 2
-    writer.write(1, 0)?; // epf_sharp_custom = false (default LUT optimal -- custom costs 16 bytes)
-    // Custom EPF weights: boost chroma channel smoothing for better chroma PSNR
-    writer.write(1, 1)?; // epf_weight_custom = true
-    writer.write(16, f32_to_f16_bits(4.0))?;  // epf_channel_scale[0] = 4.0 (Y, less edge preservation = more smoothing)
-    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, test)
-    writer.write(16, f32_to_f16_bits(1.0))?;  // epf_channel_scale[2] = 1.0 (B, test more smoothing)
-    writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
-    writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)
+    writer.write(1, 0)?; // epf_sharp_custom = false
+    writer.write(1, 0)?; // epf_weight_custom = false
     writer.write(1, 0)?; // epf_sigma_custom = false
     writer.write(2, 0)?; // LoopFilter extensions = 0
     // 25. FrameHeader extensions = 0
@@ -6782,7 +6655,6 @@ fn encode_single_group_section(
     ytob_map: &[i32],
     alpha: Option<&[u8]>, // u8 alpha channel, width*height pixels
     effort: u8,
-    extra_dc_precision: u32,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     let num_blocks = bw * bh;
@@ -6815,8 +6687,8 @@ fn encode_single_group_section(
     }
 
     // === LfGroup0: VarDCT DC ===
-    // extra_precision (2 bits)
-    w.write(2, extra_dc_precision as u64)?;
+    // extra_precision = 0 (2 bits)
+    w.write(2, 0)?;
     // DC coefficients as modular (3 channels: Y, X, B order as per decode_vardct_lf)
     // The decoder creates channels in order: [shrink_rect(1), shrink_rect(0), shrink_rect(2)]
     // which for non-subsampled is [Y_chan, X_chan, B_chan]
@@ -7151,7 +7023,6 @@ fn encode_lf_group_section(
     transform_map: &[u8],
     ytox_map: &[i32],
     ytob_map: &[i32],
-    extra_dc_precision: u32,
 ) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
 
@@ -7163,8 +7034,8 @@ fn encode_lf_group_section(
     assert_eq!(transform_map.len(), bw * bh);
 
     // === VarDCT LF: DC coefficients ===
-    // extra_precision (2 bits)
-    w.write(2, extra_dc_precision as u64)?;
+    // extra_precision = 0 (2 bits)
+    w.write(2, 0)?;
 
     // DC as modular (3 channels: Y, X, B order matching decoder's decode_vardct_lf)
     let npixels = gw * gh;
@@ -7602,9 +7473,7 @@ fn build_ans_distributions(
     cluster_frequencies
         .iter()
         .map(|freqs| {
-            // Try multiple shifts and pick the one with best total cost (header + data).
-            crate::encode::entropy::ans::AnsDistribution::from_frequencies_best(freqs)
-                .map(|(dist, _shift)| dist)
+            crate::encode::entropy::ans::AnsDistribution::from_frequencies(freqs)
                 .unwrap_or_else(|| crate::encode::entropy::ans::AnsDistribution::single_symbol(0))
         })
         .collect()
@@ -8149,7 +8018,6 @@ mod tests {
             bw,
             &ytox_map,
             &ytob_map,
-            0,
         );
 
         let simd = quantize_vardct_blocks_simd_assisted(
@@ -8167,7 +8035,6 @@ mod tests {
             bw,
             &ytox_map,
             &ytob_map,
-            0,
         );
 
         assert_eq!(scalar.dc_x, simd.dc_x);
@@ -10240,7 +10107,6 @@ mod tests {
                 bw,
                 &ytox_map,
                 &ytob_map,
-                0,
             );
 
             let mut transform_map = build_default_transform_map(bw, bh);
@@ -12241,112 +12107,4 @@ mod animation_tests {
             h
         );
     }
-}
-
-/// Decode a bare codestream to f32 RGB pixels. Returns (width, height, rgb_f32).
-/// Used for PSNR estimation during candidate selection.
-#[allow(dead_code)]
-fn decode_codestream_to_f32_rgb(codestream: &[u8]) -> Option<(usize, usize, Vec<f32>)> {
-    use crate::api::{
-        JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
-        ProcessingResult, states,
-    };
-    use crate::image::Image;
-
-    let options = JxlDecoderOptions::default();
-    let dec = JxlDecoder::<states::Initialized>::new(options);
-    let mut input: &[u8] = codestream;
-
-    // Advance to image info
-    let mut dec_img = loop {
-        match dec.process(&mut input) {
-            Ok(ProcessingResult::Complete { result }) => break result,
-            Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
-                if input.is_empty() { return None; }
-                return None;
-            }
-            Err(_) => return None,
-        }
-    };
-
-    let (w, h) = dec_img.basic_info().size;
-
-    // Request f32 pixel format
-    let default_fmt = dec_img.current_pixel_format().clone();
-    let req_fmt = JxlPixelFormat {
-        color_type: default_fmt.color_type,
-        color_data_format: Some(JxlDataFormat::f32()),
-        extra_channel_format: vec![],
-    };
-    dec_img.set_pixel_format(req_fmt);
-
-    let nc = dec_img.current_pixel_format().color_type.samples_per_pixel();
-    let mut img_buf = Image::new_with_value((w * nc, h), f32::NAN).ok()?;
-
-    let mut bufs = vec![JxlOutputBuffer::from_image_rect_mut(
-        img_buf.get_rect_mut(crate::image::Rect {
-            origin: (0, 0),
-            size: (w * nc, h),
-        }).into_raw(),
-    )];
-
-    // Advance to frame info
-    let mut dec_frame = loop {
-        match dec_img.process(&mut input) {
-            Ok(ProcessingResult::Complete { result }) => break result,
-            Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
-                if input.is_empty() { return None; }
-                dec_img = fallback;
-            }
-            Err(_) => return None,
-        }
-    };
-
-    // Decode pixels
-    loop {
-        match dec_frame.process(&mut input, &mut bufs) {
-            Ok(ProcessingResult::Complete { result: _dec_done }) => {
-                let mut rgb = Vec::with_capacity(w * h * 3);
-                for y in 0..h {
-                    let row = img_buf.row(y);
-                    for x in 0..w {
-                        rgb.push(row[x * nc]);
-                        rgb.push(row[x * nc + 1]);
-                        rgb.push(row[x * nc + 2]);
-                    }
-                }
-                return Some((w, h, rgb));
-            }
-            Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
-                if input.is_empty() { return None; }
-                dec_frame = fallback;
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
-/// Compute PSNR between source u8 RGB and decoded f32 RGB.
-#[allow(dead_code)]
-fn compute_psnr_from_decoded(
-    src_rgb: &[u8],
-    decoded_rgb_f32: &[f32],
-    width: usize,
-    height: usize,
-) -> f32 {
-    let npixels = width * height * 3;
-    if src_rgb.len() != npixels || decoded_rgb_f32.len() != npixels {
-        return 0.0;
-    }
-    let mut sse: f64 = 0.0;
-    for i in 0..npixels {
-        let dec_u8 = (decoded_rgb_f32[i] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-        let diff = src_rgb[i] as f64 - dec_u8 as f64;
-        sse += diff * diff;
-    }
-    let mse = sse / npixels as f64;
-    if mse < 1e-12 {
-        return 99.0;
-    }
-    (10.0 * ((255.0 * 255.0) / mse).log10()) as f32
 }
