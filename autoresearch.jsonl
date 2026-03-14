@@ -117,3 +117,5 @@
 {"run":45,"commit":"995f8fe","metric":1.958,"metrics":{},"status":"keep","description":"Steady state parity 1.96. Root cause: 29% entropy overhead from FP coefficient differences vs libjxl","timestamp":1773448728941,"segment":0}
 {"run":46,"commit":"995f8fe","metric":3.374,"metrics":{},"status":"discard","description":"Dead zone 0.55 (was 0.50): -0.46 dB PSNR, parity 3.37","timestamp":1773448817419,"segment":0}
 {"run":47,"commit":"995f8fe","metric":63.537,"metrics":{},"status":"crash","description":"Dead zone 0.45: broken rounding logic, massive PSNR loss","timestamp":1773448900952,"segment":0}
+{"run":48,"commit":"2d3aadc","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.96 stable after 47 experiments. Key wins: greedy clustering (-15%), HF metadata prediction (-3%), entropy-optimal ANS normalization","timestamp":1773448984943,"segment":0}
+{"run":49,"commit":"2d3aadc","metric":2.972,"metrics":{},"status":"discard","description":"Per-candidate ep (softer=ep2, others=ep1): worse parity 2.97, mixed ep hurts","timestamp":1773449066875,"segment":0}
