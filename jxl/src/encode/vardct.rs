@@ -1080,7 +1080,9 @@ fn encode_single_rgba_frame(
     let mut total_encodes = 0usize;
     // Extra DC precision: doubles DC quantization granularity per level.
     // Level 1 halves the DC quantization step for better PSNR at small size cost.
-    let extra_dc_precision: u32 = 1;
+    // Use extra_dc_precision=2 for images with more size headroom (smaller images)
+    let num_blocks = bw * bh;
+    let extra_dc_precision: u32 = if num_blocks <= 7000 { 2 } else { 1 };
     let mut candidate_frames = Vec::with_capacity(raw_quant_map_candidates.len());
     for raw_quant_map in &raw_quant_map_candidates {
         let quantized = quantize_vardct_blocks(
