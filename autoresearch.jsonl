@@ -111,3 +111,5 @@
 {"run":39,"commit":"a145a75","metric":1.958,"metrics":{},"status":"discard","description":"Competitive ep=1/2: ep=1 always wins size, same parity, 75% slower","timestamp":1773447503688,"segment":0}
 {"run":40,"commit":"a145a75","metric":1.973,"metrics":{},"status":"discard","description":"Content-adaptive ep: ep=2 for photos, ep=1 for graphics: parity 1.97, zoltan too big","timestamp":1773447591128,"segment":0}
 {"run":41,"commit":"d075962","metric":1.958,"metrics":{},"status":"keep","description":"Entropy-optimal ANS frequency normalization: 0.002% smaller, same parity","timestamp":1773447697419,"segment":0}
+{"run":42,"commit":"85b91bd","metric":1.958,"metrics":{},"status":"keep","description":"ANS shift 12 (was 13): no change, both produce identical output","timestamp":1773447896277,"segment":0}
+{"run":43,"commit":"2a6bfa3","metric":1.958,"metrics":{},"status":"discard","description":"Lower greedy clustering threshold 24 (was 48): no change, cluster counts already explored","timestamp":1773448076796,"segment":0}
