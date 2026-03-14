@@ -110,3 +110,4 @@
 {"run":38,"commit":"a145a75","metric":1.973,"metrics":{},"status":"discard","description":"extra_dc_precision=2: parity 1.97 (+0.8%), PSNR +0.70 but max_size +0.45%","timestamp":1773447399147,"segment":0}
 {"run":39,"commit":"a145a75","metric":1.958,"metrics":{},"status":"discard","description":"Competitive ep=1/2: ep=1 always wins size, same parity, 75% slower","timestamp":1773447503688,"segment":0}
 {"run":40,"commit":"a145a75","metric":1.973,"metrics":{},"status":"discard","description":"Content-adaptive ep: ep=2 for photos, ep=1 for graphics: parity 1.97, zoltan too big","timestamp":1773447591128,"segment":0}
+{"run":41,"commit":"d075962","metric":1.958,"metrics":{},"status":"keep","description":"Entropy-optimal ANS frequency normalization: 0.002% smaller, same parity","timestamp":1773447697419,"segment":0}

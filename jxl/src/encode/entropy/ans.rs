@@ -215,8 +215,10 @@ fn write_ans_distribution_complex(
     let alphabet_size = dist.alphabet_size;
     assert!(alphabet_size >= 3);
 
-    // Use max shift for full precision
-    let shift: i16 = 13;
+    // Use shift=12 (= ANS_LOG_TAB_SIZE). This gives full precision since
+    // our frequencies sum to 4096 = 2^12. Shift 13 would add 1 extra bit per
+    // frequency for no benefit.
+    let shift: i16 = 12;
     // Encode shift: variable-length code
     // Decode formula: read unary len (0..3), then shift = (1<<len) - 1 + read(len)
     // shift=13 -> len=3, rem = 13 - 7 = 6
