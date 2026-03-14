@@ -1301,7 +1301,7 @@ struct QuantizedVardct {
 /// Actual factors: base_correlation_x + x_factor/84 for X, base_correlation_b + b_factor/84 for B.
 /// libjxl's towards_zero shrinkage for CfL multipliers.
 /// Reduces oscillations by pulling small values to zero.
-const TOWARDS_ZERO: f64 = 2.5;
+const TOWARDS_ZERO: f64 = 2.0;
 
 /// Approximate quantization weights for CfL regression.
 /// libjxl multiplies DCT coefficients by q * inv_dequant_matrix[k].
