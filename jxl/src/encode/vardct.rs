@@ -1717,6 +1717,10 @@ fn quantize_vardct_blocks(
         let ytox_ratio = x_factor as f32 / K_COLOR_FACTOR;
         let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
 
+        // Per-tile adaptive b_dm: larger |ytob| -> finer B quant to compensate Y->B error
+        let ytob_abs = (b_factor as f32 / K_COLOR_FACTOR).abs();
+        let tile_b_dm = b_dm_multiplier * (1.0 - 0.05 * ytob_abs.min(1.0));
+
         // DC: apply CfL decorrelation and proper DC quantization.
         let raw_dc_x = dct_x[blk * 64];
         let raw_dc_y = dct_y[blk * 64];
@@ -1736,7 +1740,7 @@ fn quantize_vardct_blocks(
         for k in 1..64 {
             let dw_x = dequant_weights[k] * x_dm_multiplier;
             let dw_y = dequant_weights[64 + k];
-            let dw_b = dequant_weights[128 + k] * b_dm_multiplier;
+            let dw_b = dequant_weights[128 + k] * tile_b_dm;
 
             let ac_x = dct_x[blk * 64 + k] - ytox_ratio * dct_y[blk * 64 + k];
             let ac_y = dct_y[blk * 64 + k];
@@ -1797,6 +1801,10 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
         let ytox_ratio = x_factor as f32 / K_COLOR_FACTOR;
         let ytob_ratio = 1.0 + b_factor as f32 / K_COLOR_FACTOR;
 
+        // Per-tile adaptive b_dm: larger |ytob| -> finer B quant to compensate Y->B error
+        let ytob_abs = (b_factor as f32 / K_COLOR_FACTOR).abs();
+        let tile_b_dm = b_dm_multiplier * (1.0 - 0.05 * ytob_abs.min(1.0));
+
         let raw_dc_x = dct_x[blk * 64];
         let raw_dc_y = dct_y[blk * 64];
         let raw_dc_b = dct_b[blk * 64];
@@ -1834,7 +1842,7 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
                 tmp_b[lane] = dct_b[blk_off + k];
                 tmp_dwx[lane] = dequant_weights[k] * x_dm_multiplier;
                 tmp_dwy[lane] = dequant_weights[64 + k];
-                tmp_dwb[lane] = dequant_weights[128 + k] * b_dm_multiplier;
+                tmp_dwb[lane] = dequant_weights[128 + k] * tile_b_dm;
             }
             for lane in chunk..lanes {
                 tmp_x[lane] = 0.0;
