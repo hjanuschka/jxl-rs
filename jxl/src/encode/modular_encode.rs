@@ -482,6 +482,96 @@ pub fn write_modular_section_ans_perchannel(
     Ok(())
 }
 
+/// Write a per-channel ANS modular section where each channel can use a different predictor.
+///
+/// `predictors` has one predictor per channel. `signed_residuals` has pre-computed
+/// residuals for each channel (channel_size values per channel, concatenated).
+pub fn write_modular_section_ans_perchannel_diff_pred(
+    writer: &mut BitWriter,
+    predictors: &[u32],
+    signed_residuals: &[i32],
+    num_channels: usize,
+    channel_size: usize,
+    uint_config: HybridUintConfig,
+) -> Result<()> {
+    assert_eq!(predictors.len(), num_channels);
+    assert_eq!(signed_residuals.len(), num_channels * channel_size);
+
+    if num_channels < 2 {
+        return write_modular_section_ans(
+            writer, 0, predictors[0], signed_residuals, uint_config, false,
+        );
+    }
+
+    write_minimal_group_header(writer, false)?;
+
+    // Multi-leaf tree: one leaf per channel, each with its own predictor
+    let leaves: Vec<(i32, u32)> = predictors.iter().map(|&p| (0i32, p)).collect();
+    let (tree_stream, leaf_id_to_channel) = build_tree_token_stream_multi(&leaves)?;
+    let tree_context_map = [0u8; 6];
+    write_huffman_histograms(
+        writer,
+        &tree_context_map,
+        &[tree_stream.uint_config],
+        &[tree_stream.code.clone()],
+    )?;
+    write_token_stream(writer, &tree_stream)?;
+
+    let mut channel_to_leaf_id = vec![0usize; num_channels];
+    for (leaf_id, &ch) in leaf_id_to_channel.iter().enumerate() {
+        channel_to_leaf_id[ch] = leaf_id;
+    }
+
+    let mut leaf_dists: Vec<AnsDistribution> = Vec::with_capacity(num_channels);
+    let mut all_tokens: Vec<AnsToken> = Vec::new();
+    let mut leaf_freqs: Vec<Vec<u64>> = vec![Vec::new(); num_channels];
+    let mut leaf_encoded: Vec<Vec<HybridUintEncoded>> = vec![Vec::new(); num_channels];
+
+    for ch in 0..num_channels {
+        let leaf_id = channel_to_leaf_id[ch];
+        let ch_data = &signed_residuals[ch * channel_size..(ch + 1) * channel_size];
+        let encoded: Vec<HybridUintEncoded> = ch_data
+            .iter()
+            .map(|&v| uint_config.encode(pack_signed(v)))
+            .collect();
+        let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
+        let alphabet_size = (max_token as usize + 1).max(1);
+        if leaf_freqs[leaf_id].len() < alphabet_size {
+            leaf_freqs[leaf_id].resize(alphabet_size, 0);
+        }
+        for enc in &encoded {
+            leaf_freqs[leaf_id][enc.token as usize] += 1;
+        }
+        leaf_encoded[leaf_id] = encoded;
+    }
+
+    for leaf_id in 0..num_channels {
+        let dist = AnsDistribution::from_frequencies_best(&leaf_freqs[leaf_id])
+            .map(|(d, _)| d)
+            .ok_or(Error::InvalidAnsHistogram)?;
+        leaf_dists.push(dist);
+    }
+
+    for ch in 0..num_channels {
+        let leaf_id = channel_to_leaf_id[ch];
+        for enc in &leaf_encoded[leaf_id] {
+            all_tokens.push(AnsToken {
+                symbol: enc.token,
+                cluster: leaf_id,
+                extra_bits: enc.extra_bits,
+                extra_nbits: enc.nbits as usize,
+            });
+        }
+    }
+
+    let context_map: Vec<u8> = (0..num_channels as u8).collect();
+    let uint_configs_vec: Vec<HybridUintConfig> = vec![uint_config; num_channels];
+    write_ans_histograms(writer, &context_map, &uint_configs_vec, &leaf_dists)?;
+    write_ans_stream(writer, &leaf_dists, &all_tokens)?;
+
+    Ok(())
+}
+
 /// Write LF global section with histogram-driven tree + residual encoding.
 ///
 /// For single-group images, also includes the residual data.
@@ -767,7 +857,181 @@ pub fn encode_modular_signed_stream(
         }
     }
 
-    if best_use_ans && best_perchannel {
+    // Try per-channel predictor selection (different predictor per channel)
+    let mut best_diffpred = false;
+    if num_channels > 1 && data.len() >= 256 {
+        // Find best predictor per channel by L1 residual score
+        let predictor_options: &[u32] = &[0, 1, 2, 3, 4, 5];
+        let mut per_ch_preds = vec![0u32; num_channels];
+        let mut per_ch_residuals = Vec::with_capacity(data.len());
+        let mut any_diff = false;
+
+        for c in 0..num_channels {
+            let ch = &data[c * channel_size..(c + 1) * channel_size];
+            let mut best_p = 0u32;
+            let mut best_l1 = u64::MAX;
+            for &p in predictor_options {
+                let l1: u64 = (0..channel_size).map(|i| {
+                    let x = i % width;
+                    let y = i / width;
+                    let left = if x > 0 { ch[y * width + x - 1] }
+                               else if y > 0 { ch[(y - 1) * width] }
+                               else { 0 };
+                    let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
+                    let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
+                                  else { left };
+                    let pred = match p {
+                        1 => left as i64,
+                        2 => top as i64,
+                        3 => (left as i64 + top as i64) / 2,
+                        4 => {
+                            let pp = left as i64 + top as i64 - topleft as i64;
+                            if (pp - left as i64).abs() < (pp - top as i64).abs() { left as i64 } else { top as i64 }
+                        }
+                        5 => {
+                            let (l, t, tl) = (left as i64, top as i64, topleft as i64);
+                            let mn = l.min(t); let mx = l.max(t);
+                            let g = l + t - tl;
+                            let gc = if tl < mn { mx } else { g };
+                            if tl > mx { mn } else { gc }
+                        }
+                        _ => 0,
+                    };
+                    (ch[i] as i64 - pred).unsigned_abs()
+                }).sum();
+                if l1 < best_l1 { best_l1 = l1; best_p = p; }
+            }
+            per_ch_preds[c] = best_p;
+            if c > 0 && best_p != per_ch_preds[0] { any_diff = true; }
+        }
+
+        // Only try if channels actually want different predictors
+        if any_diff {
+            // Build residuals for each channel with its best predictor
+            for c in 0..num_channels {
+                let ch = &data[c * channel_size..(c + 1) * channel_size];
+                let p = per_ch_preds[c];
+                for i in 0..channel_size {
+                    let x = i % width;
+                    let y = i / width;
+                    let left = if x > 0 { ch[y * width + x - 1] }
+                               else if y > 0 { ch[(y - 1) * width] }
+                               else { 0 };
+                    let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
+                    let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
+                                  else { left };
+                    let pred = match p {
+                        1 => left,
+                        2 => top,
+                        3 => ((left as i64 + top as i64) / 2) as i32,
+                        4 => {
+                            let pp = left as i64 + top as i64 - topleft as i64;
+                            if (pp - left as i64).abs() < (pp - top as i64).abs() { left } else { top }
+                        }
+                        5 => {
+                            let (l, t, tl) = (left as i64, top as i64, topleft as i64);
+                            let mn = l.min(t); let mx = l.max(t);
+                            let g = l + t - tl;
+                            let gc = if tl < mn { mx } else { g };
+                            (if tl > mx { mn } else { gc }) as i32
+                        }
+                        _ => 0,
+                    };
+                    per_ch_residuals.push(ch[i] - pred);
+                }
+            }
+
+            let mut tmp_dp = BitWriter::new();
+            if write_modular_section_ans_perchannel_diff_pred(
+                &mut tmp_dp, &per_ch_preds, &per_ch_residuals,
+                num_channels, channel_size, uint_config,
+            ).is_ok() {
+                let sz_dp = tmp_dp.finish().len();
+                if sz_dp < best_size {
+                    best_size = sz_dp;
+                    best_use_ans = true;
+                    best_perchannel = true;
+                    best_diffpred = true;
+                }
+            }
+        }
+    }
+
+    if best_diffpred {
+        // Re-compute per-channel residuals (we consumed them above for sizing)
+        let predictor_options: &[u32] = &[0, 1, 2, 3, 4, 5];
+        let mut per_ch_preds = vec![0u32; num_channels];
+        let mut per_ch_residuals = Vec::with_capacity(data.len());
+        for c in 0..num_channels {
+            let ch = &data[c * channel_size..(c + 1) * channel_size];
+            let mut best_p = 0u32;
+            let mut best_l1 = u64::MAX;
+            for &p in predictor_options {
+                let l1: u64 = (0..channel_size).map(|i| {
+                    let x = i % width;
+                    let y = i / width;
+                    let left = if x > 0 { ch[y * width + x - 1] }
+                               else if y > 0 { ch[(y - 1) * width] }
+                               else { 0 };
+                    let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
+                    let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
+                                  else { left };
+                    let pred = match p {
+                        1 => left as i64,
+                        2 => top as i64,
+                        3 => (left as i64 + top as i64) / 2,
+                        4 => {
+                            let pp = left as i64 + top as i64 - topleft as i64;
+                            if (pp - left as i64).abs() < (pp - top as i64).abs() { left as i64 } else { top as i64 }
+                        }
+                        5 => {
+                            let (l, t, tl) = (left as i64, top as i64, topleft as i64);
+                            let mn = l.min(t); let mx = l.max(t);
+                            let g = l + t - tl;
+                            let gc = if tl < mn { mx } else { g };
+                            if tl > mx { mn } else { gc }
+                        }
+                        _ => 0,
+                    };
+                    (ch[i] as i64 - pred).unsigned_abs()
+                }).sum();
+                if l1 < best_l1 { best_l1 = l1; best_p = p; }
+            }
+            per_ch_preds[c] = best_p;
+            for i in 0..channel_size {
+                let x = i % width;
+                let y = i / width;
+                let left = if x > 0 { ch[y * width + x - 1] }
+                           else if y > 0 { ch[(y - 1) * width] }
+                           else { 0 };
+                let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
+                let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
+                              else { left };
+                let pred = match best_p {
+                    1 => left,
+                    2 => top,
+                    3 => ((left as i64 + top as i64) / 2) as i32,
+                    4 => {
+                        let pp = left as i64 + top as i64 - topleft as i64;
+                        if (pp - left as i64).abs() < (pp - top as i64).abs() { left } else { top }
+                    }
+                    5 => {
+                        let (l, t, tl) = (left as i64, top as i64, topleft as i64);
+                        let mn = l.min(t); let mx = l.max(t);
+                        let g = l + t - tl;
+                        let gc = if tl < mn { mx } else { g };
+                        (if tl > mx { mn } else { gc }) as i32
+                    }
+                    _ => 0,
+                };
+                per_ch_residuals.push(ch[i] - pred);
+            }
+        }
+        write_modular_section_ans_perchannel_diff_pred(
+            writer, &per_ch_preds, &per_ch_residuals,
+            num_channels, channel_size, uint_config,
+        )
+    } else if best_use_ans && best_perchannel {
         write_modular_section_ans_perchannel(
             writer,
             best_predictor,
