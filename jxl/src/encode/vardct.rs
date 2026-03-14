@@ -1056,7 +1056,7 @@ fn encode_single_rgba_frame(
     let dequant_weights = default_dct8x8_dequant_weights();
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
-    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, optimal with EPF weights
+    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, optimal
     let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // optimal with EPF weights
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
@@ -5587,8 +5587,7 @@ fn encode_vardct_frame_inner(
         {
             vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0); num_passes]
         } else {
-            // Match libjxl default: (4, 2, 0) puts more MSBs in token for
-            // better ANS distribution modeling of AC coefficients.
+            // (4, 2, 0) puts more MSBs in token, optimal for AC coeff distributions
             vec![crate::encode::entropy::HybridUintConfig::new(4, 2, 0)]
         };
         let all_encoded_passes: Vec<Vec<Vec<crate::encode::entropy::HybridUintEncoded>>> =
@@ -6688,7 +6687,7 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     // Custom EPF weights: boost chroma channel smoothing for better chroma PSNR
     writer.write(1, 1)?; // epf_weight_custom = true
     writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[0] = 5.0 (Y, optimal)
-    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, optimal)
+    writer.write(16, f32_to_f16_bits(5.5))?;  // epf_channel_scale[1] = 5.5 (X, slight increase)
     writer.write(16, f32_to_f16_bits(2.0))?;  // epf_channel_scale[2] = 2.0 (B, optimal)
     writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
     writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)

@@ -1,57 +1,54 @@
 # Autoresearch Ideas (deferred)
 
 ## Current status
-- Best parity_score: **1.609** (756 experiments)
+- Best parity_score: **1.600** (770 experiments)
+- Improvement: 2.380 -> 1.600 (-32.8%)
 - Best configuration:
   - `TOWARDS_ZERO = 2.965` (CfL shrink)
   - Merge multipliers: rect=4.0, 16x16=5.5, 32x32=7.0
-  - `b_dm_multiplier = 0.94` (retuned with EPF weights)
-  - `x_dm_multiplier *= 0.97` (new, 0.776 effective)
+  - `b_dm_multiplier = 0.94`
+  - `x_dm_multiplier *= 0.97` (0.776 effective)
   - `epf_iters = 2`
-  - Custom EPF weights: Y=5.0, X=5.0, B=2.0 (NEW: reduced Y and B)
+  - Custom EPF weights: Y=5.0, X=5.0, B=2.0
+  - `quant_lf = base + 1` (finer DC quantization)
   - `extra_dc_precision = 1`
 
-## Remaining penalty breakdown (estimated)
-- kodim08: ~5.5 pen (-0.275 dB PSNR gap)
-- kodim13: ~2.5 pen (~-0.12 dB PSNR gap)
-- kodim01/zoltan/Webkit: 0 pen
+## Key metrics
+- mean_size: -7.9%, max_size: -0.03% (VERY tight!)
+- mean_psnr_gap: +0.34 dB, worst: -0.27 dB (kodim08)
 
-## Exhaustively confirmed (DO NOT RETRY)
-### EPF weights
-- Y: 5.0 optimal (tested 3-40, flat below 10)
-- X: 5.0 optimal (3.5 and 6.0 both worse)
-- B: 2.0 optimal (1.0, 1.5, 1.75, 2.5, 3.5 all worse)
-- zeroflush params: no effect
-- EPF sigma quant_mul: 0.50 and 0.55 both worse (over-smoothing)
-- EPF sharpness map: NO effect on djxl output (encoding bug?)
+## Remaining penalty
+- kodim08: ~5.5 pen (-0.27 dB: B=-0.414, R=-0.198, G=-0.036)
+- kodim13: ~2.5 pen (~-0.10 dB: B=-0.220, R=-0.054, G=+0.131)
 
-### Quantization
-- b_dm_multiplier: 0.94 optimal with EPF weights (0.91-0.95 tested)
-- x_dm_multiplier: 0.97 optimal (0.95 overshoots size, 0.975/1.0 worse parity)
-- Dead zones: always worse (0.505, 0.535, 0.465 all bad)
-- AdjustQuantBias-aware rounding: more nonzeros, worse parity
-- quant_ac, rq candidates: no effect (uniform always wins)
-- ep=2: great PSNR (+0.73 avg) but zoltan overshoots by +0.72%
-- ep=2 + harder rq=7: still overshoots
-
-### CfL / color
-- CfL shrink: 2.965 optimal (tested 2.2-3.2, stable across EPF changes)
-- Separate B vs X CfL shrink: always worse
-- CfL dist_mul, B base-correlation: confirmed bad
-- Gaborish weight mismatch: catastrophic (encoder/decoder must match)
-- Inverse gab B-weight reduction: introduces systematic error
-
-### Other
+## Exhaustively confirmed DO NOT RETRY
+### EPF weights (15 experiments)
+- Y: 5.0 (3-40 tested, plateau at 3-10)
+- X: 5.0 (3.5, 4.0, 4.5, 6.0 all worse)
+- B: 2.0 (1.0-2.5 tested, 2.0 optimal)
+- zeroflush: no effect
+- sigma quant_mul: 0.50/0.55 worse
+### Dequant multipliers (8 experiments)
+- b_dm: 0.94 (0.91-0.95, stable across configs)
+- x_dm*0.97 optimal (0.95 overshoots, 0.975/0.98/1.0 worse)
+- Freq-dependent B: no effect (steps too coarse)
+### Quantization (12 experiments)
+- quant_lf+1 optimal (+2 overshoots one image)
+- ep=2: always overshoots even with harder rq
+- Dead zones: always worse
+- AdjustQuantBias rounding: always worse
+### CfL (8 experiments)
+- shrink=2.965 stable
+- B reg 0.3: no effect
+- Separate B/X shrink: worse
+### Other (6 experiments)
+- Gab weight changes: catastrophic without inv-gab match
+- Custom coeff orders: no gain
+- HybridUint(4,1,2) for modular/AC: slightly worse than (4,2,0)
 - ANS shift [0,3,6,9,12]: no gain
-- Merge multipliers: saturated
-- AQ map modifications: never selected (uniform wins)
 
-## Only remaining paths
-1. **LZ77 for modular DC streams** -- save ~1% bytes, could make ep=2 viable
-   for zoltan without size overshoot
-2. **Fix EPF sharpness map encoding bug** -- if fixed, per-block sharpness
-   could help kodim08/13 specifically
-3. **Custom dequant weight tables** -- signal different HF weight shapes to
-   decoder (F16 writer now available). Could better match our quantization grid
-4. **Dual-pass Y-roundtrip + CfL refit** -- very high effort but addresses
-   root cause of chroma gap
+## Only remaining paths (ALL high effort, likely diminishing returns)
+1. **LZ77 for modular DC** -- save ~0.5-1% on DC streams
+2. **Fix EPF sharpness map** -- bug investigation
+3. **ANS RebalanceHistogram** -- marginal entropy improvement
+4. **Custom dequant weight tables** -- F16 writer exists but complex
