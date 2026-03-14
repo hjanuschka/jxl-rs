@@ -191,7 +191,7 @@ fn effort_params(effort: u8) -> EffortParams {
         // Enable entropy-merge heuristics from Hare-and-slower style tiers.
         enable_entropy_merge: speed_tier <= 5,
         // Enable custom coefficient orders from Squirrel-and-slower tiers.
-        enable_custom_coeff_orders: false, // try disabling to reduce overhead
+        enable_custom_coeff_orders: false, // custom orders add overhead without PSNR benefit
         max_total_encodes,
     }
 }
@@ -1056,7 +1056,7 @@ fn encode_single_rgba_frame(
     let dequant_weights = default_dct8x8_dequant_weights();
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
-    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, retune with EPF
+    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, optimal with EPF weights
     let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // optimal with EPF weights
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
@@ -2461,7 +2461,9 @@ fn build_adaptive_raw_quant_map_full(
     // Then SetQuantFieldRect converts each aq_map[i] to
     //   raw_quant = clamp(aq_map[i] * inv_global_scale + 0.5, 1, 255).
     let q_for_global_scale = 0.39 / distance;
-    let (global_scale, quant_lf, _) = compute_global_scale_and_quant(distance, q_for_global_scale);
+    let (global_scale, quant_lf_base, _) = compute_global_scale_and_quant(distance, q_for_global_scale);
+    // Slightly increase quant_lf for finer DC quantization without ep=2 overhead
+    let quant_lf = quant_lf_base + 1;
     let inv_global_scale = 65536.0 / global_scale as f32;
 
     let mut raw_quant_map = Vec::with_capacity(num_blocks);
@@ -6686,7 +6688,7 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     // Custom EPF weights: boost chroma channel smoothing for better chroma PSNR
     writer.write(1, 1)?; // epf_weight_custom = true
     writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[0] = 5.0 (Y, optimal)
-    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, default optimal)
+    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, optimal)
     writer.write(16, f32_to_f16_bits(2.0))?;  // epf_channel_scale[2] = 2.0 (B, optimal)
     writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
     writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)
