@@ -1,63 +1,57 @@
 # Autoresearch Ideas (deferred)
 
 ## Current status
-- Best parity_score: **1.726066** (714 experiments)
-- Best configuration (stable, heavily tuned):
+- Best parity_score: **1.609** (756 experiments)
+- Best configuration:
   - `TOWARDS_ZERO = 2.965` (CfL shrink)
   - Merge multipliers: rect=4.0, 16x16=5.5, 32x32=7.0
-  - `b_dm_multiplier = 0.93`
-  - `epf_iters = 2` (confirmed optimal, better than libjxl's 1)
+  - `b_dm_multiplier = 0.94` (retuned with EPF weights)
+  - `x_dm_multiplier *= 0.97` (new, 0.776 effective)
+  - `epf_iters = 2`
+  - Custom EPF weights: Y=5.0, X=5.0, B=2.0 (NEW: reduced Y and B)
   - `extra_dc_precision = 1`
 
-## Remaining penalty
-- kodim08: ~5.75 pen (-0.29 dB, B:-0.43 R:-0.24 G:-0.04)
-- kodim13: ~3.25 pen (-0.16 dB, B:-0.24 R:-0.07 G:+0.14)
+## Remaining penalty breakdown (estimated)
+- kodim08: ~5.5 pen (-0.275 dB PSNR gap)
+- kodim13: ~2.5 pen (~-0.12 dB PSNR gap)
+- kodim01/zoltan/Webkit: 0 pen
 
 ## Exhaustively confirmed (DO NOT RETRY)
+### EPF weights
+- Y: 5.0 optimal (tested 3-40, flat below 10)
+- X: 5.0 optimal (3.5 and 6.0 both worse)
+- B: 2.0 optimal (1.0, 1.5, 1.75, 2.5, 3.5 all worse)
+- zeroflush params: no effect
+- EPF sigma quant_mul: 0.50 and 0.55 both worse (over-smoothing)
+- EPF sharpness map: NO effect on djxl output (encoding bug?)
+
 ### Quantization
-- Dead zones (0.505, 0.535, libjxl 0.56/0.62 quadrant): always worse
-- AdjustQuantBias-aware rounding (0.465/1.429 boundaries): more nonzeros, worse parity
-- quant_ac multipliers (1.25-1.35): no effect (rq integers unchanged)
-- Finer/coarser uniform rq candidates: finer too large, coarser too lossy
-- Finer adaptive map (+1 rq per block): always loses size selection
-- Y-roundtrip quantization: regresses (CfL factors fitted to original Y)
+- b_dm_multiplier: 0.94 optimal with EPF weights (0.91-0.95 tested)
+- x_dm_multiplier: 0.97 optimal (0.95 overshoots size, 0.975/1.0 worse parity)
+- Dead zones: always worse (0.505, 0.535, 0.465 all bad)
+- AdjustQuantBias-aware rounding: more nonzeros, worse parity
+- quant_ac, rq candidates: no effect (uniform always wins)
+- ep=2: great PSNR (+0.73 avg) but zoltan overshoots by +0.72%
+- ep=2 + harder rq=7: still overshoots
 
 ### CfL / color
-- CfL shrink: 2.965 optimal (tested 2.2-3.2 at 0.001 granularity)
-- Separate B vs X CfL shrink: always worse than unified
-- CfL dist_mul: no gain at 8e-4 or 1.2e-3
-- CfL B base-correlation: 0.98 and 1.02 both strongly regressive
-- b_dm_multiplier: 0.93 optimal (0.80-0.97 tested)
-- x_dm_multiplier: any deviation from 0.8 worsens parity
+- CfL shrink: 2.965 optimal (tested 2.2-3.2, stable across EPF changes)
+- Separate B vs X CfL shrink: always worse
+- CfL dist_mul, B base-correlation: confirmed bad
+- Gaborish weight mismatch: catastrophic (encoder/decoder must match)
+- Inverse gab B-weight reduction: introduces systematic error
 
-### Entropy
-- HybridUint configs beyond kFast: no improvement
-- ANS shift candidates [0,3,6,9,12]: no gain over [0,6,12]
-- Dual-gs candidate system: no effect, only slower
+### Other
+- ANS shift [0,3,6,9,12]: no gain
+- Merge multipliers: saturated
+- AQ map modifications: never selected (uniform wins)
 
-### Loop filter
-- EPF: iters=2 optimal (1 and 3 both worse)
-- EPF sharpness map: has NO effect on djxl output (possible encoding bug)
-- EPF sigma custom: crashed (needs F16 writer)
-
-### Merge / transform
-- Merge multipliers saturated at rect=4.0, 16=5.5, 32=7.0
-- extra_dc_precision=2: always size overshoot
-- Decode-based candidate selection: over-picks large candidates
-
-## Root cause
-The chroma PSNR gap is structural: our gs=5111 (from 0.39/d AQ) vs libjxl's
-gs=8813 (from 0.79/d) produces different quantization steps. Our finer steps
-create more nonzeros (smaller files) but each coefficient overshoots more
-(worse PSNR on R/B channels).
-
-## Only remaining paths (HIGH effort)
-1. **Fix EPF sharpness encoding** -- it has zero effect currently, suggesting a
-   bug. If fixed, adaptive sharpness could help chroma PSNR on photo blocks.
-2. **LZ77 for modular streams** -- could save 1-3% bytes, making ep=2 viable.
-3. **Dual-pass encoding with Y-roundtrip + CfL refit** -- quantize Y, compute
-   CfL from dequantized Y, then quantize X/B. Requires refitting CfL maps
-   per-candidate (chicken-and-egg: CfL depends on Y quant, Y quant depends on
-   candidate). High implementation complexity.
-4. **Custom dequant weights** -- signal slightly different weight tables to
-   decoder. Requires F16 writing support for frame header fields.
+## Only remaining paths
+1. **LZ77 for modular DC streams** -- save ~1% bytes, could make ep=2 viable
+   for zoltan without size overshoot
+2. **Fix EPF sharpness map encoding bug** -- if fixed, per-block sharpness
+   could help kodim08/13 specifically
+3. **Custom dequant weight tables** -- signal different HF weight shapes to
+   decoder (F16 writer now available). Could better match our quantization grid
+4. **Dual-pass Y-roundtrip + CfL refit** -- very high effort but addresses
+   root cause of chroma gap
