@@ -1056,8 +1056,8 @@ fn encode_single_rgba_frame(
     let dequant_weights = default_dct8x8_dequant_weights();
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
-    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0); // = 0.8
-    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // default=1.0, try 0.94 with new EPF
+    let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, retune with EPF
+    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // optimal with EPF weights
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
