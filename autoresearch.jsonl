@@ -173,3 +173,4 @@
 {"run":101,"commit":"8dc0b15","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.958 stable. Continuing loop at optimization plateau.","timestamp":1773457479025,"segment":0}
 {"run":102,"commit":"8dc0b15","metric":4.494,"metrics":{},"status":"discard","description":"Content-adaptive gs (0.50 for photos, 0.39 for graphics): +0.37 dB mean but +5.2% max size","timestamp":1773457736290,"segment":0}
 {"run":103,"commit":"8dc0b15","metric":2.861,"metrics":{},"status":"discard","description":"Decode-PSNR selection with 6% budget: +4.5% max size, PSNR unchanged. Wrong candidates picked.","timestamp":1773457891111,"segment":0}
+{"run":104,"commit":"74fc62d","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.958 (103 experiments). All parameter-level optimizations exhausted. Need architectural changes.","timestamp":1773457956935,"segment":0}
