@@ -3990,8 +3990,8 @@ fn build_entropy_merge_transform_map(
     // Entropy multipliers: without libjxl's perceptual loss term working,
     // we use high multipliers to avoid quality-destroying merges.
     // PSNR parity with libjxl is the priority over file size.
-    let entropy_mul_16 = 3.7f32;
-    let entropy_mul_32 = 4.7f32;
+    let entropy_mul_16 = 4.0f32;
+    let entropy_mul_32 = 5.0f32;
 
     // Pre-allocated buffers for forward transform hot path.
     // Reused across all block evaluations to avoid ~54K heap allocations.
@@ -4061,7 +4061,7 @@ fn build_entropy_merge_transform_map(
     // Phase 0.5: DCT16x8 / DCT8x16 rectangular merges (pairs of 8x8 blocks).
     // These are common in libjxl and help in areas smooth in one direction.
     let dct8x16_weights = crate::frame::quant_weights::DequantMatrices::get_library_table(6);
-    let entropy_mul_rect = 2.8f32; // Conservative multiplier for rect merges
+    let entropy_mul_rect = 3.0f32; // Conservative multiplier for rect merges
 
     // DCT16X8 (id=6): 16 rows x 8 cols = 1 block wide, 2 blocks tall
     // Merge 2 vertically adjacent blocks (must not cross group boundaries)
