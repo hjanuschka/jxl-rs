@@ -58,31 +58,50 @@ impl AnsDistribution {
             }
         }
 
-        // Adjust to hit exactly SUM_PROBS
+        // Adjust to hit exactly SUM_PROBS using entropy-optimal greedy adjustment.
+        // For each ±1 step, pick the symbol where the adjustment minimizes
+        // cross-entropy: cost = raw_count * log2(SUM_PROBS / freq).
+        // Increasing freq reduces cost; decreasing increases cost.
         while assigned != SUM_PROBS {
             if assigned > SUM_PROBS {
-                // Find the symbol with the largest frequency and reduce it
-                let max_idx = freqs
+                // Need to decrease some freq by 1. Pick the symbol where
+                // decreasing hurts least: minimize raw_count * (log(freq) - log(freq-1))
+                let best = freqs
                     .iter()
                     .enumerate()
                     .filter(|&(_, &f)| f > 1)
-                    .max_by_key(|&(_, &f)| f)
+                    .min_by(|&(i, &fi), &(j, &fj)| {
+                        // Cost increase of decreasing fi by 1:
+                        // raw_freqs[i] * log2(fi / (fi-1))
+                        let cost_i = raw_freqs[i] as f64 * (fi as f64 / (fi as f64 - 1.0)).ln();
+                        let cost_j = raw_freqs[j] as f64 * (fj as f64 / (fj as f64 - 1.0)).ln();
+                        cost_i.partial_cmp(&cost_j).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(i, _)| i);
-                if let Some(idx) = max_idx {
+                if let Some(idx) = best {
                     freqs[idx] -= 1;
                     assigned -= 1;
                 } else {
-                    break; // Can't reduce further
+                    break;
                 }
             } else {
-                // Find the symbol with the largest raw frequency and increase it
-                let best_idx = raw_freqs
+                // Need to increase some freq by 1. Pick the symbol where
+                // increasing helps most: maximize raw_count * (log(freq+1) - log(freq))
+                let best = raw_freqs
                     .iter()
                     .enumerate()
                     .filter(|&(_, &f)| f > 0)
-                    .max_by_key(|&(_, &f)| f)
+                    .max_by(|&(i, _), &(j, _)| {
+                        // Benefit of increasing freq[i] by 1:
+                        // raw_freqs[i] * log2((fi+1) / fi)
+                        let fi = freqs[i] as f64;
+                        let fj = freqs[j] as f64;
+                        let benefit_i = raw_freqs[i] as f64 * ((fi + 1.0) / fi).ln();
+                        let benefit_j = raw_freqs[j] as f64 * ((fj + 1.0) / fj).ln();
+                        benefit_i.partial_cmp(&benefit_j).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(i, _)| i);
-                if let Some(idx) = best_idx {
+                if let Some(idx) = best {
                     freqs[idx] += 1;
                     assigned += 1;
                 } else {
