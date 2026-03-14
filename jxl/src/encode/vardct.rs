@@ -1057,7 +1057,7 @@ fn encode_single_rgba_frame(
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
     let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0); // = 0.8
-    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.93; // default=1.0, slightly finer B quant
+    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // default=1.0, try 0.94 with new EPF
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
@@ -6685,9 +6685,9 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     writer.write(1, 0)?; // epf_sharp_custom = false
     // Custom EPF weights: boost chroma channel smoothing for better chroma PSNR
     writer.write(1, 1)?; // epf_weight_custom = true
-    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[0] = 5.0 (Y, very reduced)
-    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, default)
-    writer.write(16, f32_to_f16_bits(2.0))?;  // epf_channel_scale[2] = 2.0 (B, reduced)
+    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[0] = 5.0 (Y, optimal)
+    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, default optimal)
+    writer.write(16, f32_to_f16_bits(2.0))?;  // epf_channel_scale[2] = 2.0 (B, optimal)
     writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
     writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)
     writer.write(1, 0)?; // epf_sigma_custom = false
