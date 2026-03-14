@@ -1057,7 +1057,7 @@ fn encode_single_rgba_frame(
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
     let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, optimal
-    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // optimal with EPF weights
+    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // optimal
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
@@ -1301,7 +1301,7 @@ struct QuantizedVardct {
 /// Actual factors: base_correlation_x + x_factor/84 for X, base_correlation_b + b_factor/84 for B.
 /// libjxl's towards_zero shrinkage for CfL multipliers.
 /// Reduces oscillations by pulling small values to zero.
-const TOWARDS_ZERO: f64 = 3.05;
+const TOWARDS_ZERO: f64 = 3.1;
 
 /// Approximate quantization weights for CfL regression.
 /// libjxl multiplies DCT coefficients by q * inv_dequant_matrix[k].
@@ -6693,7 +6693,7 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     writer.write(1, 1)?; // epf_weight_custom = true
     writer.write(16, f32_to_f16_bits(4.0))?;  // epf_channel_scale[0] = 4.0 (Y, optimal)
     writer.write(16, f32_to_f16_bits(5.5))?;  // epf_channel_scale[1] = 5.5 (X, optimal)
-    writer.write(16, f32_to_f16_bits(1.5))?;  // epf_channel_scale[2] = 1.5 (B, optimal with Y=4.0)
+    writer.write(16, f32_to_f16_bits(1.5))?;  // epf_channel_scale[2] = 1.5 (B, optimal)
     writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
     writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)
     writer.write(1, 0)?; // epf_sigma_custom = false
