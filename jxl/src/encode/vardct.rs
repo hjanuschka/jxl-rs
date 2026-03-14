@@ -6578,6 +6578,32 @@ struct FrameHeaderConfig {
 }
 
 /// Unified VarDCT frame header writer.
+/// Convert f32 to IEEE 754 half-precision (F16) as u16.
+fn f32_to_f16_bits(f: f32) -> u64 {
+    let bits = f.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = (bits >> 23) & 0xFF;
+    let mant = bits & 0x7F_FFFF;
+    if exp == 0 {
+        // zero or denormal -> F16 zero
+        (sign as u64) << 15
+    } else if exp == 0xFF {
+        // inf/nan
+        let h_mant = if mant != 0 { 0x200u64 } else { 0 };
+        ((sign as u64) << 15) | (0x1F << 10) | h_mant
+    } else {
+        let new_exp = exp as i32 - 127 + 15;
+        if new_exp <= 0 {
+            (sign as u64) << 15
+        } else if new_exp >= 31 {
+            ((sign as u64) << 15) | (0x1F << 10)
+        } else {
+            let h_mant = (mant >> 13) as u64;
+            ((sign as u64) << 15) | ((new_exp as u64) << 10) | h_mant
+        }
+    }
+}
+
 fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfig) -> Result<()> {
     // 1. all_default = false (we need VarDCT settings)
     writer.write(1, 0)?;
@@ -6657,7 +6683,13 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     }
     writer.write(2, 2)?; // epf_iters = 2
     writer.write(1, 0)?; // epf_sharp_custom = false
-    writer.write(1, 0)?; // epf_weight_custom = false
+    // Custom EPF weights: boost chroma channel smoothing for better chroma PSNR
+    writer.write(1, 1)?; // epf_weight_custom = true
+    writer.write(16, f32_to_f16_bits(40.0))?; // epf_channel_scale[0] = 40.0 (Y, default)
+    writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, default)
+    writer.write(16, f32_to_f16_bits(1.5))?;  // epf_channel_scale[2] = 1.5 (B, strongly reduced)
+    writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
+    writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)
     writer.write(1, 0)?; // epf_sigma_custom = false
     writer.write(2, 0)?; // LoopFilter extensions = 0
     // 25. FrameHeader extensions = 0

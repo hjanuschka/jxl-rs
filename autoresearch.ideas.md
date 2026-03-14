@@ -1,70 +1,63 @@
 # Autoresearch Ideas (deferred)
 
-## Current Status: parity_score=1.958 (94 experiments)
+## Current status
+- Best parity_score: **1.726066** (714 experiments)
+- Best configuration (stable, heavily tuned):
+  - `TOWARDS_ZERO = 2.965` (CfL shrink)
+  - Merge multipliers: rect=4.0, 16x16=5.5, 32x32=7.0
+  - `b_dm_multiplier = 0.93`
+  - `epf_iters = 2` (confirmed optimal, better than libjxl's 1)
+  - `extra_dc_precision = 1`
 
-## Root Cause Analysis (UPDATED)
+## Remaining penalty
+- kodim08: ~5.75 pen (-0.29 dB, B:-0.43 R:-0.24 G:-0.04)
+- kodim13: ~3.25 pen (-0.16 dB, B:-0.24 R:-0.07 G:+0.14)
 
-The -0.31 dB PSNR gap on kodim08 (-0.44 dB on B channel, -0.26 dB R, -0.07 dB G) comes
-from the **global_scale / dequantization step mismatch**:
+## Exhaustively confirmed (DO NOT RETRY)
+### Quantization
+- Dead zones (0.505, 0.535, libjxl 0.56/0.62 quadrant): always worse
+- AdjustQuantBias-aware rounding (0.465/1.429 boundaries): more nonzeros, worse parity
+- quant_ac multipliers (1.25-1.35): no effect (rq integers unchanged)
+- Finer/coarser uniform rq candidates: finer too large, coarser too lossy
+- Finer adaptive map (+1 rq per block): always loses size selection
+- Y-roundtrip quantization: regresses (CfL factors fitted to original Y)
 
-- Our encoder uses gs=5111 (from AQ map), libjxl uses gs=8813 (from 0.79/d)
-- At gs=5111, rq=6: each quantized unit dequantizes to 2.14*dw (coarse reconstruction)
-- At gs=8813, rq=6: each quantized unit dequantizes to 1.24*dw (fine reconstruction)
-- Our FINER quantization step (0.468) produces MORE nonzero coefficients
-- But each nonzero coefficient OVERSHOOTS the true value by more
-- libjxl's COARSER quantization (0.807) produces fewer nonzeros, each closer to truth
+### CfL / color
+- CfL shrink: 2.965 optimal (tested 2.2-3.2 at 0.001 granularity)
+- Separate B vs X CfL shrink: always worse than unified
+- CfL dist_mul: no gain at 8e-4 or 1.2e-3
+- CfL B base-correlation: 0.98 and 1.02 both strongly regressive
+- b_dm_multiplier: 0.93 optimal (0.80-0.97 tested)
+- x_dm_multiplier: any deviation from 0.8 worsens parity
 
-Attempts to change gs failed because rq snaps to integers, causing discontinuities.
-The AQ map's gs=5111 was chosen to give the right per-block variation range.
+### Entropy
+- HybridUint configs beyond kFast: no improvement
+- ANS shift candidates [0,3,6,9,12]: no gain over [0,6,12]
+- Dual-gs candidate system: no effect, only slower
 
-## Disproved Hypotheses (do NOT retry)
-- FP accumulation order (gaborish, DCT): identical output (quant absorbs ULPs)
-- Fast cbrt: identical output (LUT dominates)
-- CfL towards_zero shrinkage: 2.6 is near-optimal
-- CfL dist_mul: 1e-3 is better than 1e-6 (overcorrects)
-- AdjustQuantBias-aware quantization: no coefficients in bias-sensitive range at gs=5111
-- Position-dependent dead zones: no effect at our fine quantization
-- extra_dc_precision=0: catastrophic -1.87 dB (DC precision is critical for us)
-- extra_dc_precision=2: +0.70 dB PSNR but one image exceeds libjxl size
-- Decode-based selection: works but budget too coarse (5% no change, 10% overshoots)
+### Loop filter
+- EPF: iters=2 optimal (1 and 3 both worse)
+- EPF sharpness map: has NO effect on djxl output (possible encoding bug)
+- EPF sigma custom: crashed (needs F16 writer)
 
-## Remaining Paths (All High Effort)
+### Merge / transform
+- Merge multipliers saturated at rect=4.0, 16=5.5, 32=7.0
+- extra_dc_precision=2: always size overshoot
+- Decode-based candidate selection: over-picks large candidates
 
-### 1. Dual-gs Candidate System
-Encode candidates at BOTH gs=5111 and gs=8813, each with appropriate rq values.
-Use decode-based PSNR to pick the best per-image. High implementation complexity
-(need to restructure candidate loop to vary gs).
+## Root cause
+The chroma PSNR gap is structural: our gs=5111 (from 0.39/d AQ) vs libjxl's
+gs=8813 (from 0.79/d) produces different quantization steps. Our finer steps
+create more nonzeros (smaller files) but each coefficient overshoots more
+(worse PSNR on R/B channels).
 
-### 2. LZ77 for Modular Streams
-libjxl uses LZ77 for DC data encoding. Could reduce DC stream overhead enough
-to offset the PSNR gap by allowing extra_dc_precision=2.
-
-### 3. ANS RebalanceHistogram
-Implement libjxl's proper histogram grid fitting (RebalanceHistogram).
-Our current entropy-optimal normalization doesn't match libjxl's grid structure.
-
-## Per-Image Breakdown
-- kodim01: 0 pen (-2.82%, +0.02 dB)
-- kodim08: 6.20 pen (-2.71%, -0.31 dB) -- B channel: -0.44 dB!
-- kodim13: 3.59 pen (-3.54%, -0.18 dB)
-- zoltan: 0 pen (-1.04%, +0.36 dB)
-- Webkit: 0 pen (-39.8%, +1.21 dB)
-
-## Key Infrastructure Added
-- `decode_codestream_to_f32_rgb()` - decode bare codestream in release builds
-- `compute_psnr_from_decoded()` - compute PSNR from decoded f32 data
-- Both available in the encoder for future RD-based selection
-
-## Tried and Failed (94 experiments, do NOT retry)
-- All quant_ac multipliers (0.82-1.40)
-- Dead zones (0.505, 0.52, 0.58, position-dependent quadrant)
-- All softer_rq variations (remove, rq-2, quality budget, mixed maps)
-- All ep variations (2, competitive, per-candidate, content-adaptive)
-- All clustering variations (more counts, lower threshold)
-- Fast cbrt, gaborish FP order, bias-aware quantization
-- CfL tuning (towards_zero 0.5-3.5, dist_mul 1e-3 to 1e-6)
-- extra_dc_precision (0, 1, 2, candidate-based)
-- Global scale changes (q=0.45, 0.55, 0.79 for gs; all cause rq discontinuities)
-- Merge multiplier tuning (2.0-3.5 range)
-- Decode-based selection (5%, 7%, 10% budgets)
-- Force DCT8-only (merges are critical, save ~25%)
+## Only remaining paths (HIGH effort)
+1. **Fix EPF sharpness encoding** -- it has zero effect currently, suggesting a
+   bug. If fixed, adaptive sharpness could help chroma PSNR on photo blocks.
+2. **LZ77 for modular streams** -- could save 1-3% bytes, making ep=2 viable.
+3. **Dual-pass encoding with Y-roundtrip + CfL refit** -- quantize Y, compute
+   CfL from dequantized Y, then quantize X/B. Requires refitting CfL maps
+   per-candidate (chicken-and-egg: CfL depends on Y quant, Y quant depends on
+   candidate). High implementation complexity.
+4. **Custom dequant weights** -- signal slightly different weight tables to
+   decoder. Requires F16 writing support for frame header fields.
