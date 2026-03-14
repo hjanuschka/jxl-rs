@@ -14,7 +14,6 @@ use super::{
     BitWriter,
     entropy::{
         HybridUintConfig, HybridUintEncoded,
-        ans::{AnsDistribution, AnsToken, write_ans_histograms, write_ans_stream},
         huffman_encode::{
             HuffmanCode, build_huffman_code, write_huffman_histograms, write_huffman_symbol,
         },
@@ -87,19 +86,15 @@ fn write_token_stream(writer: &mut BitWriter, stream: &TokenStream) -> Result<()
 /// Context 0 (split_val) is never read for leaf nodes.
 /// Build a single-leaf tree with the given offset and predictor.
 fn build_tree_token_stream(offset: i32, predictor: u32) -> Result<TokenStream> {
-    let (stream, _map) = build_tree_token_stream_multi(&[(offset, predictor)])?;
-    Ok(stream)
+    build_tree_token_stream_multi(&[(offset, predictor)])
 }
 
-/// Build a tree from leaf specifications, returning (token_stream, leaf_id_to_channel_map).
+/// Build a tree from leaf specifications.
 ///
-/// If `leaves.len() == 1`, creates a single-leaf tree. Map is [0].
-/// If `leaves.len() > 1`, creates a channel-split tree.
+/// If `leaves.len() == 1`, creates a single-leaf tree.
+/// If `leaves.len() > 1`, creates a channel-split tree where leaf i applies to channel i.
 /// Each leaf has (offset, predictor).
-///
-/// JXL tree convention: LEFT child = property > splitval, RIGHT child = property <= splitval.
-/// Tree is encoded in BFS order (breadth-first).
-fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<(TokenStream, Vec<usize>)> {
+fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<TokenStream> {
     for &(_, predictor) in leaves {
         if predictor > 13 {
             return Err(Error::InvalidPredictor(predictor));
@@ -108,123 +103,64 @@ fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<(TokenStream, 
 
     let tree_config = HybridUintConfig::new(15, 0, 0);
     let mut tree_values: Vec<u32> = Vec::new();
-    // Maps leaf_id (BFS order) to channel index
-    let mut leaf_id_to_channel: Vec<usize> = Vec::new();
 
     if leaves.len() == 1 {
+        // Single leaf: property=0 (leaf marker), predictor, offset, mult_log, mult_bits
+        let (offset, predictor) = leaves[0];
         tree_values.extend_from_slice(&[
-            0,                                   // property = 0 (leaf)
-            leaves[0].1,                         // predictor
-            pack_signed(leaves[0].0),            // offset
-            0,                                   // multiplier_log = 0
-            0,                                   // multiplier_bits = 0
+            0,                   // property = 0 (leaf)
+            predictor,           // predictor
+            pack_signed(offset), // offset
+            0,                   // multiplier_log = 0
+            0,                   // multiplier_bits = 0
         ]);
-        leaf_id_to_channel.push(0);
     } else {
-        // Multi-leaf tree: chain of splits by channel property (property 0).
-        // Encoded in BFS order.
+        // Multi-leaf tree: split by channel property.
+        // JXL tree node format: property, splitval, left_child, right_child
+        // Property 1 = channel index (0-based in decode stream context)
         //
-        // For N channels, we build a right-leaning chain:
-        //   Node 0: split(channel, val=0)
-        //     LEFT (ch > 0): Node 1 (continuation)
-        //     RIGHT (ch <= 0): Leaf for channel 0
-        //   Node 1: split(channel, val=1)
-        //     LEFT (ch > 1): Node 2 (continuation) or Leaf for last channel
-        //     RIGHT (ch <= 1): Leaf for channel 1
+        // Tree structure for N channels:
+        //   node 0: if channel < 1 -> leaf(ch0) else node1
+        //   node 1: if channel < 2 -> leaf(ch1) else node2/leaf(ch>=2)
         //   ...
         //
-        // BFS visits: all split nodes first, then leaves in order:
-        //   split_0, split_1, ..., split_{N-2}, leaf_ch0, leaf_ch_{N-1}, leaf_ch1, ...
+        // Encoding: DFS pre-order. Each node writes:
+        //   property (non-zero = split), splitval, then left subtree, then right subtree.
+        // Each leaf writes: 0 (property=leaf), predictor, offset, mult_log, mult_bits.
         //
-        // Actually BFS interleaves: each split's children are queued left then right.
-        // Let me build it properly with a BFS queue.
+        // The property for "channel" in the decoder is property index 1 (0-indexed).
+        // But the encoding uses property + 1 as the packed token.
+        // Actually, in the JXL spec the tree is encoded as:
+        //   read property (0 = leaf, >0 = decision node with property = val-1)
+        //   if property > 0: read splitval, then encode left child, then right child
+        //   if property == 0: read predictor, offset, mult_log, mult_bits
 
-        let n = leaves.len();
+        for i in 0..leaves.len() {
+            if i == leaves.len() - 1 {
+                // Last leaf
+                let (offset, predictor) = leaves[i];
+                tree_values.push(0); // leaf
+                tree_values.push(predictor);
+                tree_values.push(pack_signed(offset));
+                tree_values.push(0); // multiplier_log
+                tree_values.push(0); // multiplier_bits
+            } else {
+                // Decision node: split on channel < (i+1)
+                // property index for "channel" = 0 in the WP predictor properties list
+                // In the encoded tree, property value = (actual_property_index + 1)
+                // Channel is property 0 in JXL modular, so encoded as 1
+                tree_values.push(1); // property = channel (0+1=1)
+                tree_values.push(pack_signed(i as i32)); // splitval = i (channel < i+1 means channel == i)
 
-        // Build tree structure first, then serialize in BFS order.
-        // Each node is either Split{val, left_idx, right_idx} or Leaf{channel}.
-        enum Node {
-            Split { val: i32, left: usize, right: usize },
-            Leaf { channel: usize },
-        }
+                // Left child is the leaf for channel i
+                let (offset, predictor) = leaves[i];
+                tree_values.push(0); // leaf
+                tree_values.push(predictor);
+                tree_values.push(pack_signed(offset));
+                tree_values.push(0); // multiplier_log
+                tree_values.push(0); // multiplier_bits
 
-        let mut nodes: Vec<Node> = Vec::new();
-
-        // Build chain: channel 0 splits off to the right, then channel 1, etc.
-        // For channel i (0..n-2): split on val=i, RIGHT=leaf(ch_i), LEFT=next_split
-        // Last split: LEFT=leaf(ch_{n-1}), RIGHT=leaf(ch_{n-2})
-
-        // Build bottom-up: start with the last two channels
-        let last_leaf = nodes.len();
-        nodes.push(Node::Leaf { channel: n - 1 });
-        let second_last_leaf = nodes.len();
-        nodes.push(Node::Leaf { channel: n - 2 });
-
-        // Last split node: split on val=n-2
-        let mut current_split = nodes.len();
-        nodes.push(Node::Split {
-            val: (n - 2) as i32 - 1, // split on val = n-3... no
-            left: last_leaf,
-            right: second_last_leaf,
-        });
-
-        // Actually this approach is getting complicated. Let me use a recursive build.
-        // Build a function that creates a subtree for channels [lo..hi]
-        fn build_subtree(
-            nodes: &mut Vec<Node>,
-            leaves_data: &[(i32, u32)],
-            lo: usize,
-            hi: usize, // exclusive
-        ) -> usize {
-            if hi - lo == 1 {
-                let idx = nodes.len();
-                nodes.push(Node::Leaf { channel: lo });
-                return idx;
-            }
-            // Split: channel <= lo goes RIGHT (leaf for channel lo)
-            // channel > lo goes LEFT (subtree for channels lo+1..hi)
-            let idx = nodes.len();
-            nodes.push(Node::Split {
-                val: lo as i32, // placeholder, will be overwritten
-                left: 0,
-                right: 0,
-            });
-            let left = build_subtree(nodes, leaves_data, lo + 1, hi);
-            let right_idx = nodes.len();
-            nodes.push(Node::Leaf { channel: lo });
-            nodes[idx] = Node::Split {
-                val: lo as i32,
-                left,
-                right: right_idx,
-            };
-            idx
-        }
-
-        nodes.clear();
-        let root = build_subtree(&mut nodes, &leaves, 0, n);
-        assert_eq!(root, 0);
-
-        // Now serialize in BFS order
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(0usize);
-        while let Some(node_idx) = queue.pop_front() {
-            match &nodes[node_idx] {
-                Node::Split { val, left, right } => {
-                    // Property 0 (channel) encoded as 0+1=1
-                    tree_values.push(1);
-                    tree_values.push(pack_signed(*val));
-                    queue.push_back(*left);
-                    queue.push_back(*right);
-                }
-                Node::Leaf { channel } => {
-                    let (offset, predictor) = leaves[*channel];
-                    tree_values.push(0); // leaf
-                    tree_values.push(predictor);
-                    tree_values.push(pack_signed(offset));
-                    tree_values.push(0); // multiplier_log
-                    tree_values.push(0); // multiplier_bits
-                    leaf_id_to_channel.push(*channel);
-                }
+                // Right child continues to next iteration
             }
         }
     }
@@ -245,14 +181,11 @@ fn build_tree_token_stream_multi(leaves: &[(i32, u32)]) -> Result<(TokenStream, 
 
     let code = build_huffman_code(&frequencies).ok_or(Error::InvalidHuffman)?;
 
-    Ok((
-        TokenStream {
-            tokens,
-            code,
-            uint_config: tree_config,
-        },
-        leaf_id_to_channel,
-    ))
+    Ok(TokenStream {
+        tokens,
+        code,
+        uint_config: tree_config,
+    })
 }
 
 /// Write a complete modular section with histogram-driven Huffman encoding.
@@ -295,279 +228,6 @@ pub fn write_modular_section_huffman(
         &[residual_stream.code.clone()],
     )?;
     write_token_stream(writer, &residual_stream)?;
-
-    Ok(())
-}
-
-/// Write a complete modular section using ANS entropy coding.
-///
-/// Same structure as write_modular_section_huffman but uses ANS instead of Huffman
-/// for the residual data. Tree is still Huffman (tiny, overhead negligible).
-/// Public wrapper for ANS modular section encoding, used by vardct HF metadata.
-pub fn write_modular_section_ans_pub(
-    writer: &mut BitWriter,
-    offset: i32,
-    predictor: u32,
-    signed_residuals: &[i32],
-    uint_config: HybridUintConfig,
-    use_global_tree: bool,
-) -> Result<()> {
-    write_modular_section_ans(writer, offset, predictor, signed_residuals, uint_config, use_global_tree)
-}
-
-fn write_modular_section_ans(
-    writer: &mut BitWriter,
-    offset: i32,
-    predictor: u32,
-    signed_residuals: &[i32],
-    uint_config: HybridUintConfig,
-    use_global_tree: bool,
-) -> Result<()> {
-    write_minimal_group_header(writer, use_global_tree)?;
-
-    // Tree: use Huffman (tree is tiny, ANS overhead would be larger)
-    let tree_stream = build_tree_token_stream(offset, predictor)?;
-    let tree_context_map = [0u8; 6];
-    write_huffman_histograms(
-        writer,
-        &tree_context_map,
-        &[tree_stream.uint_config],
-        &[tree_stream.code.clone()],
-    )?;
-    write_token_stream(writer, &tree_stream)?;
-
-    // Residual data: use ANS
-    let residual_encoded: Vec<HybridUintEncoded> = signed_residuals
-        .iter()
-        .map(|&v| uint_config.encode(pack_signed(v)))
-        .collect();
-
-    let max_token = residual_encoded
-        .iter()
-        .map(|e| e.token)
-        .max()
-        .unwrap_or(0);
-    let alphabet_size = (max_token as usize + 1).max(1);
-    let mut frequencies = vec![0u64; alphabet_size];
-    for enc in &residual_encoded {
-        frequencies[enc.token as usize] += 1;
-    }
-
-    let dist = AnsDistribution::from_frequencies_best(&frequencies)
-        .map(|(d, _)| d)
-        .ok_or(Error::InvalidAnsHistogram)?;
-
-    let ans_tokens: Vec<AnsToken> = residual_encoded
-        .iter()
-        .map(|enc| AnsToken {
-            symbol: enc.token,
-            cluster: 0,
-            extra_bits: enc.extra_bits,
-            extra_nbits: enc.nbits as usize,
-        })
-        .collect();
-
-    let residual_context_map = [0u8];
-    write_ans_histograms(
-        writer,
-        &residual_context_map,
-        &[uint_config],
-        &[dist.clone()],
-    )?;
-    write_ans_stream(writer, &[dist], &ans_tokens)?;
-
-    Ok(())
-}
-
-/// Write a modular section using ANS with per-channel histograms.
-///
-/// Uses a multi-leaf tree that splits by channel, giving each channel its own
-/// entropy context. This can be more efficient when channels have different
-/// distributions (e.g., Y vs X vs B in DC data).
-pub fn write_modular_section_ans_perchannel(
-    writer: &mut BitWriter,
-    predictor: u32,
-    signed_residuals: &[i32],
-    num_channels: usize,
-    channel_size: usize,
-    uint_config: HybridUintConfig,
-    use_global_tree: bool,
-) -> Result<()> {
-    if num_channels < 2 {
-        // Fall back to single-histogram ANS for single channel
-        return write_modular_section_ans(
-            writer,
-            0,
-            predictor,
-            signed_residuals,
-            uint_config,
-            use_global_tree,
-        );
-    }
-
-    write_minimal_group_header(writer, use_global_tree)?;
-
-    // Multi-leaf tree: one leaf per channel, all with same predictor
-    let leaves: Vec<(i32, u32)> = (0..num_channels).map(|_| (0i32, predictor)).collect();
-    let (tree_stream, leaf_id_to_channel) = build_tree_token_stream_multi(&leaves)?;
-    let tree_context_map = [0u8; 6];
-    write_huffman_histograms(
-        writer,
-        &tree_context_map,
-        &[tree_stream.uint_config],
-        &[tree_stream.code.clone()],
-    )?;
-    write_token_stream(writer, &tree_stream)?;
-
-    // Build channel_to_leaf_id mapping (inverse of leaf_id_to_channel)
-    let mut channel_to_leaf_id = vec![0usize; num_channels];
-    for (leaf_id, &ch) in leaf_id_to_channel.iter().enumerate() {
-        channel_to_leaf_id[ch] = leaf_id;
-    }
-
-    // Build per-leaf ANS distributions (indexed by leaf_id)
-    let mut leaf_dists: Vec<AnsDistribution> = Vec::with_capacity(num_channels);
-    let mut all_tokens: Vec<AnsToken> = Vec::new();
-
-    // First pass: build distributions per leaf_id
-    let mut leaf_freqs: Vec<Vec<u64>> = vec![Vec::new(); num_channels];
-    let mut leaf_encoded: Vec<Vec<HybridUintEncoded>> = vec![Vec::new(); num_channels];
-
-    for ch in 0..num_channels {
-        let leaf_id = channel_to_leaf_id[ch];
-        let ch_data = &signed_residuals[ch * channel_size..(ch + 1) * channel_size];
-        let encoded: Vec<HybridUintEncoded> = ch_data
-            .iter()
-            .map(|&v| uint_config.encode(pack_signed(v)))
-            .collect();
-
-        let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
-        let alphabet_size = (max_token as usize + 1).max(1);
-        if leaf_freqs[leaf_id].len() < alphabet_size {
-            leaf_freqs[leaf_id].resize(alphabet_size, 0);
-        }
-        for enc in &encoded {
-            leaf_freqs[leaf_id][enc.token as usize] += 1;
-        }
-        leaf_encoded[leaf_id] = encoded;
-    }
-
-    for leaf_id in 0..num_channels {
-        let dist = AnsDistribution::from_frequencies_best(&leaf_freqs[leaf_id])
-            .map(|(d, _)| d)
-            .ok_or(Error::InvalidAnsHistogram)?;
-        leaf_dists.push(dist);
-    }
-
-    // Build token stream: data is emitted channel-by-channel (ch0, ch1, ch2)
-    // Each channel's tokens use the leaf_id corresponding to that channel
-    for ch in 0..num_channels {
-        let leaf_id = channel_to_leaf_id[ch];
-        for enc in &leaf_encoded[leaf_id] {
-            all_tokens.push(AnsToken {
-                symbol: enc.token,
-                cluster: leaf_id,
-                extra_bits: enc.extra_bits,
-                extra_nbits: enc.nbits as usize,
-            });
-        }
-    }
-
-    // Context map: leaf_id -> histogram leaf_id (identity mapping)
-    let context_map: Vec<u8> = (0..num_channels as u8).collect();
-    let uint_configs_vec: Vec<HybridUintConfig> = vec![uint_config; num_channels];
-    write_ans_histograms(writer, &context_map, &uint_configs_vec, &leaf_dists)?;
-    write_ans_stream(writer, &leaf_dists, &all_tokens)?;
-
-    Ok(())
-}
-
-/// Write a per-channel ANS modular section where each channel can use a different predictor.
-///
-/// `predictors` has one predictor per channel. `signed_residuals` has pre-computed
-/// residuals for each channel (channel_size values per channel, concatenated).
-pub fn write_modular_section_ans_perchannel_diff_pred(
-    writer: &mut BitWriter,
-    predictors: &[u32],
-    signed_residuals: &[i32],
-    num_channels: usize,
-    channel_size: usize,
-    uint_config: HybridUintConfig,
-) -> Result<()> {
-    assert_eq!(predictors.len(), num_channels);
-    assert_eq!(signed_residuals.len(), num_channels * channel_size);
-
-    if num_channels < 2 {
-        return write_modular_section_ans(
-            writer, 0, predictors[0], signed_residuals, uint_config, false,
-        );
-    }
-
-    write_minimal_group_header(writer, false)?;
-
-    // Multi-leaf tree: one leaf per channel, each with its own predictor
-    let leaves: Vec<(i32, u32)> = predictors.iter().map(|&p| (0i32, p)).collect();
-    let (tree_stream, leaf_id_to_channel) = build_tree_token_stream_multi(&leaves)?;
-    let tree_context_map = [0u8; 6];
-    write_huffman_histograms(
-        writer,
-        &tree_context_map,
-        &[tree_stream.uint_config],
-        &[tree_stream.code.clone()],
-    )?;
-    write_token_stream(writer, &tree_stream)?;
-
-    let mut channel_to_leaf_id = vec![0usize; num_channels];
-    for (leaf_id, &ch) in leaf_id_to_channel.iter().enumerate() {
-        channel_to_leaf_id[ch] = leaf_id;
-    }
-
-    let mut leaf_dists: Vec<AnsDistribution> = Vec::with_capacity(num_channels);
-    let mut all_tokens: Vec<AnsToken> = Vec::new();
-    let mut leaf_freqs: Vec<Vec<u64>> = vec![Vec::new(); num_channels];
-    let mut leaf_encoded: Vec<Vec<HybridUintEncoded>> = vec![Vec::new(); num_channels];
-
-    for ch in 0..num_channels {
-        let leaf_id = channel_to_leaf_id[ch];
-        let ch_data = &signed_residuals[ch * channel_size..(ch + 1) * channel_size];
-        let encoded: Vec<HybridUintEncoded> = ch_data
-            .iter()
-            .map(|&v| uint_config.encode(pack_signed(v)))
-            .collect();
-        let max_token = encoded.iter().map(|e| e.token).max().unwrap_or(0);
-        let alphabet_size = (max_token as usize + 1).max(1);
-        if leaf_freqs[leaf_id].len() < alphabet_size {
-            leaf_freqs[leaf_id].resize(alphabet_size, 0);
-        }
-        for enc in &encoded {
-            leaf_freqs[leaf_id][enc.token as usize] += 1;
-        }
-        leaf_encoded[leaf_id] = encoded;
-    }
-
-    for leaf_id in 0..num_channels {
-        let dist = AnsDistribution::from_frequencies_best(&leaf_freqs[leaf_id])
-            .map(|(d, _)| d)
-            .ok_or(Error::InvalidAnsHistogram)?;
-        leaf_dists.push(dist);
-    }
-
-    for ch in 0..num_channels {
-        let leaf_id = channel_to_leaf_id[ch];
-        for enc in &leaf_encoded[leaf_id] {
-            all_tokens.push(AnsToken {
-                symbol: enc.token,
-                cluster: leaf_id,
-                extra_bits: enc.extra_bits,
-                extra_nbits: enc.nbits as usize,
-            });
-        }
-    }
-
-    let context_map: Vec<u8> = (0..num_channels as u8).collect();
-    let uint_configs_vec: Vec<HybridUintConfig> = vec![uint_config; num_channels];
-    write_ans_histograms(writer, &context_map, &uint_configs_vec, &leaf_dists)?;
-    write_ans_stream(writer, &leaf_dists, &all_tokens)?;
 
     Ok(())
 }
@@ -671,8 +331,7 @@ pub fn encode_modular_signed_stream(
 ) -> Result<()> {
     assert_eq!(data.len(), width * height * num_channels);
 
-    // Match libjxl's default modular HybridUint config for VarDCT DC data.
-    let uint_config = HybridUintConfig::new(4, 2, 0);
+    let uint_config = HybridUintConfig::new(4, 1, 2);
 
     // Try multiple predictors and pick the best by actual encoded byte size.
     let channel_size = width * height;
@@ -755,61 +414,19 @@ pub fn encode_modular_signed_stream(
             }
         }
     }
-    // Select predictor (4): matches decoder's predict.rs select() exactly
-    // p = left + top - topleft; if |p - left| < |p - top|: left else: top
-    let mut select_residuals = Vec::with_capacity(data.len());
-    for c in 0..num_channels {
-        let ch = &data[c * channel_size..(c + 1) * channel_size];
-        for y in 0..height {
-            for x in 0..width {
-                let val = ch[y * width + x];
-                let left = get_left(ch, x, y) as i64;
-                let top = get_top(ch, x, y) as i64;
-                let topleft = get_topleft(ch, x, y) as i64;
-                let p = left + top - topleft;
-                let pred = if (p - left).abs() < (p - top).abs() {
-                    left
-                } else {
-                    top
-                };
-                select_residuals.push(val - pred as i32);
-            }
-        }
-    }
-
-    // AverageWestAndNorth predictor (3): (left + top) / 2 (integer truncation towards zero)
-    let mut avg_wn_residuals = Vec::with_capacity(data.len());
-    for c in 0..num_channels {
-        let ch = &data[c * channel_size..(c + 1) * channel_size];
-        for y in 0..height {
-            for x in 0..width {
-                let val = ch[y * width + x];
-                let left = get_left(ch, x, y) as i64;
-                let top = get_top(ch, x, y) as i64;
-                let pred = (left + top) / 2;
-                avg_wn_residuals.push(val - pred as i32);
-            }
-        }
-    }
-
     // Pick predictor by exact encoded size (regression-safe).
-    let candidates: [(u32, &[i32]); 6] = [
+    let candidates: [(u32, &[i32]); 4] = [
         (0, data),
         (5, &grad_residuals),
         (1, &left_residuals),
         (2, &top_residuals),
-        (4, &select_residuals),
-        (3, &avg_wn_residuals),
     ];
 
     let mut best_predictor = 0u32;
     let mut best_idx = 0usize;
     let mut best_size = usize::MAX;
-    let mut best_use_ans = false;
-    let mut best_perchannel = false;
 
     for (idx, (predictor, values)) in candidates.iter().enumerate() {
-        // Try Huffman
         let mut tmp = BitWriter::new();
         write_modular_section_huffman(&mut tmp, 0, *predictor, values, uint_config, false)?;
         let sz = tmp.finish().len();
@@ -817,417 +434,17 @@ pub fn encode_modular_signed_stream(
             best_size = sz;
             best_predictor = *predictor;
             best_idx = idx;
-            best_use_ans = false;
-            best_perchannel = false;
-        }
-
-        // Try ANS (only worthwhile for larger streams where ANS overhead pays off)
-        if data.len() >= 256 {
-            let mut tmp_ans = BitWriter::new();
-            if write_modular_section_ans(&mut tmp_ans, 0, *predictor, values, uint_config, false)
-                .is_ok()
-            {
-                let sz_ans = tmp_ans.finish().len();
-                if sz_ans < best_size {
-                    best_size = sz_ans;
-                    best_predictor = *predictor;
-                    best_idx = idx;
-                    best_use_ans = true;
-                    best_perchannel = false;
-                }
-            }
-
-            // Try per-channel ANS (separate histogram per channel)
-            if num_channels > 1 {
-                let mut tmp_pcans = BitWriter::new();
-                if write_modular_section_ans_perchannel(
-                    &mut tmp_pcans, *predictor, values, num_channels, channel_size,
-                    uint_config, false,
-                ).is_ok() {
-                    let sz_pc = tmp_pcans.finish().len();
-                    if sz_pc < best_size {
-                        best_size = sz_pc;
-                        best_predictor = *predictor;
-                        best_idx = idx;
-                        best_use_ans = true;
-                        best_perchannel = true;
-                    }
-                }
-            }
         }
     }
 
-    // Try per-channel predictor selection (different predictor per channel)
-    let mut best_diffpred = false;
-    if num_channels > 1 && data.len() >= 256 {
-        // Find best predictor per channel by L1 residual score
-        let predictor_options: &[u32] = &[0, 1, 2, 3, 4, 5];
-        let mut per_ch_preds = vec![0u32; num_channels];
-        let mut per_ch_residuals = Vec::with_capacity(data.len());
-        let mut any_diff = false;
-
-        for c in 0..num_channels {
-            let ch = &data[c * channel_size..(c + 1) * channel_size];
-            let mut best_p = 0u32;
-            let mut best_l1 = u64::MAX;
-            for &p in predictor_options {
-                let l1: u64 = (0..channel_size).map(|i| {
-                    let x = i % width;
-                    let y = i / width;
-                    let left = if x > 0 { ch[y * width + x - 1] }
-                               else if y > 0 { ch[(y - 1) * width] }
-                               else { 0 };
-                    let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
-                    let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
-                                  else { left };
-                    let pred = match p {
-                        1 => left as i64,
-                        2 => top as i64,
-                        3 => (left as i64 + top as i64) / 2,
-                        4 => {
-                            let pp = left as i64 + top as i64 - topleft as i64;
-                            if (pp - left as i64).abs() < (pp - top as i64).abs() { left as i64 } else { top as i64 }
-                        }
-                        5 => {
-                            let (l, t, tl) = (left as i64, top as i64, topleft as i64);
-                            let mn = l.min(t); let mx = l.max(t);
-                            let g = l + t - tl;
-                            let gc = if tl < mn { mx } else { g };
-                            if tl > mx { mn } else { gc }
-                        }
-                        _ => 0,
-                    };
-                    (ch[i] as i64 - pred).unsigned_abs()
-                }).sum();
-                if l1 < best_l1 { best_l1 = l1; best_p = p; }
-            }
-            per_ch_preds[c] = best_p;
-            if c > 0 && best_p != per_ch_preds[0] { any_diff = true; }
-        }
-
-        // Only try if channels actually want different predictors
-        if any_diff {
-            // Build residuals for each channel with its best predictor
-            for c in 0..num_channels {
-                let ch = &data[c * channel_size..(c + 1) * channel_size];
-                let p = per_ch_preds[c];
-                for i in 0..channel_size {
-                    let x = i % width;
-                    let y = i / width;
-                    let left = if x > 0 { ch[y * width + x - 1] }
-                               else if y > 0 { ch[(y - 1) * width] }
-                               else { 0 };
-                    let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
-                    let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
-                                  else { left };
-                    let pred = match p {
-                        1 => left,
-                        2 => top,
-                        3 => ((left as i64 + top as i64) / 2) as i32,
-                        4 => {
-                            let pp = left as i64 + top as i64 - topleft as i64;
-                            if (pp - left as i64).abs() < (pp - top as i64).abs() { left } else { top }
-                        }
-                        5 => {
-                            let (l, t, tl) = (left as i64, top as i64, topleft as i64);
-                            let mn = l.min(t); let mx = l.max(t);
-                            let g = l + t - tl;
-                            let gc = if tl < mn { mx } else { g };
-                            (if tl > mx { mn } else { gc }) as i32
-                        }
-                        _ => 0,
-                    };
-                    per_ch_residuals.push(ch[i] - pred);
-                }
-            }
-
-            let mut tmp_dp = BitWriter::new();
-            if write_modular_section_ans_perchannel_diff_pred(
-                &mut tmp_dp, &per_ch_preds, &per_ch_residuals,
-                num_channels, channel_size, uint_config,
-            ).is_ok() {
-                let sz_dp = tmp_dp.finish().len();
-                if sz_dp < best_size {
-                    best_size = sz_dp;
-                    best_use_ans = true;
-                    best_perchannel = true;
-                    best_diffpred = true;
-                }
-            }
-        }
-    }
-
-    if best_diffpred {
-        // Re-compute per-channel residuals (we consumed them above for sizing)
-        let predictor_options: &[u32] = &[0, 1, 2, 3, 4, 5];
-        let mut per_ch_preds = vec![0u32; num_channels];
-        let mut per_ch_residuals = Vec::with_capacity(data.len());
-        for c in 0..num_channels {
-            let ch = &data[c * channel_size..(c + 1) * channel_size];
-            let mut best_p = 0u32;
-            let mut best_l1 = u64::MAX;
-            for &p in predictor_options {
-                let l1: u64 = (0..channel_size).map(|i| {
-                    let x = i % width;
-                    let y = i / width;
-                    let left = if x > 0 { ch[y * width + x - 1] }
-                               else if y > 0 { ch[(y - 1) * width] }
-                               else { 0 };
-                    let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
-                    let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
-                                  else { left };
-                    let pred = match p {
-                        1 => left as i64,
-                        2 => top as i64,
-                        3 => (left as i64 + top as i64) / 2,
-                        4 => {
-                            let pp = left as i64 + top as i64 - topleft as i64;
-                            if (pp - left as i64).abs() < (pp - top as i64).abs() { left as i64 } else { top as i64 }
-                        }
-                        5 => {
-                            let (l, t, tl) = (left as i64, top as i64, topleft as i64);
-                            let mn = l.min(t); let mx = l.max(t);
-                            let g = l + t - tl;
-                            let gc = if tl < mn { mx } else { g };
-                            if tl > mx { mn } else { gc }
-                        }
-                        _ => 0,
-                    };
-                    (ch[i] as i64 - pred).unsigned_abs()
-                }).sum();
-                if l1 < best_l1 { best_l1 = l1; best_p = p; }
-            }
-            per_ch_preds[c] = best_p;
-            for i in 0..channel_size {
-                let x = i % width;
-                let y = i / width;
-                let left = if x > 0 { ch[y * width + x - 1] }
-                           else if y > 0 { ch[(y - 1) * width] }
-                           else { 0 };
-                let top = if y > 0 { ch[(y - 1) * width + x] } else { left };
-                let topleft = if x > 0 && y > 0 { ch[(y - 1) * width + x - 1] }
-                              else { left };
-                let pred = match best_p {
-                    1 => left,
-                    2 => top,
-                    3 => ((left as i64 + top as i64) / 2) as i32,
-                    4 => {
-                        let pp = left as i64 + top as i64 - topleft as i64;
-                        if (pp - left as i64).abs() < (pp - top as i64).abs() { left } else { top }
-                    }
-                    5 => {
-                        let (l, t, tl) = (left as i64, top as i64, topleft as i64);
-                        let mn = l.min(t); let mx = l.max(t);
-                        let g = l + t - tl;
-                        let gc = if tl < mn { mx } else { g };
-                        (if tl > mx { mn } else { gc }) as i32
-                    }
-                    _ => 0,
-                };
-                per_ch_residuals.push(ch[i] - pred);
-            }
-        }
-        write_modular_section_ans_perchannel_diff_pred(
-            writer, &per_ch_preds, &per_ch_residuals,
-            num_channels, channel_size, uint_config,
-        )
-    } else if best_use_ans && best_perchannel {
-        write_modular_section_ans_perchannel(
-            writer,
-            best_predictor,
-            candidates[best_idx].1,
-            num_channels,
-            channel_size,
-            uint_config,
-            false,
-        )
-    } else if best_use_ans {
-        write_modular_section_ans(
-            writer,
-            0,
-            best_predictor,
-            candidates[best_idx].1,
-            uint_config,
-            false,
-        )
-    } else {
-        write_modular_section_huffman(
-            writer,
-            0,
-            best_predictor,
-            candidates[best_idx].1,
-            uint_config,
-            false,
-        )
-    }
-}
-
-/// Encode a multi-channel modular stream where channels have different dimensions.
-///
-/// Each entry in `channel_specs` is (width, height). `data` is the concatenation
-/// of all channel values in row-major order per channel.
-///
-/// For each channel, tries multiple predictors (Zero, Left, Top, Select, Gradient)
-/// and picks the one that minimizes encoded size. Uses a multi-leaf decision tree
-/// that splits by channel, allowing each channel to use a different predictor.
-pub fn encode_modular_multichannel_stream(
-    writer: &mut BitWriter,
-    channel_specs: &[(usize, usize)],
-    data: &[i32],
-) -> Result<()> {
-    let total: usize = channel_specs.iter().map(|(w, h)| w * h).sum();
-    assert_eq!(data.len(), total);
-
-    let uint_config = HybridUintConfig::new(4, 2, 0);
-
-    // Helper: compute prediction for one channel
-    fn predict_channel(ch_data: &[i32], w: usize, h: usize, predictor: u32) -> Vec<i32> {
-        let mut residuals = Vec::with_capacity(w * h);
-        for y in 0..h {
-            for x in 0..w {
-                let val = ch_data[y * w + x];
-                let left = if x > 0 {
-                    ch_data[y * w + x - 1]
-                } else if y > 0 {
-                    ch_data[(y - 1) * w]
-                } else {
-                    0
-                };
-                let top = if y > 0 { ch_data[(y - 1) * w + x] } else { left };
-                let topleft = if x > 0 && y > 0 {
-                    ch_data[(y - 1) * w + x - 1]
-                } else {
-                    left
-                };
-
-                let pred = match predictor {
-                    1 => left,  // West
-                    2 => top,   // North
-                    4 => {      // Select
-                        let p = (left as i64 + top as i64 - topleft as i64);
-                        if (p - left as i64).abs() < (p - top as i64).abs() {
-                            left
-                        } else {
-                            top
-                        }
-                    }
-                    5 => {      // Gradient (clamped)
-                        let l = left as i64;
-                        let t = top as i64;
-                        let tl = topleft as i64;
-                        let mn = l.min(t);
-                        let mx = l.max(t);
-                        let g = l + t - tl;
-                        let grad_clamp_max = if tl < mn { mx } else { g };
-                        let pred = if tl > mx { mn } else { grad_clamp_max };
-                        pred as i32
-                    }
-                    _ => 0,     // Zero
-                };
-                residuals.push(val - pred);
-            }
-        }
-        residuals
-    }
-
-    // Find best predictor per channel by L1 score
-    let predictors = [0u32, 1, 2, 4, 5];
-    let mut best_per_channel = Vec::with_capacity(channel_specs.len());
-    let mut best_residuals_all = Vec::with_capacity(total);
-    let mut offset = 0;
-    for &(w, h) in channel_specs {
-        let ch_data = &data[offset..offset + w * h];
-        let mut best_pred = 0u32;
-        let mut best_score = u64::MAX;
-        let mut best_resid = vec![];
-        for &pred in &predictors {
-            let resid = predict_channel(ch_data, w, h, pred);
-            let score: u64 = resid.iter().map(|&v| (v as i64).unsigned_abs()).sum();
-            if score < best_score {
-                best_score = score;
-                best_pred = pred;
-                best_resid = resid;
-            }
-        }
-        best_per_channel.push(best_pred);
-        best_residuals_all.extend_from_slice(&best_resid);
-        offset += w * h;
-    }
-
-    // Check if all channels use the same predictor
-    let all_same = best_per_channel.iter().all(|&p| p == best_per_channel[0]);
-
-    // Strategy 1: single predictor (best overall by L1)
-    let mut best_single_pred = 0u32;
-    let mut best_single_score = u64::MAX;
-    for &pred in &predictors {
-        let mut score = 0u64;
-        let mut off = 0;
-        for &(w, h) in channel_specs {
-            let resid = predict_channel(&data[off..off + w * h], w, h, pred);
-            score += resid.iter().map(|&v| (v as i64).unsigned_abs()).sum::<u64>();
-            off += w * h;
-        }
-        if score < best_single_score {
-            best_single_score = score;
-            best_single_pred = pred;
-        }
-    }
-
-    // Encode with single predictor (flat, compatible with existing decoders)
-    let mut flat_resid = Vec::with_capacity(total);
-    offset = 0;
-    for &(w, h) in channel_specs {
-        flat_resid.extend_from_slice(&predict_channel(
-            &data[offset..offset + w * h], w, h, best_single_pred,
-        ));
-        offset += w * h;
-    }
-
-    // Evaluate candidates by size and write the best directly to `writer`.
-    // Each candidate: (predictor, residuals, try_ans)
-    let mut candidates_to_try: Vec<(u32, &[i32], bool)> = Vec::new();
-    candidates_to_try.push((best_single_pred, &flat_resid, false)); // Huffman
-    if total >= 64 {
-        candidates_to_try.push((best_single_pred, &flat_resid, true)); // ANS
-    }
-    if best_single_pred != 0 {
-        candidates_to_try.push((0, data, false)); // Zero predictor Huffman
-        if total >= 64 {
-            candidates_to_try.push((0, data, true)); // Zero predictor ANS
-        }
-    }
-
-    let mut best_size = usize::MAX;
-    let mut best_pred = best_single_pred;
-    let mut best_resid: &[i32] = &flat_resid;
-    let mut best_ans = false;
-
-    for &(pred, resid, use_ans) in &candidates_to_try {
-        let mut tmp = BitWriter::new();
-        let ok = if use_ans {
-            write_modular_section_ans_pub(&mut tmp, 0, pred, resid, uint_config, false).is_ok()
-        } else {
-            write_modular_section_huffman(&mut tmp, 0, pred, resid, uint_config, false).is_ok()
-        };
-        if ok {
-            let sz = tmp.total_bits_written();
-            if sz < best_size {
-                best_size = sz;
-                best_pred = pred;
-                best_resid = resid;
-                best_ans = use_ans;
-            }
-        }
-    }
-
-    // Write the winner directly to the output writer.
-    if best_ans {
-        write_modular_section_ans_pub(writer, 0, best_pred, best_resid, uint_config, false)
-    } else {
-        write_modular_section_huffman(writer, 0, best_pred, best_resid, uint_config, false)?;
-        Ok(())
-    }
+    write_modular_section_huffman(
+        writer,
+        0,
+        best_predictor,
+        candidates[best_idx].1,
+        uint_config,
+        false,
+    )
 }
 
 #[cfg(test)]

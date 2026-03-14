@@ -17,46 +17,6 @@ const SUM_PROBS: u32 = 1 << LOG_SUM_PROBS;
 /// Expected initial/final ANS state (must match decoder's AnsReader::CHECKSUM).
 const ANS_CHECKSUM: u32 = 0x130000;
 
-/// GetPopulationCountPrecision from JXL spec.
-/// Returns the number of precision bits for a frequency with given logcount at given shift.
-fn get_population_count_precision(logcount: u32, shift: u32) -> u32 {
-    let r = (logcount as i32).min(shift as i32 - ((LOG_SUM_PROBS as i32 - logcount as i32) >> 1));
-    r.max(0) as u32
-}
-
-/// Compute the smallest increment (step size) for a count at a given shift.
-fn smallest_increment_log(count: u16, shift: u32) -> u32 {
-    if count == 0 {
-        return 0;
-    }
-    let bits = 32 - (count as u32).leading_zeros(); // floor(log2(count)) + 1
-    let logcount = bits - 1; // floor(log2(count))
-    let precision = get_population_count_precision(logcount, shift);
-    if logcount > precision {
-        logcount - precision
-    } else {
-        0
-    }
-}
-
-/// Snap a frequency to the allowed grid for a given shift.
-fn snap_to_grid(count: u16, shift: u32) -> u16 {
-    if count <= 1 {
-        return count;
-    }
-    let step_log = smallest_increment_log(count, shift);
-    let mask = (1u16 << step_log) - 1;
-    count & !mask
-}
-
-/// Get the grid step size for a given count at a given shift.
-fn grid_step(count: u16, shift: u32) -> u16 {
-    if count <= 1 {
-        return 1;
-    }
-    1u16 << smallest_increment_log(count, shift)
-}
-
 /// A normalized ANS distribution for one histogram.
 #[derive(Clone, Debug)]
 pub struct AnsDistribution {
@@ -66,8 +26,6 @@ pub struct AnsDistribution {
     pub cumul: Vec<u16>,
     /// Number of symbols with freq > 0.
     pub alphabet_size: usize,
-    /// Shift used for header encoding (0-12). Higher = more header bits but better precision.
-    pub shift: u32,
 }
 
 impl AnsDistribution {
@@ -100,50 +58,31 @@ impl AnsDistribution {
             }
         }
 
-        // Adjust to hit exactly SUM_PROBS using entropy-optimal greedy adjustment.
-        // For each ±1 step, pick the symbol where the adjustment minimizes
-        // cross-entropy: cost = raw_count * log2(SUM_PROBS / freq).
-        // Increasing freq reduces cost; decreasing increases cost.
+        // Adjust to hit exactly SUM_PROBS
         while assigned != SUM_PROBS {
             if assigned > SUM_PROBS {
-                // Need to decrease some freq by 1. Pick the symbol where
-                // decreasing hurts least: minimize raw_count * (log(freq) - log(freq-1))
-                let best = freqs
+                // Find the symbol with the largest frequency and reduce it
+                let max_idx = freqs
                     .iter()
                     .enumerate()
                     .filter(|&(_, &f)| f > 1)
-                    .min_by(|&(i, &fi), &(j, &fj)| {
-                        // Cost increase of decreasing fi by 1:
-                        // raw_freqs[i] * log2(fi / (fi-1))
-                        let cost_i = raw_freqs[i] as f64 * (fi as f64 / (fi as f64 - 1.0)).ln();
-                        let cost_j = raw_freqs[j] as f64 * (fj as f64 / (fj as f64 - 1.0)).ln();
-                        cost_i.partial_cmp(&cost_j).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .max_by_key(|&(_, &f)| f)
                     .map(|(i, _)| i);
-                if let Some(idx) = best {
+                if let Some(idx) = max_idx {
                     freqs[idx] -= 1;
                     assigned -= 1;
                 } else {
-                    break;
+                    break; // Can't reduce further
                 }
             } else {
-                // Need to increase some freq by 1. Pick the symbol where
-                // increasing helps most: maximize raw_count * (log(freq+1) - log(freq))
-                let best = raw_freqs
+                // Find the symbol with the largest raw frequency and increase it
+                let best_idx = raw_freqs
                     .iter()
                     .enumerate()
                     .filter(|&(_, &f)| f > 0)
-                    .max_by(|&(i, _), &(j, _)| {
-                        // Benefit of increasing freq[i] by 1:
-                        // raw_freqs[i] * log2((fi+1) / fi)
-                        let fi = freqs[i] as f64;
-                        let fj = freqs[j] as f64;
-                        let benefit_i = raw_freqs[i] as f64 * ((fi + 1.0) / fi).ln();
-                        let benefit_j = raw_freqs[j] as f64 * ((fj + 1.0) / fj).ln();
-                        benefit_i.partial_cmp(&benefit_j).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .max_by_key(|&(_, &f)| f)
                     .map(|(i, _)| i);
-                if let Some(idx) = best {
+                if let Some(idx) = best_idx {
                     freqs[idx] += 1;
                     assigned += 1;
                 } else {
@@ -164,322 +103,6 @@ impl AnsDistribution {
             freqs,
             cumul,
             alphabet_size,
-            shift: 12, // full precision
-        })
-    }
-
-    /// Build a distribution at a given precision shift.
-    ///
-    /// Lower shift = fewer header bits but coarser frequency approximation.
-    /// The frequencies are constrained to the "allowed counts" grid determined
-    /// by the shift, matching libjxl's RebalanceHistogram.
-    pub fn from_frequencies_at_shift(raw_freqs: &[u64], shift: u32) -> Option<Self> {
-        let nonzero_count = raw_freqs.iter().filter(|&&f| f > 0).count();
-        if nonzero_count == 0 {
-            return None;
-        }
-        let alphabet_size = raw_freqs.len();
-        let total: u64 = raw_freqs.iter().sum();
-        if total == 0 {
-            return None;
-        }
-
-        let mut freqs = vec![0u16; alphabet_size];
-
-        // Find the symbol with highest raw frequency (will be the "remainder" bin)
-        let mut remainder_pos = 0;
-        let mut max_raw = 0u64;
-        for (i, &f) in raw_freqs.iter().enumerate() {
-            if f > max_raw {
-                max_raw = f;
-                remainder_pos = i;
-            }
-        }
-
-        // Initial proportional assignment, snapped to allowed grid
-        let norm = SUM_PROBS as f64 / total as f64;
-        let mut rest = SUM_PROBS as i32;
-        for (i, &f) in raw_freqs.iter().enumerate() {
-            if f == 0 {
-                continue;
-            }
-            if i == remainder_pos {
-                continue; // will be set from remainder
-            }
-            let target = f as f64 * norm;
-            let mut count = target.round().max(1.0) as u16;
-            count = count.min(SUM_PROBS as u16 - 1);
-            // Snap to allowed grid
-            count = snap_to_grid(count, shift);
-            if count == 0 && f > 0 {
-                count = 1; // minimum for nonzero symbol
-            }
-            freqs[i] = count;
-            rest -= count as i32;
-        }
-
-        // Set remainder bin
-        if rest <= 0 {
-            // Need to reduce other bins to make room
-            // Simple approach: reduce the largest non-remainder bins
-            while rest <= 0 {
-                let mut best_idx = None;
-                let mut best_freq = 0u16;
-                for (i, &f) in freqs.iter().enumerate() {
-                    if i == remainder_pos {
-                        continue;
-                    }
-                    if f > 1 && f > best_freq {
-                        best_freq = f;
-                        best_idx = Some(i);
-                    }
-                }
-                if let Some(idx) = best_idx {
-                    let old = freqs[idx];
-                    let step = grid_step(old, shift);
-                    let new_val = old.saturating_sub(step).max(1);
-                    let new_val = snap_to_grid(new_val, shift).max(1);
-                    let delta = old - new_val;
-                    freqs[idx] = new_val;
-                    rest += delta as i32;
-                } else {
-                    break;
-                }
-            }
-            freqs[remainder_pos] = rest.max(1) as u16;
-        } else {
-            freqs[remainder_pos] = rest as u16;
-        }
-
-        // Greedy entropy-optimal adjustment (same as full precision but on grid)
-        let mut assigned: u32 = freqs.iter().map(|&f| f as u32).sum();
-        let max_iters = 200;
-        let mut iters = 0;
-        while assigned != SUM_PROBS && iters < max_iters {
-            iters += 1;
-            if assigned > SUM_PROBS {
-                // Decrease: find symbol where -step hurts least
-                let best = freqs
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, &f)| f > 1 && i != remainder_pos)
-                    .min_by(|&(i, &fi), &(j, &fj)| {
-                        let step_i = grid_step(fi, shift).max(1);
-                        let step_j = grid_step(fj, shift).max(1);
-                        let new_fi = (fi - step_i).max(1);
-                        let new_fj = (fj - step_j).max(1);
-                        let cost_i = raw_freqs[i] as f64 * (fi as f64 / new_fi as f64).ln();
-                        let cost_j = raw_freqs[j] as f64 * (fj as f64 / new_fj as f64).ln();
-                        cost_i.partial_cmp(&cost_j).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(i, _)| i);
-                if let Some(idx) = best {
-                    let step = grid_step(freqs[idx], shift).max(1);
-                    let old = freqs[idx];
-                    let new_val = (old - step).max(1);
-                    freqs[idx] = new_val;
-                    assigned -= (old - new_val) as u32;
-                    freqs[remainder_pos] = (freqs[remainder_pos] as u32 + (old - new_val) as u32) as u16;
-                } else {
-                    break;
-                }
-            } else {
-                // Increase: find symbol where +step helps most
-                let best = raw_freqs
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, &f)| f > 0 && i != remainder_pos)
-                    .max_by(|&(i, _), &(j, _)| {
-                        let fi = freqs[i] as f64;
-                        let fj = freqs[j] as f64;
-                        let step_i = grid_step(freqs[i], shift).max(1) as f64;
-                        let step_j = grid_step(freqs[j], shift).max(1) as f64;
-                        let benefit_i = raw_freqs[i] as f64 * ((fi + step_i) / fi).ln();
-                        let benefit_j = raw_freqs[j] as f64 * ((fj + step_j) / fj).ln();
-                        benefit_i.partial_cmp(&benefit_j).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(i, _)| i);
-                if let Some(idx) = best {
-                    let step = grid_step(freqs[idx], shift).max(1);
-                    let old = freqs[idx];
-                    let new_val = old + step;
-                    if new_val as u32 + (assigned - old as u32) > SUM_PROBS {
-                        break;
-                    }
-                    freqs[idx] = new_val;
-                    assigned += (new_val - old) as u32;
-                    freqs[remainder_pos] = (freqs[remainder_pos] as i32 - (new_val - old) as i32).max(0) as u16;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Final check: ensure sum = SUM_PROBS
-        let sum: u32 = freqs.iter().map(|&f| f as u32).sum();
-        if sum != SUM_PROBS {
-            // Adjust remainder
-            let diff = SUM_PROBS as i32 - sum as i32;
-            freqs[remainder_pos] = (freqs[remainder_pos] as i32 + diff).max(1) as u16;
-        }
-
-        // Verify no zero freqs for nonzero raw freqs
-        for (i, &f) in raw_freqs.iter().enumerate() {
-            if f > 0 && freqs[i] == 0 {
-                freqs[i] = 1;
-                // Steal from remainder
-                if freqs[remainder_pos] > 1 {
-                    freqs[remainder_pos] -= 1;
-                }
-            }
-        }
-
-        let sum: u32 = freqs.iter().map(|&f| f as u32).sum();
-        if sum != SUM_PROBS {
-            return None; // couldn't balance
-        }
-
-        let mut cumul = vec![0u16; alphabet_size + 1];
-        for i in 0..alphabet_size {
-            cumul[i + 1] = cumul[i] + freqs[i];
-        }
-
-        Some(Self {
-            freqs,
-            cumul,
-            alphabet_size,
-            shift,
-        })
-    }
-
-    /// Estimate the total cost (header + data) for this distribution encoding
-    /// the given raw frequency counts.
-    pub fn estimate_total_cost(&self, raw_freqs: &[u64], shift: u32) -> f64 {
-        let total_tokens: u64 = raw_freqs.iter().sum();
-        if total_tokens == 0 {
-            return 0.0;
-        }
-
-        // Data cost: cross-entropy
-        let mut data_bits = 0.0f64;
-        for (i, &raw) in raw_freqs.iter().enumerate() {
-            if raw > 0 && self.freqs[i] > 0 {
-                // Cost per token = log2(SUM_PROBS / freq)
-                data_bits += raw as f64 * (SUM_PROBS as f64 / self.freqs[i] as f64).log2();
-            }
-        }
-
-        // Header cost estimate (simplified):
-        // For each nonzero symbol: prefix code (~3-5 bits) + extra bits determined by shift
-        let mut header_bits = 0.0f64;
-        header_bits += 4.0; // shift encoding overhead
-        header_bits += 10.0; // alphabet_size encoding
-        for (i, &freq) in self.freqs.iter().enumerate() {
-            if freq == 0 {
-                header_bits += 5.0; // prefix code for zero
-                continue;
-            }
-            let code = if freq == 1 { 1 } else { (32 - (freq as u32).leading_zeros()) as i16 };
-            header_bits += 4.0; // approximate prefix code length
-
-            if code > 1 {
-                let zeros = code - 1;
-                let bitcount = (shift as i16 - ((LOG_SUM_PROBS as i16 - zeros) >> 1))
-                    .clamp(0, zeros);
-                header_bits += bitcount as f64;
-            }
-        }
-
-        data_bits + header_bits
-    }
-
-    /// Build the best distribution by trying multiple shifts.
-    /// Returns (distribution, best_shift).
-    ///
-    /// The returned distribution has frequencies that exactly match what the
-    /// decoder will reconstruct, guaranteeing encode/decode consistency.
-    pub fn from_frequencies_best(raw_freqs: &[u64]) -> Option<(Self, u32)> {
-        let nonzero_count = raw_freqs.iter().filter(|&&f| f > 0).count();
-        if nonzero_count <= 2 {
-            // For 1-2 symbols, shift doesn't matter
-            return Self::from_frequencies(raw_freqs).map(|d| (d, 12));
-        }
-
-        // Try shifts 0, 6, 12 (libjxl's kFast strategy)
-        let shifts = [0u32, 6, 12];
-        let mut best_dist = None;
-        let mut best_shift = 12u32;
-        let mut best_cost = f64::MAX;
-
-        // We need log_alpha_size for roundtrip test
-        let max_alpha = raw_freqs.len();
-        let log_alpha_size = if max_alpha <= 32 {
-            5
-        } else if max_alpha <= 64 {
-            6
-        } else if max_alpha <= 128 {
-            7
-        } else {
-            8
-        };
-
-        for &shift in &shifts {
-            if let Some(dist) = Self::from_frequencies_at_shift(raw_freqs, shift) {
-                // Roundtrip through encoder/decoder to get exact decoded frequencies
-                if let Ok(roundtripped) = dist.roundtrip_through_decoder(log_alpha_size) {
-                    let cost = roundtripped.estimate_total_cost(raw_freqs, shift);
-                    if cost < best_cost {
-                        best_cost = cost;
-                        best_shift = shift;
-                        best_dist = Some(roundtripped);
-                    }
-                }
-            }
-        }
-
-        best_dist.map(|d| (d, best_shift))
-    }
-
-    /// Write this distribution to a bitstream and read it back to get the exact
-    /// frequencies the decoder will use.
-    fn roundtrip_through_decoder(&self, log_alpha_size: usize) -> Result<Self> {
-        let mut tmp_w = crate::encode::bit_writer::BitWriter::new();
-        write_ans_distribution(&mut tmp_w, self, log_alpha_size)?;
-        tmp_w.write(32, 0)?; // safety padding
-        let tmp_bytes = tmp_w.finish();
-        let mut tmp_br = crate::bit_reader::BitReader::new(&tmp_bytes);
-        let hist = crate::entropy_coding::ans::AnsHistogram::decode(&mut tmp_br, log_alpha_size)
-            .map_err(|_| Error::InvalidAnsHistogram)?;
-
-        // Extract decoded frequencies
-        let alphabet_size = self.alphabet_size;
-        let mut freqs = vec![0u16; alphabet_size];
-        // The decoded histogram has a frequency table we can extract
-        // by counting alias table entries
-        for idx in 0..SUM_PROBS {
-            let i = (idx >> hist.log_bucket_size) as usize;
-            let pos = idx & ((1u32 << hist.log_bucket_size) - 1);
-            let bucket = hist.buckets[i];
-            let symbol = if pos >= bucket.alias_cutoff as u32 {
-                bucket.alias_symbol as usize
-            } else {
-                i
-            };
-            if symbol < alphabet_size {
-                freqs[symbol] += 1;
-            }
-        }
-
-        let mut cumul = vec![0u16; alphabet_size + 1];
-        for i in 0..alphabet_size {
-            cumul[i + 1] = cumul[i] + freqs[i];
-        }
-
-        Ok(Self {
-            freqs,
-            cumul,
-            alphabet_size,
-            shift: self.shift,
         })
     }
 
@@ -496,7 +119,6 @@ impl AnsDistribution {
             freqs,
             cumul,
             alphabet_size,
-            shift: 12,
         }
     }
 }
@@ -574,9 +196,8 @@ fn write_ans_distribution_complex(
     let alphabet_size = dist.alphabet_size;
     assert!(alphabet_size >= 3);
 
-    // Use the shift stored in the distribution (selected by from_frequencies_best
-    // or defaulting to 12 for full precision).
-    let shift: i16 = dist.shift as i16;
+    // Use max shift for full precision
+    let shift: i16 = 13;
     // Encode shift: variable-length code
     // Decode formula: read unary len (0..3), then shift = (1<<len) - 1 + read(len)
     // shift=13 -> len=3, rem = 13 - 7 = 6
@@ -787,44 +408,13 @@ fn write_ans_prefix(w: &mut BitWriter, val: u16) -> Result<()> {
 // ==================== rANS stream encoder ====================
 
 /// Bit payload associated with one token in forward decoding order.
-/// Uses inline storage for refills (most tokens need 0-2 refills).
 #[derive(Debug, Default)]
 struct AnsTokenBits {
     /// 16-bit rANS normalization words consumed by `AnsHistogram::read`.
-    /// Inline up to 4 refills to avoid heap allocation for most tokens.
-    refills_inline: [u16; 4],
-    refills_len: u8,
-    refills_overflow: Option<Vec<u16>>,
+    refills: Vec<u16>,
     /// HybridUint extra bits consumed after reading the token.
     extra_bits: u32,
     extra_nbits: usize,
-}
-
-impl AnsTokenBits {
-    #[inline]
-    fn push_refill(&mut self, val: u16) {
-        let len = self.refills_len as usize;
-        if len < 4 {
-            self.refills_inline[len] = val;
-            self.refills_len += 1;
-        } else {
-            self.refills_overflow
-                .get_or_insert_with(Vec::new)
-                .push(val);
-        }
-    }
-
-    #[inline]
-    fn refills(&self) -> impl Iterator<Item = &u16> {
-        let inline_len = (self.refills_len as usize).min(4);
-        self.refills_inline[..inline_len].iter().chain(
-            self.refills_overflow
-                .as_ref()
-                .map(|v| v.as_slice())
-                .unwrap_or(&[])
-                .iter(),
-        )
-    }
 }
 
 /// Per-cluster reverse mapping from (symbol, offset) -> 12-bit ANS index.
@@ -973,7 +563,7 @@ pub fn write_ans_stream(
         // Renormalize (matches libjxl ANSCoder::PutSymbol):
         // while (state >> (32 - LOG_SUM_PROBS)) >= freq, emit 16 LSB bits.
         while (state >> (32 - LOG_SUM_PROBS)) >= freq {
-            bits.push_refill((state & 0xFFFF) as u16);
+            bits.refills.push((state & 0xFFFF) as u16);
             state >>= 16;
         }
 
@@ -995,7 +585,7 @@ pub fn write_ans_stream(
     // Write initial state, then per-token payloads in forward symbol order.
     w.write(32, state as u64)?;
     for bits in token_bits_rev.iter().rev() {
-        for &r in bits.refills() {
+        for &r in &bits.refills {
             w.write(16, r as u64)?;
         }
         if bits.extra_nbits > 0 {
