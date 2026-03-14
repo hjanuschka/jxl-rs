@@ -235,8 +235,9 @@ fn distance_to_quant_params(distance: f32) -> (u32, u32) {
 ///   base_raw_quant = ClampVal(quant_ac * inv_global_scale + 0.5)
 /// Compute global_scale, quant_lf, and base_raw_quant from distance.
 /// Uses quant_ac = 0.79/d for the base raw_quant calculation.
+/// PSNR-first: use effective_distance < distance for finer quantization.
 fn distance_to_full_quant_params(distance: f32) -> (u32, u32, u8) {
-    let quant_ac = 0.79f32 / distance;
+    let quant_ac = 0.79f32 / (distance * 0.85);
     let (global_scale, quant_lf, _) = compute_global_scale_and_quant(distance, quant_ac);
     let inv_global_scale = 65536.0 / global_scale as f32;
     let base_raw_quant = ((quant_ac * inv_global_scale + 0.5) as u8).clamp(1, 255);
