@@ -1447,22 +1447,24 @@ fn compute_cfl_maps_scalar(
             // where regularizer = num * distance_mul * 0.5 * K^2
             let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8) * ((tx * 8 + 8).min(bw) - tx * 8);
             let num_coeffs = (n_blocks * 63) as f64;
-            // kDistanceMultiplierAC = 1e-3 (libjxl uses 1e-9 but with much
-            // larger q*qm weights; we scale up to compensate)
-            let dist_mul = 1e-3;
+            // libjxl's kDistanceMultiplierAC = 1e-9, but in their formula the
+            // regularizer is in (y*qw/84)^2 units. Converting to our sum_yy
+            // units: reg = 84^2 * N * 1e-9 * 0.5 = N * 3.528e-6.
+            let reg = num_coeffs * 84.0 * 84.0 * 1e-9 * 0.5;
 
             // X channel: base_correlation_x = 0
-            let reg_x = num_coeffs * dist_mul * 0.5;
-            if sum_yy_x + reg_x > 1e-10 {
-                let x_raw = (sum_yx / (sum_yy_x + reg_x)) * K_COLOR_FACTOR as f64;
+            // libjxl: x = 84 * sum(y*qw^2*X) / (sum(y^2*qw^2) + reg)
+            if sum_yy_x + reg > 1e-10 {
+                let x_raw = (sum_yx / (sum_yy_x + reg)) * K_COLOR_FACTOR as f64;
                 let x_shrunk = towards_zero_shrink(x_raw, TOWARDS_ZERO);
                 ytox_map[ty * cr_w + tx] = (x_shrunk.round() as i32).clamp(-127, 127);
             }
 
             // B channel: base_correlation_b = 1.0
-            let reg_b = num_coeffs * dist_mul * 0.5;
-            if sum_yy_b + reg_b > 1e-10 {
-                let b_raw = ((sum_yb / (sum_yy_b + reg_b)) - 1.0) * K_COLOR_FACTOR as f64;
+            // libjxl: x = 84 * sum(y*qw^2*(B-Y)) / (sum(y^2*qw^2) + reg)
+            // Previous bug: (sum_yb/(sum_yy+reg) - 1.0)*84 leaked reg into numerator
+            if sum_yy_b + reg > 1e-10 {
+                let b_raw = K_COLOR_FACTOR as f64 * (sum_yb - sum_yy_b) / (sum_yy_b + reg);
                 let b_shrunk = towards_zero_shrink(b_raw, TOWARDS_ZERO);
                 ytob_map[ty * cr_w + tx] = (b_shrunk.round() as i32).clamp(-127, 127);
             }
@@ -1563,18 +1565,16 @@ fn compute_cfl_maps_simd_assisted<D: SimdDescriptor>(
 
             let n_blocks = ((ty * 8 + 8).min(bh) - ty * 8) * ((tx * 8 + 8).min(bw) - tx * 8);
             let num_coeffs = (n_blocks * 63) as f64;
-            let dist_mul = 1e-3;
+            let reg = num_coeffs * 84.0 * 84.0 * 1e-9 * 0.5;
 
-            let reg_x = num_coeffs * dist_mul * 0.5;
-            if sum_yy_x + reg_x > 1e-10 {
-                let x_raw = (sum_yx / (sum_yy_x + reg_x)) * K_COLOR_FACTOR as f64;
+            if sum_yy_x + reg > 1e-10 {
+                let x_raw = (sum_yx / (sum_yy_x + reg)) * K_COLOR_FACTOR as f64;
                 let x_shrunk = towards_zero_shrink(x_raw, TOWARDS_ZERO);
                 ytox_map[ty * cr_w + tx] = (x_shrunk.round() as i32).clamp(-127, 127);
             }
 
-            let reg_b = num_coeffs * dist_mul * 0.5;
-            if sum_yy_b + reg_b > 1e-10 {
-                let b_raw = ((sum_yb / (sum_yy_b + reg_b)) - 1.0) * K_COLOR_FACTOR as f64;
+            if sum_yy_b + reg > 1e-10 {
+                let b_raw = K_COLOR_FACTOR as f64 * (sum_yb - sum_yy_b) / (sum_yy_b + reg);
                 let b_shrunk = towards_zero_shrink(b_raw, TOWARDS_ZERO);
                 ytob_map[ty * cr_w + tx] = (b_shrunk.round() as i32).clamp(-127, 127);
             }
