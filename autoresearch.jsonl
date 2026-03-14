@@ -130,3 +130,4 @@
 {"run":58,"commit":"5b1b5f8","metric":1.958,"metrics":{},"status":"discard","description":"2% quality budget selection: no change, rq=5 vs rq=6 gap is 26% (way over 2%)","timestamp":1773451127634,"segment":0}
 {"run":59,"commit":"5b1b5f8","metric":1.958,"metrics":{},"status":"discard","description":"More cluster counts (48,64): no change, limited by number of contexts","timestamp":1773451262752,"segment":0}
 {"run":60,"commit":"3e58cc7","metric":1.958,"metrics":{},"status":"discard","description":"Trellis DC quantization (floor/ceil vs prediction): no change, round-nearest already optimal","timestamp":1773451447431,"segment":0}
+{"run":61,"commit":"e3b552f","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.958 stable after 60 experiments. ANS shift optimization committed. Remaining gap requires structural entropy coding improvements.","timestamp":1773451497595,"segment":0}
