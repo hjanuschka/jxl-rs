@@ -164,3 +164,6 @@
 {"run":92,"commit":"1395683","metric":10.215,"metrics":{},"status":"discard","description":"Use uniform gs=8813: catastrophic as before. Need intermediate gs for better dequant/quant balance.","timestamp":1773456622715,"segment":0}
 {"run":93,"commit":"1395683","metric":4.504,"metrics":{},"status":"discard","description":"gs from q=0.55/d (intermediate): better PSNR (+0.99 mean) but +4.89% max size on one image","timestamp":1773456698579,"segment":0}
 {"run":94,"commit":"1395683","metric":17.372,"metrics":{},"status":"discard","description":"gs from q=0.45/d: catastrophic -3.48 dB on one image","timestamp":1773456760110,"segment":0}
+{"run":95,"commit":"c97cde0","metric":1.958,"metrics":{},"status":"keep","description":"Baseline 1.958 after 94 experiments. Root cause identified: gs/dequant step mismatch.","timestamp":1773456902013,"segment":0}
+{"run":96,"commit":"c97cde0","metric":10.22,"metrics":{},"status":"discard","description":"gs=8813: kodim08 PSNR fixed (+0.20 vs -0.31!) but Webkit -1.49 dB, kodim01/zoltan too large","timestamp":1773457050953,"segment":0}
+{"run":97,"commit":"c97cde0","metric":4.495,"metrics":{},"status":"discard","description":"Recomputed base_rq at gs_aq: changed rq selection, worse parity","timestamp":1773457169498,"segment":0}
