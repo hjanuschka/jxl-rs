@@ -814,7 +814,7 @@ pub fn encode_modular_multichannel_stream(
     let total: usize = channel_specs.iter().map(|(w, h)| w * h).sum();
     assert_eq!(data.len(), total);
 
-    let uint_config = HybridUintConfig::new(4, 1, 2);
+    let uint_config = HybridUintConfig::new(4, 2, 0);
 
     // Helper: compute prediction for one channel
     fn predict_channel(ch_data: &[i32], w: usize, h: usize, predictor: u32) -> Vec<i32> {
