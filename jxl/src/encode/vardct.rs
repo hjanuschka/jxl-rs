@@ -7556,7 +7556,9 @@ fn build_ans_distributions(
     cluster_frequencies
         .iter()
         .map(|freqs| {
-            crate::encode::entropy::ans::AnsDistribution::from_frequencies(freqs)
+            // Try multiple shifts and pick the one with best total cost (header + data).
+            crate::encode::entropy::ans::AnsDistribution::from_frequencies_best(freqs)
+                .map(|(dist, _shift)| dist)
                 .unwrap_or_else(|| crate::encode::entropy::ans::AnsDistribution::single_symbol(0))
         })
         .collect()

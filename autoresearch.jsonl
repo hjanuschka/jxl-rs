@@ -119,3 +119,4 @@
 {"run":47,"commit":"995f8fe","metric":63.537,"metrics":{},"status":"crash","description":"Dead zone 0.45: broken rounding logic, massive PSNR loss","timestamp":1773448900952,"segment":0}
 {"run":48,"commit":"2d3aadc","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.96 stable after 47 experiments. Key wins: greedy clustering (-15%), HF metadata prediction (-3%), entropy-optimal ANS normalization","timestamp":1773448984943,"segment":0}
 {"run":49,"commit":"2d3aadc","metric":2.972,"metrics":{},"status":"discard","description":"Per-candidate ep (softer=ep2, others=ep1): worse parity 2.97, mixed ep hurts","timestamp":1773449066875,"segment":0}
+{"run":50,"commit":"ff739b4","metric":1.958,"metrics":{},"status":"keep","description":"Final baseline: parity 1.96, 49 experiments. Optimization plateau reached.","timestamp":1773449130059,"segment":0}

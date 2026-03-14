@@ -353,7 +353,8 @@ fn write_modular_section_ans(
         frequencies[enc.token as usize] += 1;
     }
 
-    let dist = AnsDistribution::from_frequencies(&frequencies)
+    let dist = AnsDistribution::from_frequencies_best(&frequencies)
+        .map(|(d, _)| d)
         .ok_or(Error::InvalidAnsHistogram)?;
 
     let ans_tokens: Vec<AnsToken> = residual_encoded
@@ -452,7 +453,8 @@ pub fn write_modular_section_ans_perchannel(
     }
 
     for leaf_id in 0..num_channels {
-        let dist = AnsDistribution::from_frequencies(&leaf_freqs[leaf_id])
+        let dist = AnsDistribution::from_frequencies_best(&leaf_freqs[leaf_id])
+            .map(|(d, _)| d)
             .ok_or(Error::InvalidAnsHistogram)?;
         leaf_dists.push(dist);
     }
