@@ -1719,7 +1719,7 @@ fn quantize_vardct_blocks(
 
         // Per-tile adaptive b_dm: larger |ytob| -> finer B quant to compensate Y->B error
         let ytob_abs = (b_factor as f32 / K_COLOR_FACTOR).abs();
-        let tile_b_dm = b_dm_multiplier * (1.0 - 0.05 * ytob_abs.min(1.0));
+        let tile_b_dm = b_dm_multiplier * (1.0 - 0.06 * ytob_abs.min(1.0));
 
         // DC: apply CfL decorrelation and proper DC quantization.
         let raw_dc_x = dct_x[blk * 64];
@@ -1803,7 +1803,7 @@ fn quantize_vardct_blocks_simd_assisted<D: SimdDescriptor>(
 
         // Per-tile adaptive b_dm: larger |ytob| -> finer B quant to compensate Y->B error
         let ytob_abs = (b_factor as f32 / K_COLOR_FACTOR).abs();
-        let tile_b_dm = b_dm_multiplier * (1.0 - 0.05 * ytob_abs.min(1.0));
+        let tile_b_dm = b_dm_multiplier * (1.0 - 0.06 * ytob_abs.min(1.0));
 
         let raw_dc_x = dct_x[blk * 64];
         let raw_dc_y = dct_y[blk * 64];
