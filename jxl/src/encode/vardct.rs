@@ -1057,7 +1057,7 @@ fn encode_single_rgba_frame(
 
     // dm_multiplier for x and b channels (from x_qm_scale=3, b_qm_scale=2 defaults)
     let x_dm_multiplier = (1.0f32 / 1.25).powf(3.0 - 2.0) * 0.97; // = 0.776, optimal
-    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 0.94; // optimal
+    let b_dm_multiplier = (1.0f32 / 1.25).powf(2.0 - 2.0) * 1.0; // restore default (save bytes)
 
     // Cache forward transformed non-8x8 blocks across candidate evaluation.
     let mut forward_transform_cache = ForwardTransformCoeffCache::new();
