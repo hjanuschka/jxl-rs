@@ -120,3 +120,8 @@
 {"run":48,"commit":"2d3aadc","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.96 stable after 47 experiments. Key wins: greedy clustering (-15%), HF metadata prediction (-3%), entropy-optimal ANS normalization","timestamp":1773448984943,"segment":0}
 {"run":49,"commit":"2d3aadc","metric":2.972,"metrics":{},"status":"discard","description":"Per-candidate ep (softer=ep2, others=ep1): worse parity 2.97, mixed ep hurts","timestamp":1773449066875,"segment":0}
 {"run":50,"commit":"ff739b4","metric":1.958,"metrics":{},"status":"keep","description":"Final baseline: parity 1.96, 49 experiments. Optimization plateau reached.","timestamp":1773449130059,"segment":0}
+{"run":51,"commit":"4f48e46","metric":1.958,"metrics":{},"status":"keep","description":"ANS shift selection (0,6,12 with roundtrip): 0.04% smaller avg but same parity since size already beats libjxl","timestamp":1773449670602,"segment":0}
+{"run":52,"commit":"4f48e46","metric":4.375,"metrics":{},"status":"discard","description":"Force rq=6 only (remove softer_rq=5): 4.86% larger on some images, parity 4.37","timestamp":1773449852911,"segment":0}
+{"run":53,"commit":"4f48e46","metric":1.969,"metrics":{},"status":"discard","description":"ep=2 with shift optimization: 1.969 vs 1.958, zoltan +0.43% size penalty negates PSNR gain","timestamp":1773450054079,"segment":0}
+{"run":54,"commit":"4f48e46","metric":23.124,"metrics":{},"status":"discard","description":"ep=2 + softer_rq=base-2: way too coarse, -1.97 dB PSNR","timestamp":1773450134677,"segment":0}
+{"run":55,"commit":"4f48e46","metric":23.124,"metrics":{},"status":"discard","description":"ep=2 + extra_softer_rq=base-2: rq=4 wins everywhere, -1.97 dB PSNR","timestamp":1773450518859,"segment":0}
