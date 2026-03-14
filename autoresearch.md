@@ -1,37 +1,34 @@
-# Autoresearch: encoder parity with libjxl (size + PSNR)
+# Autoresearch: encoder PSNR parity with libjxl (all images >= 0 dB gap)
 
 ## Objective
-Reduce jxl-rs encoder parity gaps against libjxl on sampler-style RGB images.
-The target is to close both:
-- size gap (bytes)
-- quality gap (PSNR)
-at fixed settings (distance=1.0, jxl-rs effort=7, libjxl effort=3).
+Achieve PSNR >= libjxl on ALL images in the corpus.
+Size is secondary -- we accept larger files if needed to reach PSNR parity.
+Target: parity_score = 0 (worst PSNR gap across all images >= 0 dB).
+
+Settings: distance=1.0, jxl-rs effort=7, libjxl effort=3.
 
 We are explicitly allowed to inspect libjxl C++ reference code under `/tmp/libjxl`
 (read-only) to copy algorithmic behavior and constants where parity requires it.
 
 ## Metrics
-- **Primary**: `parity_score` (unitless, lower is better)
-  - Defined as corpus mean of: `max(0, size_pct) + 20 * max(0, -psnr_gap_db)`
-  - where `size_pct = (ours/lib - 1) * 100`, `psnr_gap_db = ours_psnr - lib_psnr`.
-  - This rewards equal-or-better size and equal-or-better PSNR vs libjxl.
+- **Primary**: `parity_score` (dB, lower is better, target = 0)
+  - Defined as: `max(0, -min_psnr_gap_db)` across all corpus images
+  - where `psnr_gap_db = our_psnr - libjxl_psnr` (positive = we're better)
+  - A score of 0 means ALL images have PSNR >= libjxl
 - **Secondary**:
-  - `mean_size_pct`
-  - `mean_psnr_gap_db`
-  - `max_size_pct`
-  - `min_psnr_gap_db`
+  - `mean_size_pct` (average file size vs libjxl, negative = smaller)
+  - `mean_psnr_gap_db` (average PSNR difference)
+  - `max_size_pct` (worst file size vs libjxl)
+  - `min_psnr_gap_db` (worst PSNR gap -- this IS the primary metric negated)
+  - `num_psnr_negative` (count of images with PSNR < libjxl)
   - `total_encode_s` (jxl-rs wall-clock across corpus)
 
 ## How to Run
 `./autoresearch.sh`
 
-The script prints:
-- `METRIC parity_score=<number>`
-- `METRIC mean_size_pct=<number>`
-- `METRIC mean_psnr_gap_db=<number>`
-- `METRIC max_size_pct=<number>`
-- `METRIC min_psnr_gap_db=<number>`
-- `METRIC total_encode_s=<number>`
+## Corpus
+Full sampler: all `*_source.jpg` files in the images directory (19 images).
+Includes Kodak set, dice, zoltan, Webkit-logo-P3.
 
 ## Files in Scope
 - `jxl/src/encode/vardct.rs` - VarDCT rate/distortion decisions, AQ, transforms, tokenization.
@@ -55,10 +52,3 @@ The script prints:
 - Maintain determinism guardrails (scalar canonical output unless explicitly gated).
 - Keep changes measurable on the defined corpus.
 - `/tmp/libjxl` is reference-only: inspect freely, but do not modify.
-
-## What's Been Tried
-- SIMD foundation landed (dispatch, helpers, tests, fuzz smoke, CI jobs).
-- Transform SIMD kernels added for 8x8/16x16/16x8/8x16/32x32 with equivalence tests.
-- AQ-related SIMD-assisted loops added (mask mapping/downsample and related helpers).
-- CI checks now include scalar-vs-auto codestream equality and scalar-vs-assisted RD regression smoke.
-- Current remaining macro gap is parity vs libjxl in size and PSNR at fixed settings, not just microkernel speed.

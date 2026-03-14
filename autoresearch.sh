@@ -24,14 +24,8 @@ from pathlib import Path
 repo = Path('.').resolve()
 imgdir = Path('/home/chrome/my-host/static-files/jxl-encode/images')
 
-# Small but representative sampler-like RGB subset
-corpus = [
-    imgdir / 'kodim01_source.jpg',
-    imgdir / 'kodim08_source.jpg',
-    imgdir / 'kodim13_source.jpg',
-    imgdir / 'zoltan_source.jpg',
-    imgdir / 'Webkit-logo-P3_source.jpg',
-]
+# Full corpus: all source images in the sampler
+corpus = sorted(imgdir.glob('*_source.jpg'))
 
 jxle = Path(os.environ.get('JXLE', str(repo / 'target/release/jxle')))
 
@@ -94,8 +88,8 @@ def psnr(a: bytes, b: bytes) -> float:
 
 size_pcts = []
 psnr_gaps = []
-penalties = []
 encode_total = 0.0
+num_psnr_negative = 0
 
 from PIL import Image
 
@@ -146,22 +140,26 @@ with tempfile.TemporaryDirectory(prefix='autoresearch-parity-') as td:
         lib_psnr = psnr(src_rgb, l_rgb)
         psnr_gap = ours_psnr - lib_psnr
 
-        penalty = max(0.0, size_pct) + 20.0 * max(0.0, -psnr_gap)
-
         size_pcts.append(size_pct)
         psnr_gaps.append(psnr_gap)
-        penalties.append(penalty)
+        if psnr_gap < 0:
+            num_psnr_negative += 1
 
-mean_size = sum(size_pcts) / len(size_pcts)
-mean_gap = sum(psnr_gaps) / len(psnr_gaps)
+n = len(psnr_gaps)
+mean_size = sum(size_pcts) / n
+mean_gap = sum(psnr_gaps) / n
 max_size = max(size_pcts)
 min_gap = min(psnr_gaps)
-parity_score = sum(penalties) / len(penalties)
+
+# Primary metric: worst PSNR deficit (lower = better, target = 0)
+# Measures how far the worst image is from parity. 0 means all images >= libjxl.
+parity_score = max(0.0, -min_gap)
 
 print(f'METRIC parity_score={parity_score:.6f}')
 print(f'METRIC mean_size_pct={mean_size:.6f}')
 print(f'METRIC mean_psnr_gap_db={mean_gap:.6f}')
 print(f'METRIC max_size_pct={max_size:.6f}')
 print(f'METRIC min_psnr_gap_db={min_gap:.6f}')
+print(f'METRIC num_psnr_negative={num_psnr_negative}')
 print(f'METRIC total_encode_s={encode_total:.6f}')
 PY
