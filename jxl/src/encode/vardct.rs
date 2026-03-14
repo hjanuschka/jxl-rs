@@ -6687,7 +6687,7 @@ fn write_vardct_frame_header_full(writer: &mut BitWriter, cfg: &FrameHeaderConfi
     writer.write(1, 1)?; // epf_weight_custom = true
     writer.write(16, f32_to_f16_bits(40.0))?; // epf_channel_scale[0] = 40.0 (Y, default)
     writer.write(16, f32_to_f16_bits(5.0))?;  // epf_channel_scale[1] = 5.0 (X, default)
-    writer.write(16, f32_to_f16_bits(1.5))?;  // epf_channel_scale[2] = 1.5 (B, strongly reduced)
+    writer.write(16, f32_to_f16_bits(2.0))?;  // epf_channel_scale[2] = 2.0 (B, reduced)
     writer.write(16, f32_to_f16_bits(0.45))?; // epf_pass1_zeroflush = 0.45 (default)
     writer.write(16, f32_to_f16_bits(0.6))?;  // epf_pass2_zeroflush = 0.6 (default)
     writer.write(1, 0)?; // epf_sigma_custom = false
