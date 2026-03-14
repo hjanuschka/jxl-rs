@@ -169,3 +169,4 @@
 {"run":97,"commit":"c97cde0","metric":4.495,"metrics":{},"status":"discard","description":"Recomputed base_rq at gs_aq: changed rq selection, worse parity","timestamp":1773457169498,"segment":0}
 {"run":98,"commit":"1b5581a","metric":1.958,"metrics":{},"status":"keep","description":"Baseline stable at 1.958, 97 experiments. Dual-gs candidate system needed for further progress.","timestamp":1773457249518,"segment":0}
 {"run":99,"commit":"c97cde0","metric":4.378,"metrics":{},"status":"discard","description":"gs from q=0.576/d (match libjxl quant step at rq=7): better PSNR but +5.6% max size","timestamp":1773457360088,"segment":0}
+{"run":100,"commit":"1195793","metric":1.958,"metrics":{},"status":"keep","description":"100th experiment. Parity 1.958 (17.8% improvement from 2.38). Optimization plateau -- architectural changes required.","timestamp":1773457424167,"segment":0}
