@@ -138,3 +138,4 @@
 {"run":66,"commit":"287ebc2","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.958 stable. 65 experiments. Confirmed: 26% entropy gap from coefficient value differences, not ANS overhead.","timestamp":1773452051467,"segment":0}
 {"run":67,"commit":"18ae55c","metric":1.958,"metrics":{},"status":"discard","description":"Match libjxl gaborish FP order (row-based Symmetric5): identical output, quant absorbs ULP diffs","timestamp":1773452245116,"segment":0}
 {"run":68,"commit":"18ae55c","metric":9.015,"metrics":{},"status":"discard","description":"Force DCT8-only (no merges): +15% size, -1.0 dB. Merges are critical for our parity!","timestamp":1773452354587,"segment":0}
+{"run":69,"commit":"8d75c7f","metric":1.958,"metrics":{},"status":"keep","description":"Baseline verified. Key insight: DCT16/32 merges save ~25%, compensating for base entropy gap.","timestamp":1773452415397,"segment":0}
