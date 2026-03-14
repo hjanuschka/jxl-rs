@@ -1,6 +1,6 @@
 # Autoresearch Ideas (deferred)
 
-## Current Status: parity_score=1.96 (commit acdf6aa, 31 experiments)
+## Current Status: parity_score=1.96 (commit 85b91bd, 42 experiments)
 
 ## Per-Image Breakdown (ep=1, gs=5111, with greedy clustering + HF metadata prediction)
 - Webkit: 0 penalty (SOLVED)
