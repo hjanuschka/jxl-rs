@@ -132,3 +132,6 @@
 {"run":60,"commit":"3e58cc7","metric":1.958,"metrics":{},"status":"discard","description":"Trellis DC quantization (floor/ceil vs prediction): no change, round-nearest already optimal","timestamp":1773451447431,"segment":0}
 {"run":61,"commit":"e3b552f","metric":1.958,"metrics":{},"status":"keep","description":"Parity 1.958 stable after 60 experiments. ANS shift optimization committed. Remaining gap requires structural entropy coding improvements.","timestamp":1773451497595,"segment":0}
 {"run":62,"commit":"b8ea75b","metric":1.958,"metrics":{},"status":"keep","description":"Baseline stable: parity 1.958, 61 experiments. Loop plateau confirmed.","timestamp":1773451563798,"segment":0}
+{"run":63,"commit":"f38f147","metric":1.958,"metrics":{},"status":"keep","description":"Parity plateau confirmed at 1.958 (62 experiments). All parameter-level optimizations exhausted.","timestamp":1773451629516,"segment":0}
+{"run":64,"commit":"f38f147","metric":1.958,"metrics":{},"status":"discard","description":"Fast cbrt (libjxl Newton-Raphson): identical output, LUT dominates precision","timestamp":1773451799559,"segment":0}
+{"run":65,"commit":"f38f147","metric":4.375,"metrics":{},"status":"discard","description":"quant_ac 0.88/d (was 0.79): softer_rq=6 matches libjxl but +4.86% size from entropy gap","timestamp":1773451960360,"segment":0}
