@@ -1,71 +1,58 @@
 # Autoresearch Ideas (deferred)
 
-## Current Status: parity_score=2.38 (commit 64736a9, 15+ experiments)
+## Current Status: parity_score=1.96 (commit acdf6aa, 31 experiments)
 
-## Per-Image Breakdown (ep=1, gs=5111)
-- Webkit: 0 penalty (SOLVED via extra_dc_precision=1)
-- kodim08: 6.73 pen (-0.32 dB PSNR, +0.4% size) -- MAIN TARGET
-- kodim13: 3.60 pen (-0.18 dB PSNR, -0.7% size)
-- kodim01: 1.35 pen (+1.3% size, near-zero PSNR gap)
-- zoltan: 0.64 pen (+0.6% size)
+## Per-Image Breakdown (ep=1, gs=5111, with greedy clustering + HF metadata prediction)
+- Webkit: 0 penalty (SOLVED)
+- kodim08: ~6.2 pen (-0.31 dB PSNR) -- MAIN TARGET (pure PSNR gap)
+- kodim13: ~3.6 pen (-0.18 dB PSNR) -- second target
+- kodim01: 0 pen (smaller + better PSNR now)
+- zoltan: 0 pen (smaller now)
 
-## Root Cause of Remaining Gap
-- gs=5111 (from 0.39/d) gives coarser AC quantization than libjxl's gs=8813 (from 0.79/d)
-- Our AC step is ~2x coarser: rq=5 * 5111/65536 = 0.39 vs libjxl rq=6 * 8813/65536 = 0.81
-- But gs=8813 makes files 28% larger (pure size competition can't handle it)
-- Need RD-aware competition or better AC entropy coding to close the gap
-
-## Speed Optimization Notes (from profiling)
-- **40%** of encode time is in `compute_forward_transform_coeffs` (entropy merge)
-  - Uses dense NxN linear solver (matrix multiply) for DCT16x8/8x16/16x16/32x32
-  - ~36K Vec allocations per image in this path
-  - Could use `jxl_transforms::dct2d_*_scalar` but convention mismatch needs verification
-  - Entropy merge only saves 0.02 parity score -- consider gating at lower efforts
-- **21%** in ANS entropy coding for AC (`write_ans_stream`)
-  - 3% of that is just dropping `Vec<AnsTokenBits>` (allocation overhead)
-- **16%** in Huffman encoding for AC (`write_huffman_symbol`)
-  - 11% in `is_single_symbol` which iterates frequencies -- could cache result
-- **3.7%** in greedy context map clustering
-- **3.5%** in cluster frequency building
+## Root Cause of Remaining Gap (PSNR only, size is now -10% vs libjxl)
+- gs=5111 gives rq=5 (scale=0.390), libjxl gs=8813 gives rq=6 (scale=0.807)
+- Our quantization step is ~2x coarser, losing fine detail
+- Pure-size competition always picks coarsest rq
+- Can't increase gs without AQ map recalibration
+- All AQ/gs/rq parameter tuning has been exhausted (see Tried and Failed)
 
 ## Promising Ideas (untried)
-- **RD-aware candidate selection**: use size + lambda*distortion instead of pure size.
-  Could let us use gs=8813 candidates that are larger but much better PSNR.
-  Lambda ~20 matches the parity_score formula weighting.
-- **Custom block context map**: libjxl computes per-image block context maps that
-  improve AC entropy coding efficiency. Currently we use all_default=true.
-- **CfL HF optimization**: optimize chroma-from-luma factors for HF AC coefficients
-  per block to reduce chroma residual entropy.
-- **Per-channel ANS for HF metadata**: 4 channels with different distributions,
-  splitting could improve entropy coding.
-- **Smarter AC coefficient ordering**: try natural order vs current zigzag for
-  better zero-run encoding.
+- **LZ77 for modular streams**: libjxl uses LZ77 for DC and lossless data.
+  Could significantly improve lossless compression (835 KB vs 484 KB gap).
+  Complex to implement but high potential.
+- **RD-aware candidate selection with decode-based PSNR**: encode each candidate,
+  decode it, compute actual PSNR, pick best parity. Very expensive but would
+  directly optimize the target metric. Could be effort-gated.
+- **Custom block context map with AQ-based splitting**: use per-image AQ stats
+  to split AC contexts by quantization level. Already implemented but disabled.
+- **Per-channel predictor selection for HF metadata**: use multi-leaf tree for
+  CfL-x/CfL-b/transform/EPF channels with independent predictors.
+- **ANS shift selection**: libjxl tries 7 different shift values (0,2,4,6,8,10,12)
+  for each ANS histogram table, picking cheapest total cost. We hardcode shift=13.
+  Needs RebalanceHistogram implementation to adjust frequencies at lower shifts.
+  This is likely the biggest remaining entropy coding gap (~26% overhead vs libjxl).
+  Implementation effort: moderate (need frequency rebalancing + cost estimation).
+
+## Recently Successful (keep these patterns)
+- **Finer greedy cluster counts**: [1-32] found better context maps, parity 2.38->2.03
+- **HF metadata spatial prediction**: multi-predictor modular encoding for CfL/EPF maps, parity 2.03->1.96
+- **Modular predictors 2/4/5**: Top/Select/Gradient for lossless, 869->835 KB
 
 ## Tried and Failed (do NOT retry)
-- quant_ac multiplier 1.0: massive PSNR regression (-1.68 dB)
-- quant_ac multiplier 1.15: -0.83 dB worst PSNR, parity 4.98
-- quant_ac multiplier 1.22/1.30/1.35: no effect (gs unchanged, same rq levels)
-- Dead zone threshold 0.52/0.56: worse PSNR (-0.43 dB), files smaller but parity 3.29
-- Dead zone threshold 0.58/0.64 (libjxl match): massive PSNR regression, parity 7.79
-- Bias-aware AC quantization (AdjustQuantBias thresholds 0.465): no change, scale too fine
-- CfL dist_mul 1e-9 (was 1e-3): no change, regularizer negligible at both scales
+- quant_ac multiplier 1.0/1.15/1.22/1.25/1.30/1.35/1.40: no effect or massive regression
+- Dead zone threshold 0.52/0.56/0.58/0.64: worse PSNR or massive regression
+- Bias-aware AC quantization (AdjustQuantBias): no change at fine scale
+- CfL dist_mul 1e-9 (both scalar+SIMD paths): no change, integer discretization dominates
 - CfL weights with dm_multiplier: no change (x_dm=0.8 negligible, b_dm=1.0)
-- Remove softer_rq candidate: +8.9% max size kills parity (6.72)
-- Fix base_rq to match actual gs: PSNR +0.40 but +8.9% size, parity 6.72
-- Add matched-gs rq candidates: never win size competition, 50% slower
-- Add finer_rq=base+1 candidate: never wins size competition
-- quant_ac multiplier changes (1.15, 1.30): no effect (only affects adaptive candidate)
-- x_qm_scale 3->2: regression, photo PSNR worsened
-- gs=8813 + ep=0: massive regression (Webkit -4.64 dB)
-- gs=8813 + ep=1: regression (Webkit +9.6% size)
-- Hybrid gs (5111 flat, 8813 photo): 28% larger files
-- 0.79/d for AQ quant_ac: regression
-- EPF iters 2->1: slight regression
-- Competitive ep=0/1 per candidate: ep=0 always wins pure-size
-- Higher rq candidates: never win size competition
-- Dead-zone removal: no effect
-- Disabling gaborish: massive regression
-- extra_dc_precision=3: too much size overhead
-- Removing softer_rq: massive regression
-- Competitive HybridUint configs: (4,2,0) already optimal
-- libjxl polynomial sRGB EOTF: no difference for 8-bit
+- CfL TOWARDS_ZERO 1.0 or 4.0: both worse than 2.6
+- Remove softer_rq candidate: massive size regression
+- Fix base_rq to match actual gs: PSNR improves but +8.9% size kills parity
+- Add matched-gs rq candidates: never win size competition
+- Add finer_rq=base+1 candidate: never wins size competition  
+- HybridUint config (4,1,2) or competitive config selection: slight regression
+- AQ with 0.79/d: AQ modulation miscalibrated, -1.46 dB
+- gs from 0.6725/d: AQ/gs mismatch, -1.49 dB
+- Override gs to 8813: +21.5% size, AQ calibrated for wrong gs
+- Disable entropy merge: barely worse parity (2.39 vs 2.38), 2x faster
+- x_qm_scale 3->2: regression
+- All 1..32 cluster counts: same as 14 selected counts, just 20% slower
