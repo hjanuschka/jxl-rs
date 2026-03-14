@@ -12196,3 +12196,111 @@ mod animation_tests {
         );
     }
 }
+
+/// Decode a bare codestream to f32 RGB pixels. Returns (width, height, rgb_f32).
+/// Used for PSNR estimation during candidate selection.
+#[allow(dead_code)]
+fn decode_codestream_to_f32_rgb(codestream: &[u8]) -> Option<(usize, usize, Vec<f32>)> {
+    use crate::api::{
+        JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
+        ProcessingResult, states,
+    };
+    use crate::image::Image;
+
+    let options = JxlDecoderOptions::default();
+    let dec = JxlDecoder::<states::Initialized>::new(options);
+    let mut input: &[u8] = codestream;
+
+    // Advance to image info
+    let mut dec_img = loop {
+        match dec.process(&mut input) {
+            Ok(ProcessingResult::Complete { result }) => break result,
+            Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
+                if input.is_empty() { return None; }
+                return None;
+            }
+            Err(_) => return None,
+        }
+    };
+
+    let (w, h) = dec_img.basic_info().size;
+
+    // Request f32 pixel format
+    let default_fmt = dec_img.current_pixel_format().clone();
+    let req_fmt = JxlPixelFormat {
+        color_type: default_fmt.color_type,
+        color_data_format: Some(JxlDataFormat::f32()),
+        extra_channel_format: vec![],
+    };
+    dec_img.set_pixel_format(req_fmt);
+
+    let nc = dec_img.current_pixel_format().color_type.samples_per_pixel();
+    let mut img_buf = Image::new_with_value((w * nc, h), f32::NAN).ok()?;
+
+    let mut bufs = vec![JxlOutputBuffer::from_image_rect_mut(
+        img_buf.get_rect_mut(crate::image::Rect {
+            origin: (0, 0),
+            size: (w * nc, h),
+        }).into_raw(),
+    )];
+
+    // Advance to frame info
+    let mut dec_frame = loop {
+        match dec_img.process(&mut input) {
+            Ok(ProcessingResult::Complete { result }) => break result,
+            Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
+                if input.is_empty() { return None; }
+                dec_img = fallback;
+            }
+            Err(_) => return None,
+        }
+    };
+
+    // Decode pixels
+    loop {
+        match dec_frame.process(&mut input, &mut bufs) {
+            Ok(ProcessingResult::Complete { result: _dec_done }) => {
+                let mut rgb = Vec::with_capacity(w * h * 3);
+                for y in 0..h {
+                    let row = img_buf.row(y);
+                    for x in 0..w {
+                        rgb.push(row[x * nc]);
+                        rgb.push(row[x * nc + 1]);
+                        rgb.push(row[x * nc + 2]);
+                    }
+                }
+                return Some((w, h, rgb));
+            }
+            Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
+                if input.is_empty() { return None; }
+                dec_frame = fallback;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Compute PSNR between source u8 RGB and decoded f32 RGB.
+#[allow(dead_code)]
+fn compute_psnr_from_decoded(
+    src_rgb: &[u8],
+    decoded_rgb_f32: &[f32],
+    width: usize,
+    height: usize,
+) -> f32 {
+    let npixels = width * height * 3;
+    if src_rgb.len() != npixels || decoded_rgb_f32.len() != npixels {
+        return 0.0;
+    }
+    let mut sse: f64 = 0.0;
+    for i in 0..npixels {
+        let dec_u8 = (decoded_rgb_f32[i] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        let diff = src_rgb[i] as f64 - dec_u8 as f64;
+        sse += diff * diff;
+    }
+    let mse = sse / npixels as f64;
+    if mse < 1e-12 {
+        return 99.0;
+    }
+    (10.0 * ((255.0 * 255.0) / mse).log10()) as f32
+}
