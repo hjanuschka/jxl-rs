@@ -332,6 +332,8 @@ impl Frame {
                     self.decoder_state.extra_channel_info().len(),
                     &self.decoder_state.reference_frames[..],
                 )?;
+                self.header
+                    .check_patch_upsampling(p.uses_extra_channels())?;
                 *self.patches.borrow_mut() = p;
             }
 

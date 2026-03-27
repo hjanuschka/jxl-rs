@@ -179,6 +179,16 @@ impl PatchesDictionary {
         }
     }
 
+    pub fn uses_extra_channels(&self) -> bool {
+        self.blendings
+            .chunks_exact(self.blendings_stride)
+            .any(|blendings| {
+                blendings.iter().enumerate().any(|(i, blending)| {
+                    blending.mode.uses_alpha() || (blending.mode != PatchBlendMode::None && i > 0)
+                })
+            })
+    }
+
     #[cfg(test)]
     pub fn random<R: rand::Rng>(
         size: (usize, usize),
@@ -761,6 +771,59 @@ impl PatchesDictionary {
 
 #[cfg(test)]
 mod tests {
+
+    mod uses_extra_channels_tests {
+        use super::super::*;
+
+        #[test]
+        fn does_not_flag_color_only_non_alpha_patch_blending() {
+            let dict = PatchesDictionary {
+                blendings: vec![PatchBlending {
+                    mode: PatchBlendMode::Replace,
+                    alpha_channel: 0,
+                    clamp: false,
+                }],
+                blendings_stride: 1,
+                ..Default::default()
+            };
+            assert!(!dict.uses_extra_channels());
+        }
+
+        #[test]
+        fn flags_alpha_patch_blending() {
+            let dict = PatchesDictionary {
+                blendings: vec![PatchBlending {
+                    mode: PatchBlendMode::BlendAbove,
+                    alpha_channel: 0,
+                    clamp: false,
+                }],
+                blendings_stride: 1,
+                ..Default::default()
+            };
+            assert!(dict.uses_extra_channels());
+        }
+
+        #[test]
+        fn flags_non_none_extra_channel_patch_blending() {
+            let dict = PatchesDictionary {
+                blendings: vec![
+                    PatchBlending {
+                        mode: PatchBlendMode::None,
+                        alpha_channel: 0,
+                        clamp: false,
+                    },
+                    PatchBlending {
+                        mode: PatchBlendMode::Add,
+                        alpha_channel: 0,
+                        clamp: false,
+                    },
+                ],
+                blendings_stride: 2,
+                ..Default::default()
+            };
+            assert!(dict.uses_extra_channels());
+        }
+    }
 
     mod read_patches_tests {
         use super::super::*;

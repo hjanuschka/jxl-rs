@@ -663,6 +663,19 @@ impl FrameHeader {
         }
     }
 
+    pub fn check_patch_upsampling(&self, uses_extra_channels: bool) -> Result<(), Error> {
+        if uses_extra_channels
+            && self.upsampling != 1
+            && self
+                .ec_upsampling
+                .iter()
+                .any(|&ecups| ecups != self.upsampling)
+        {
+            return Err(Error::PatchesExtraChannelSubsamplingMismatch);
+        }
+        Ok(())
+    }
+
     fn check(&self, nonserialized: &FrameHeaderNonserialized) -> Result<(), Error> {
         if self.upsampling > 1
             && let Some((dim_shift, effective_upsampling)) = nonserialized
@@ -848,6 +861,32 @@ mod test_frame_header {
 
         let err = frame_header.check(&nonserialized).unwrap_err();
         assert!(matches!(err, Error::InvalidEcUpsampling(8, 3, 32)));
+    }
+
+    #[test]
+    fn test_invalid_patch_extra_channel_subsampling() {
+        let (_, mut frame_header, _) =
+            read_headers_and_toc(include_bytes!("../../resources/test/extra_channels.jxl"))
+                .unwrap();
+
+        frame_header.upsampling = 4;
+        frame_header.ec_upsampling[0] = 2;
+
+        let err = frame_header.check_patch_upsampling(true).unwrap_err();
+        assert!(matches!(err, Error::PatchesExtraChannelSubsamplingMismatch));
+    }
+
+    #[test]
+    fn test_valid_patch_extra_channel_subsampling() {
+        let (_, mut frame_header, _) =
+            read_headers_and_toc(include_bytes!("../../resources/test/extra_channels.jxl"))
+                .unwrap();
+
+        frame_header.upsampling = 4;
+        frame_header.ec_upsampling[0] = 4;
+
+        assert!(frame_header.check_patch_upsampling(true).is_ok());
+        assert!(frame_header.check_patch_upsampling(false).is_ok());
     }
 
     #[test]
