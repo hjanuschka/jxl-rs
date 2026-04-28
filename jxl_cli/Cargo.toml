@@ -6,7 +6,6 @@ license = "BSD-3-Clause"
 default-run = "jxl_cli"
 
 [dependencies]
-<<<<<<< HEAD
 jxl = { path = "../jxl", version = "=0.4.3", default-features = false, features = ["encoder"] }
 jxl_cms = { path = "../jxl_cms", version = "=0.4.3" }
 clap = { version = "4.5.18", features = ["derive"] }
