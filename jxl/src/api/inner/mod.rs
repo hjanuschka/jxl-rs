@@ -10,8 +10,11 @@ use crate::{
     error::{Error, Result},
 };
 
-use super::{JxlBasicInfo, JxlColorProfile, JxlDecoderOptions, JxlPixelFormat};
-use crate::container::frame_index::{FrameIndexBox, VisibleFrameSeekTarget};
+use super::{
+    JxlBasicInfo, JxlColorProfile, JxlDecoderOptions, JxlPixelFormat, VisibleFrameInfo,
+    VisibleFrameSeekTarget,
+};
+use crate::container::frame_index::FrameIndexBox;
 use crate::jpeg::JpegReconstructionData;
 use box_parser::BoxParser;
 use codestream_parser::CodestreamParser;
@@ -149,6 +152,11 @@ impl JxlDecoderInner {
     /// Returns JPEG reconstruction data parsed from a `jbrd` box, if present.
     pub fn jpeg_reconstruction_data(&self) -> Option<&JpegReconstructionData> {
         self.box_parser.jpeg_reconstruction.as_ref()
+    }
+
+    /// Returns visible frame info entries collected so far.
+    pub fn scanned_frames(&self) -> &[VisibleFrameInfo] {
+        &self.codestream_parser.scanned_frames
     }
 
     /// Resets frame-level state to prepare for decoding a new frame.
